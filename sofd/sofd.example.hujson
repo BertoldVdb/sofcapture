@@ -14,6 +14,9 @@
     "default_rate_hz": 10,
     // "rt_prio": 50,
     // "cpu": 2,
+    // Tighter samples at the cost of power (on our test PC it took both):
+    // "max_cpu_latency_us": 200,
+    // "cpu_governor": "performance",
   },
 
   "gnss": {

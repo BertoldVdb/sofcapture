@@ -10,6 +10,7 @@ use crate::gnss::firmware::Image;
 use crate::gnss::framer::Kind;
 use crate::gnss::{session, Hub};
 use crate::mqtt::{self, Mqtt};
+use crate::power;
 use crate::sampler::{Sampler, SamplerConfig, MAX_RATE_HZ, MIN_RATE_HZ};
 use anyhow::{anyhow, bail, Context, Result};
 use log::{info, warn};
@@ -67,6 +68,7 @@ pub struct Options {
     pub irq_off_max_ns: u32,
     pub sampler: SamplerConfig,
     pub default_rate_hz: f64,
+    pub power: power::Settings,
 }
 
 /// Keeps the controller out of runtime suspend so its frame counter runs.
@@ -132,6 +134,8 @@ pub struct Daemon {
     gnss: config::Gnss,
     tx: Sender<Msg>,
     samplers: BTreeMap<String, Running>,
+    /// Held while anything is sampled.
+    power: Option<power::Held>,
     /// controller -> client -> rate
     wants: BTreeMap<String, BTreeMap<String, f64>>,
     start_failed: BTreeMap<String, (String, Instant)>,
@@ -160,6 +164,7 @@ impl Daemon {
             gnss,
             tx,
             samplers: BTreeMap::new(),
+            power: None,
             wants: BTreeMap::new(),
             start_failed: BTreeMap::new(),
             slots: BTreeMap::new(),
@@ -206,6 +211,7 @@ impl Daemon {
             slot.board = None;
         }
         self.samplers.clear();
+        self.power = None;
         if let Some(m) = self.mqtt.take() {
             m.shutdown();
         }
@@ -614,6 +620,11 @@ impl Daemon {
             if let Some(m) = &self.mqtt {
                 m.publish(&format!("controllers/{c}/model"), Vec::new(), true);
             }
+        }
+        if desired.is_empty() {
+            self.power = None;
+        } else if self.power.is_none() {
+            self.power = power::Held::apply(&self.opts.power);
         }
         let now = Instant::now();
         self.start_failed.retain(|c, (_, t)| desired.contains_key(c) && now < *t + SAMPLER_RETRY);

@@ -52,11 +52,15 @@ pub struct Sampler {
     pub cpu: Option<usize>,
     /// Rate for boards' controllers and for requests that give none.
     pub default_rate_hz: f64,
+    /// Cap CPU wake-up latency while sampling (/dev/cpu_dma_latency).
+    pub max_cpu_latency_us: Option<u32>,
+    /// While sampling, use this cpufreq governor (on `cpu` if set, else all CPUs).
+    pub cpu_governor: Option<String>,
 }
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 10.0 }
+        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 10.0, max_cpu_latency_us: None, cpu_governor: None }
     }
 }
 
