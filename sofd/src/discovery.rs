@@ -46,6 +46,11 @@ pub struct UsbDevice {
     pub serial: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    /// Serial port, e.g. /dev/ttyACM0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
     pub controller: String,
 }
 
@@ -199,6 +204,8 @@ pub fn devices(simulate: bool) -> Result<Vec<UsbDevice>> {
             pid: read_trim(&real.join("idProduct")).unwrap_or_default(),
             serial: read_trim(&real.join("serial")),
             product: read_trim(&real.join("product")),
+            manufacturer: read_trim(&real.join("manufacturer")),
+            tty: tty_of(&real, &port),
             controller: file_name(&ctrl),
             port,
         });
@@ -212,11 +219,54 @@ pub fn devices(simulate: bool) -> Result<Vec<UsbDevice>> {
             pid: "0000".into(),
             serial: Some("SIM".into()),
             product: Some("Simulated device".into()),
+            manufacturer: None,
+            tty: None,
             controller: SIM_ID.into(),
         });
     }
     out.sort_by(|a, b| a.port.cmp(&b.port));
     Ok(out)
+}
+
+/// cdc-acm puts the tty at `<intf>/tty/ttyACM0`, usb-serial at `<intf>/ttyUSB0`.
+fn tty_of(dev: &Path, port: &str) -> Option<String> {
+    let mut intfs: Vec<PathBuf> = fs::read_dir(dev)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| file_name(p).starts_with(&format!("{port}:")))
+        .collect();
+    intfs.sort();
+    intfs.iter().find_map(|i| {
+        let mut names: Vec<String> = fs::read_dir(i.join("tty"))
+            .into_iter()
+            .chain(fs::read_dir(i))
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("tty") && n != "tty")
+            .collect();
+        names.sort();
+        names.into_iter().next().map(|n| format!("/dev/{n}"))
+    })
+}
+
+pub fn device_of_tty(tty: &str, simulate: bool) -> Result<UsbDevice> {
+    let real = fs::canonicalize(tty).with_context(|| format!("resolving {tty}"))?;
+    let name = file_name(&real);
+    let sys = fs::canonicalize(Path::new("/sys/class/tty").join(&name).join("device"))
+        .with_context(|| format!("{name} is not a device tty"))?;
+    let usb = sys
+        .ancestors()
+        .find(|p| !file_name(p).contains(':') && p.join("idVendor").exists())
+        .ok_or_else(|| anyhow!("{name} is not a USB serial port"))?;
+    let port = file_name(usb);
+    let mut dev = devices(simulate)?
+        .into_iter()
+        .find(|d| d.port == port)
+        .ok_or_else(|| anyhow!("USB device {port} of {name} not found"))?;
+    dev.tty = Some(format!("/dev/{name}"));
+    Ok(dev)
 }
 
 pub fn lookup(q: &DeviceQuery, simulate: bool) -> Result<UsbDevice> {

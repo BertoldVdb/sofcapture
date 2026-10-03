@@ -1,23 +1,29 @@
 //! sofd: timestamps USB start-of-frame by sampling host controller frame counters.
 
-mod api;
 mod backend;
+mod chrony;
 mod clock;
+mod config;
+mod daemon;
 mod discovery;
+mod gnss;
 mod kmod;
 mod mmio;
 mod model;
+mod mqtt;
 mod sampler;
 
-use anyhow::{Context, Result};
-use api::{Daemon, Msg, Options};
-use clap::{Args, Parser, Subcommand};
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use config::{Attach, Config};
+use daemon::{Daemon, Options};
 use discovery::{DeviceQuery, MmioOverride};
 use log::{info, warn};
 use sampler::SamplerConfig;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const DEFAULT_CONFIG: &str = "/etc/sofd/sofd.hujson";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -41,41 +47,13 @@ struct Cli {
     irq_off_max_us: u32,
 }
 
-#[derive(Args, Clone)]
-struct SamplerArgs {
-    /// Samples kept in the rate/offset fit
-    #[arg(long, default_value_t = 64)]
-    window: usize,
-    /// Run sampler threads SCHED_FIFO at this priority
-    #[arg(long)]
-    rt_prio: Option<i32>,
-    /// Pin sampler threads to this CPU
-    #[arg(long)]
-    cpu: Option<usize>,
-}
-
-impl SamplerArgs {
-    fn config(&self) -> SamplerConfig {
-        SamplerConfig { window: self.window, rt_prio: self.rt_prio, cpu: self.cpu }
-    }
-}
-
 #[derive(Subcommand)]
 enum Cmd {
-    /// Connect to the peer's Unix socket and serve its requests; exits when the
-    /// connection fails, closes, or the peer stops pinging
+    /// Run as a service: use sofgps boards, serve MQTT and chrony as configured
     Run {
-        /// Peer socket path
+        /// Configuration file (HuJSON); the default path may be absent
         #[arg(long)]
-        connect: PathBuf,
-        /// Close the connection (and exit) if no ping arrives for this many seconds
-        #[arg(long, default_value_t = 30.0)]
-        ping_timeout: f64,
-        /// Rate used when a subscribe request gives none
-        #[arg(long, default_value_t = 10.0)]
-        default_rate: f64,
-        #[command(flatten)]
-        sampler: SamplerArgs,
+        config: Option<PathBuf>,
     },
     /// Print controllers and their devices as JSON
     List,
@@ -94,7 +72,7 @@ enum Cmd {
         #[arg(long)]
         devnum: Option<u32>,
     },
-    /// Sample one controller and print events to stdout
+    /// Sample one controller and print events to stdout (no MQTT)
     Probe {
         controller: String,
         #[arg(long, default_value_t = 10.0)]
@@ -102,9 +80,38 @@ enum Cmd {
         /// Stop after this many samples
         #[arg(long)]
         count: Option<u64>,
-        #[command(flatten)]
-        sampler: SamplerArgs,
+        /// Use a sofgps board as GNSS reference: its tty, or "auto" for the
+        /// board on this controller
+        #[arg(long, value_name = "TTY|auto")]
+        gnss: Option<String>,
+        /// Board and sampler options from this configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn install_signal_handlers() {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
+    }
+}
+
+fn load_config(path: Option<&Path>) -> Result<Config> {
+    match path {
+        Some(p) => Config::load(p),
+        None if Path::new(DEFAULT_CONFIG).exists() => Config::load(Path::new(DEFAULT_CONFIG)),
+        None => {
+            info!("no {DEFAULT_CONFIG}, using defaults");
+            Ok(Config::default())
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -112,22 +119,18 @@ fn main() -> Result<()> {
         .target(env_logger::Target::Stderr)
         .init();
     let cli = Cli::parse();
-    let opts = |default_rate_hz: f64, sampler: SamplerConfig| Options {
+    let opts = |cfg: &Config| Options {
         overrides: cli.mmio.clone(),
         simulate: cli.simulate,
         force_generic: cli.generic.clone(),
         irq_off_max_ns: cli.irq_off_max_us * 1000,
-        default_rate_hz,
-        sampler,
+        sampler: SamplerConfig { window: cfg.sampler.window, rt_prio: cfg.sampler.rt_prio, cpu: cfg.sampler.cpu },
+        default_rate_hz: cfg.sampler.default_rate_hz,
     };
 
     match &cli.cmd {
-        Cmd::List => {
-            let d = Daemon::new(opts(10.0, SamplerArgs { window: 64, rt_prio: None, cpu: None }.config()));
-            println!("{}", serde_json::to_string_pretty(&d.list()?)?);
-        }
+        Cmd::List => println!("{}", serde_json::to_string_pretty(&daemon::list(cli.simulate)?)?),
         Cmd::Lookup { device, serial, port, busnum, devnum } => {
-            let d = Daemon::new(opts(10.0, SamplerArgs { window: 64, rt_prio: None, cpu: None }.config()));
             let q = DeviceQuery {
                 device: device.clone(),
                 serial: serial.clone(),
@@ -135,37 +138,36 @@ fn main() -> Result<()> {
                 busnum: *busnum,
                 devnum: *devnum,
             };
-            println!("{}", serde_json::to_string_pretty(&d.lookup(&q)?)?);
+            println!("{}", serde_json::to_string_pretty(&daemon::lookup(&q, cli.simulate)?)?);
         }
-        Cmd::Probe { controller, rate, count, sampler } => {
-            lock_memory(sampler.rt_prio);
-            let mut d = Daemon::new(opts(*rate, sampler.config()));
+        Cmd::Probe { controller, rate, count, gnss, config } => {
+            let mut cfg = match config {
+                Some(p) => Config::load(p)?,
+                None => Config::default(),
+            };
+            cfg.gnss.attach = match gnss {
+                Some(spec) => Attach::Serials(vec![daemon::board_serial(spec, controller, cli.simulate)?]),
+                None => Attach::None,
+            };
+            lock_memory(cfg.sampler.rt_prio);
+            install_signal_handlers();
             let (tx, rx) = std::sync::mpsc::channel();
-            d.subscribe(controller, Some(*rate), &tx)?;
-            let mut samples = 0;
-            for msg in rx {
-                if let Msg::Out(line) = msg {
-                    println!("{line}");
-                    if line.contains(r#""event":"sample""#) {
-                        samples += 1;
-                        if count.is_some_and(|c| samples >= c) {
-                            break;
-                        }
-                    }
-                }
-            }
+            let mut d = Daemon::new(opts(&cfg), cfg.gnss, tx, None, true);
+            d.want(controller, "probe", *rate);
+            d.sample_limit = *count;
+            d.run(&rx, &STOP);
         }
-        Cmd::Run { connect, ping_timeout, default_rate, sampler } => {
-            if !(ping_timeout.is_finite() && *ping_timeout > 0.0) {
-                anyhow::bail!("--ping-timeout must be a positive number of seconds");
+        Cmd::Run { config } => {
+            let cfg = load_config(config.as_deref())?;
+            lock_memory(cfg.sampler.rt_prio);
+            install_signal_handlers();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mqtt = cfg.mqtt.as_ref().map(|m| mqtt::Mqtt::connect(m, tx.clone())).transpose()?;
+            if mqtt.is_none() {
+                info!("no mqtt section: not connecting to a broker");
             }
-            lock_memory(sampler.rt_prio);
-            let mut d = Daemon::new(opts(*default_rate, sampler.config()));
-            let stream = UnixStream::connect(connect)
-                .with_context(|| format!("connecting to peer at {}", connect.display()))?;
-            info!("connected to {}", connect.display());
-            api::run_session(stream, &mut d, Duration::from_secs_f64(*ping_timeout))?;
-            info!("peer disconnected");
+            Daemon::new(opts(&cfg), cfg.gnss, tx, mqtt, false).run(&rx, &STOP);
+            info!("stopped");
         }
     }
     Ok(())

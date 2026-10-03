@@ -1,9 +1,12 @@
-//! One thread per subscribed controller: sleeps between samples, takes a
-//! timing sample through its backend, unwraps and fits it, and emits events.
+//! Per-controller sampling thread: reads the frame counter, fits it, emits events.
 
-use crate::api::Msg;
 use crate::backend::{Backend, HS_UNIT_NS};
+use crate::chrony;
 use crate::clock::{self, Ns, RealtimeSync};
+use crate::daemon::{Msg, SampleOut};
+use crate::gnss::join::Join;
+use crate::gnss::timing::Source;
+use crate::gnss::{Feed, Hub};
 use crate::model::{self, Fit, Model};
 use log::{debug, warn};
 use serde::Serialize;
@@ -25,9 +28,12 @@ const MAX_RETRIES: u32 = 3;
 /// (1 ms plus 10% of elapsed time; slewing tops out near 8%) is a step.
 const REALTIME_STEP_NS: Ns = 1_000_000;
 const REALTIME_MAX_SLEW: f64 = 0.1;
+/// Pass GNSS time on only from a fresh, filled fit: never extrapolate through an outage.
+const GNSS_MIN_POINTS: usize = 5;
+const GNSS_MAX_AGE_NS: Ns = 5_000_000_000;
 
 /// Counter epochs are unique per process; the unwrapped counter restarts
-/// whenever the epoch changes (new subscription, speed change, controller reset).
+/// whenever the epoch changes (sampling restarted, speed change, controller reset).
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -65,6 +71,22 @@ struct SampleEvent<'a> {
     realtime_sync: Option<RealtimeSync>,
     /// Start of the 1 ms frame containing this sample.
     frame_start: Option<FrameStart>,
+    /// Fit against GNSS UTC (Unix ns).
+    model_gnss: Option<&'a Fit>,
+    gnss: Option<GnssRef<'a>>,
+}
+
+/// The sofgps board on this controller, while one is attached.
+#[derive(Serialize)]
+struct GnssRef<'a> {
+    /// USB serial of the board.
+    board: &'a str,
+    /// What labelled the pulses of the newest tag (`tim_tp` or `zda`).
+    source: Option<Source>,
+    /// host frame = device frame + frame_offset.
+    frame_offset: Option<i64>,
+    /// CLOCK_REALTIME minus GNSS UTC at `frame_start`.
+    realtime_minus_gnss_ns: Option<Ns>,
 }
 
 /// A 1 ms frame boundary, where full-speed devices see SOF.
@@ -74,6 +96,7 @@ struct FrameStart {
     counter: i64,
     t_raw_ns: Option<Ns>,
     t_realtime_ns: Option<Ns>,
+    t_gnss_ns: Option<Ns>,
 }
 
 pub struct Sampler {
@@ -93,13 +116,14 @@ impl Sampler {
         rate_hz: f64,
         cfg: SamplerConfig,
         out: Sender<Msg>,
+        hub: Hub,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let period_ns = Arc::new(AtomicI64::new(period_for(rate_hz)));
         let (s, p) = (stop.clone(), period_ns.clone());
         let thread = std::thread::Builder::new()
             .name(format!("sof-{controller}"))
-            .spawn(move || run(&controller, backend, &cfg, &s, &p, &out))?;
+            .spawn(move || run(&controller, backend, &cfg, &s, &p, &out, &hub))?;
         Ok(Self { stop, period_ns, thread: Some(thread) })
     }
 
@@ -147,6 +171,7 @@ fn run(
     stop: &AtomicBool,
     period_ns: &AtomicI64,
     out: &Sender<Msg>,
+    hub: &Hub,
 ) {
     apply_scheduling(cfg);
     let new_epoch = || NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +179,12 @@ fn run(
     let mut model = Model::new(cfg.window);
     let mut fit: Option<Fit> = None;
     let mut model_rt = Model::new(cfg.window);
+    let mut model_gnss = Model::new(cfg.window);
+    let mut join = Join::default();
+    let mut feed: Option<Arc<Feed>> = None;
+    let mut gnss_source: Option<Source> = None;
+    // When the newest GNSS tag was received (raw clock).
+    let mut last_tag_rx: Option<Ns> = None;
     // (t_raw, realtime - raw) of the previous sample, for step detection.
     let mut prev_rt_off: Option<(Ns, Ns)> = None;
     let mut prev: Option<(i64, Ns)> = None;
@@ -211,7 +242,7 @@ fn run(
                 if last_error.as_ref() != Some(&msg) {
                     warn!("{id}: {msg}");
                     let ev = json!({"event": "error", "controller": id, "message": msg});
-                    if out.send(Msg::Out(ev.to_string())).is_err() {
+                    if out.send(Msg::Controller { controller: id.into(), event: ev }).is_err() {
                         return;
                     }
                     last_error = Some(msg);
@@ -220,6 +251,8 @@ fn run(
                 (prev, fit, epoch) = (None, None, new_epoch());
                 model.clear();
                 model_rt.clear();
+                model_gnss.clear();
+                join.reset();
                 next = clock::mono() + period.max(ERROR_BACKOFF_NS);
                 wake = next;
                 continue;
@@ -227,7 +260,7 @@ fn run(
         };
         if last_error.take().is_some() {
             let ev = json!({"event": "recovered", "controller": id});
-            if out.send(Msg::Out(ev.to_string())).is_err() {
+            if out.send(Msg::Controller { controller: id.into(), event: ev }).is_err() {
                 return;
             }
         }
@@ -238,6 +271,8 @@ fn run(
             (unit, prev, fit) = (s.unit_ns, None, None);
             model.clear();
             model_rt.clear();
+            model_gnss.clear();
+            join.reset();
         }
 
         let period_est = fit.as_ref().map_or(unit as f64, |f| f.period_ns);
@@ -257,6 +292,8 @@ fn run(
             epoch = new_epoch();
             model.clear();
             model_rt.clear();
+            model_gnss.clear();
+            join.reset();
             counter = s.counter as i64;
         }
         prev = Some((counter, s.t_ns));
@@ -270,7 +307,7 @@ fn run(
                 warn!("{id}: CLOCK_REALTIME stepped by {step} ns, restarting realtime fit");
                 model_rt.clear();
                 let ev = json!({"event": "realtime_step", "controller": id, "step_ns": step});
-                if out.send(Msg::Out(ev.to_string())).is_err() {
+                if out.send(Msg::Controller { controller: id.into(), event: ev }).is_err() {
                     return;
                 }
             }
@@ -285,11 +322,54 @@ fn run(
         let frame_counter = if hs { counter - counter.rem_euclid(8) } else { counter };
         let t_raw_fs = fit.as_ref().map(|f| f.predict(frame_counter));
         let t_rt_fs = fit_rt.as_ref().map(|f| f.predict(frame_counter));
-        let frame_start = (t_raw_fs.is_some() || t_rt_fs.is_some()).then(|| FrameStart {
-            bus_frame: if hs { raw >> 3 } else { raw } & 0x7ff,
+        let bus_frame = if hs { raw >> 3 } else { raw } & 0x7ff;
+
+        // GNSS reference: SOF tags of the attached sofgps device, matched to
+        // this controller's frames through the bus frame number.
+        let attached = hub.lock().unwrap().get(id).cloned();
+        if feed.as_ref().map(Arc::as_ptr) != attached.as_ref().map(Arc::as_ptr) {
+            feed = attached;
+            model_gnss.clear();
+            join.reset();
+            gnss_source = None;
+            last_tag_rx = None;
+        }
+        if let (Some(fd), Some(f)) = (&feed, &fit) {
+            let per_frame: i64 = if hs { 8 } else { 1 };
+            let frame_now = counter.div_euclid(per_frame);
+            let bus_of = |h: i64| (bus_frame as i64 + h - frame_now).rem_euclid(2048) as u32;
+            for tag in fd.drain() {
+                let at_rx = f.counter_ref as f64 + (tag.t_rx - f.t_ref_ns) as f64 / f.period_ns;
+                if let Some(h) = join.host_frame(tag.frame, at_rx / per_frame as f64, bus_of) {
+                    model_gnss.push(h * per_frame, tag.utc_ns, tag.unc_ns);
+                    gnss_source = Some(tag.source);
+                    last_tag_rx = Some(tag.t_rx);
+                }
+            }
+        }
+        let fit_gnss = model_gnss.fit(unit as f64);
+        let t_gnss_fs = fit_gnss.as_ref().map(|f| f.predict(frame_counter));
+        let gnss_valid = fit_gnss.as_ref().is_some_and(|f| f.n >= GNSS_MIN_POINTS)
+            && join.offset().is_some()
+            && last_tag_rx.is_some_and(|t| s.t_ns - t < GNSS_MAX_AGE_NS);
+        let t_realtime = s.t_ns + real_off;
+        let chrony_point = fit_gnss
+            .as_ref()
+            .filter(|_| gnss_valid)
+            .map(|f| chrony::Point { t_realtime_ns: t_realtime, t_gnss_ns: f.predict(counter) });
+        let gnss = feed.as_ref().map(|fd| GnssRef {
+            board: &fd.serial,
+            source: gnss_source,
+            frame_offset: join.offset(),
+            realtime_minus_gnss_ns: t_rt_fs.zip(t_gnss_fs).map(|(r, g)| r - g),
+        });
+
+        let frame_start = (t_raw_fs.is_some() || t_rt_fs.is_some()).then_some(FrameStart {
+            bus_frame,
             counter: frame_counter,
             t_raw_ns: t_raw_fs,
             t_realtime_ns: t_rt_fs,
+            t_gnss_ns: t_gnss_fs,
         });
         let ev = SampleEvent {
             event: "sample",
@@ -297,11 +377,11 @@ fn run(
             epoch,
             counter,
             unit_ns: unit,
-            bus_frame: if hs { raw >> 3 } else { raw } & 0x7ff,
+            bus_frame,
             microframe: hs.then_some(raw & 7),
             t_raw_ns: s.t_ns,
             t_mono_ns: s.t_ns + mono_off,
-            t_realtime_ns: s.t_ns + real_off,
+            t_realtime_ns: t_realtime,
             unc_ns: s.unc_ns,
             missed,
             mono_minus_raw_ns: mono_off,
@@ -310,10 +390,17 @@ fn run(
             model_realtime: fit_rt.as_ref(),
             realtime_sync: clock::realtime_sync(),
             frame_start,
+            model_gnss: fit_gnss.as_ref(),
+            gnss,
         };
         missed = 0;
-        let line = serde_json::to_string(&ev).expect("sample event serializes");
-        if out.send(Msg::Out(line)).is_err() {
+        let sample = SampleOut {
+            controller: id.to_string(),
+            event: serde_json::to_value(&ev).expect("sample event serializes"),
+            board: feed.as_ref().map(|f| f.serial.clone()),
+            chrony: chrony_point,
+        };
+        if out.send(Msg::Sample(Box::new(sample))).is_err() {
             return;
         }
     }

@@ -1,0 +1,31 @@
+// sofd configuration (HuJSON: comments and trailing commas allowed).
+// Install as /etc/sofd/sofd.hujson. All sections are optional.
+{
+  // Leave out to run without a broker.
+  "mqtt": {
+    "host": "localhost",
+    "port": 1883,
+    // "prefix": "sofd/myhost",          // default "sofd/<hostname>"
+    // "username": "sofd",
+    // "password_file": "/etc/sofd/mqtt.pass",
+  },
+
+  "sampler": {
+    "default_rate_hz": 10,
+    // "rt_prio": 50,
+    // "cpu": 2,
+  },
+
+  "gnss": {
+    "attach": "all",                     // or "none", or ["E072A1F9D198"]
+    "defaults": {
+      "baud": 38400,
+      "initial_baud": 9600,              // receiver's power-on baud, e.g. 38400 for u-blox M10/F9
+      // "chrony": "/run/chrony.sofgps.sock",       // use {serial} for one socket per board
+      // "firmware": "/var/lib/sofd/sofgps.bin",
+    },
+    "boards": {
+      // "E072A1F9D198": { "sof_delay_ns": 0 },
+    },
+  },
+}
