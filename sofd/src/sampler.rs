@@ -32,9 +32,20 @@ const REALTIME_MAX_SLEW: f64 = 0.1;
 const GNSS_MIN_POINTS: usize = 5;
 const GNSS_MAX_AGE_NS: Ns = 5_000_000_000;
 
-/// Counter epochs are unique per process; the unwrapped counter restarts
-/// whenever the epoch changes (sampling restarted, speed change, controller reset).
-static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static LAST_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// A new epoch: at least the current Unix time in milliseconds, so epochs
+/// stay unique across sofd restarts (unless the clock went back), and
+/// increasing within one.
+fn new_epoch() -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let mut epoch = 0;
+    let _ = LAST_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        epoch = (last + 1).max(now);
+        Some(epoch)
+    });
+    epoch
+}
 
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -174,7 +185,6 @@ fn run(
     hub: &Hub,
 ) {
     apply_scheduling(cfg);
-    let new_epoch = || NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
     let mut epoch = new_epoch();
     let mut model = Model::new(cfg.window);
     let mut fit: Option<Fit> = None;
@@ -403,5 +413,17 @@ fn run(
         if out.send(Msg::Sample(Box::new(sample))).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epochs_follow_unix_ms_and_increase() {
+        let t0 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let (a, b) = (new_epoch(), new_epoch());
+        assert!(a >= t0 && b > a);
     }
 }
