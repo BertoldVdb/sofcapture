@@ -30,11 +30,11 @@ pub struct Point {
 }
 
 fn encode(p: Point) -> Vec<u8> {
-    // timeval holds whole microseconds; the remainder goes into the offset.
+    // timeval truncates to µs; the offset still uses the exact time (error is negligible).
     let us = p.t_realtime_ns.div_euclid(1000);
     let s = SockSample {
         tv: libc::timeval { tv_sec: us.div_euclid(1_000_000) as _, tv_usec: us.rem_euclid(1_000_000) as _ },
-        offset: (p.t_gnss_ns - us * 1000) as f64 * 1e-9,
+        offset: (p.t_gnss_ns - p.t_realtime_ns) as f64 * 1e-9,
         pulse: 0,
         leap: 0,
         _pad: 0,
@@ -120,7 +120,7 @@ mod tests {
             assert_eq!(i64::from_ne_bytes(b[0..8].try_into().unwrap()), 1_790_000_000);
             assert_eq!(i64::from_ne_bytes(b[8..16].try_into().unwrap()), 123_456);
             let off = f64::from_ne_bytes(b[16..24].try_into().unwrap());
-            assert!((off - 1289e-9).abs() < 1e-15, "{off}");
+            assert!((off - 500e-9).abs() < 1e-15, "{off}");
             assert_eq!(i32::from_ne_bytes(b[36..40].try_into().unwrap()), SOCK_MAGIC);
         }
     }
