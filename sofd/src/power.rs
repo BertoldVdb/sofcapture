@@ -13,12 +13,22 @@ pub struct Settings {
     pub cpu: Option<usize>,
 }
 
+/// Firmware turbo switch as seen by intel_pstate.
+const NO_TURBO: &str = "/sys/devices/system/cpu/intel_pstate/no_turbo";
+
 /// Dropping it restores the settings.
 pub struct Held {
     /// The latency limit lasts while this stays open.
     _latency: Option<File>,
-    /// cpufreq governor files and their previous value.
-    governors: Vec<(PathBuf, String)>,
+    governor: Option<(String, Vec<PathBuf>)>,
+    /// Files we changed, with their old value.
+    restore: Vec<(PathBuf, String)>,
+    /// `no_turbo` when the governor was last set.
+    no_turbo: Option<String>,
+}
+
+fn no_turbo() -> Option<String> {
+    std::fs::read_to_string(NO_TURBO).ok().map(|s| s.trim().to_string())
 }
 
 fn cpus() -> Vec<usize> {
@@ -54,32 +64,53 @@ impl Held {
                 }
             }
         });
-        let mut governors = vec![];
+        let mut held = Self { _latency: latency, governor: None, restore: vec![], no_turbo: no_turbo() };
         if let Some(g) = &s.cpu_governor {
-            let targets = s.cpu.map_or_else(cpus, |c| vec![c]);
-            for c in targets {
+            let mut paths = vec![];
+            for c in s.cpu.map_or_else(cpus, |c| vec![c]) {
                 let path = PathBuf::from(format!("/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_governor"));
                 let Ok(old) = std::fs::read_to_string(&path) else { continue };
                 let old = old.trim().to_string();
-                if old == *g {
-                    continue;
-                }
+                // Write even if unchanged: it makes the driver recompute its turbo limits.
                 match std::fs::write(&path, g) {
-                    Ok(()) => governors.push((path, old)),
+                    Ok(()) => {
+                        if old != *g {
+                            held.restore.push((path.clone(), old));
+                        }
+                        paths.push(path);
+                    }
                     Err(e) => warn!("cpu{c}: cpufreq governor {g}: {e}"),
                 }
             }
-            if !governors.is_empty() {
-                info!("cpufreq governor {g} on {} CPU(s) while sampling", governors.len());
+            if !paths.is_empty() {
+                info!("cpufreq governor {g} on {} CPU(s) while sampling", paths.len());
+                held.governor = Some((g.clone(), paths));
             }
         }
-        Some(Self { _latency: latency, governors })
+        Some(held)
+    }
+
+    /// Call periodically. intel_pstate (HWP) only picks up a turbo change when the
+    /// governor is set again; otherwise it can stay stuck at base clock.
+    pub fn refresh(&mut self) {
+        let Some((g, paths)) = &self.governor else { return };
+        let now = no_turbo();
+        if now == self.no_turbo {
+            return;
+        }
+        info!("turbo {}: re-applying cpufreq governor {g}", if now.as_deref() == Some("1") { "disabled" } else { "enabled" });
+        for path in paths {
+            if let Err(e) = std::fs::write(path, g) {
+                warn!("{}: {g}: {e}", path.display());
+            }
+        }
+        self.no_turbo = now;
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        for (path, old) in &self.governors {
+        for (path, old) in &self.restore {
             if let Err(e) = std::fs::write(path, old) {
                 warn!("{}: restoring {old}: {e}", path.display());
             }

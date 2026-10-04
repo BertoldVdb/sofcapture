@@ -190,6 +190,9 @@ impl Daemon {
             let now = Instant::now();
             if now >= next_scan {
                 self.scan();
+                if let Some(p) = &mut self.power {
+                    p.refresh();
+                }
                 next_scan = now + SCAN_EVERY;
             }
             let wait = next_scan.saturating_duration_since(now).min(Duration::from_millis(200));

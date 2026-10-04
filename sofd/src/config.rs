@@ -60,7 +60,7 @@ pub struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 10.0, max_cpu_latency_us: None, cpu_governor: None }
+        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 50.0, max_cpu_latency_us: None, cpu_governor: None }
     }
 }
 

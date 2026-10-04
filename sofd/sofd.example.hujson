@@ -11,7 +11,7 @@
   },
 
   "sampler": {
-    "default_rate_hz": 10,
+    "default_rate_hz": 50,             // also the chrony sample rate
     // "rt_prio": 50,
     // "cpu": 2,
     // Tighter samples at the cost of power (on our test PC it took both):
