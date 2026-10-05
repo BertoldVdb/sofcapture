@@ -889,7 +889,8 @@ mod tests {
         fn check_tags(&self, source: Source) {
             assert!(self.out.tags.len() > 20, "{} tags; states {:?}", self.out.tags.len(), self.states());
             for t in &self.out.tags {
-                assert_eq!(t.utc_ns, (UTC0_S * 1000 + t.frame as i64) * MS, "{t:?}");
+                let super::super::timing::At::Frame { frame, .. } = t.at else { panic!("{t:?}") };
+                assert_eq!(t.utc_ns, (UTC0_S * 1000 + frame as i64) * MS, "{t:?}");
                 assert_eq!(t.source, source);
             }
         }

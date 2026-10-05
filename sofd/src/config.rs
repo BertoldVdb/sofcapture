@@ -71,6 +71,18 @@ pub struct Gnss {
     pub defaults: BoardOptions,
     /// Per-serial overrides of `defaults`.
     pub boards: BTreeMap<String, BoardOptions>,
+    /// MQTT clients allowed to act as GNSS reference, by client name.
+    pub external: BTreeMap<String, External>,
+}
+
+/// An MQTT client that may publish SOF tags (`controllers/<id>/ref/<client>`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct External {
+    /// chrony SOCK refclock path fed from this reference.
+    pub chrony: Option<PathBuf>,
+    /// Subtracted from every tag's time.
+    pub sof_delay_ns: i64,
 }
 
 /// Which sofgps boards sofd uses.
@@ -252,6 +264,7 @@ mod tests {
                 "attach": ["A1"],
                 "defaults": { "chrony": "/run/chrony.{serial}.sock", "initial_baud": 115200, "firmware": "/fw.bin" },
                 "boards": { "A1": { "baud": 115200, "chrony": null }, "B2": { "firmware": null } },
+                "external": { "app": { "chrony": "/run/c.sock", "sof_delay_ns": 40 }, "other": {} },
               },
             }"#,
         )
@@ -262,6 +275,8 @@ mod tests {
         assert_eq!((a.baud, a.initial_baud, a.chrony, a.firmware.as_deref()), (115_200, 115_200, None, Some(Path::new("/fw.bin"))));
         let b = c.gnss.board("B2");
         assert_eq!((b.baud, b.chrony.as_deref(), b.firmware), (38_400, Some(Path::new("/run/chrony.B2.sock")), None));
+        assert_eq!(c.gnss.external["app"].chrony.as_deref(), Some(Path::new("/run/c.sock")));
+        assert_eq!((c.gnss.external["app"].sof_delay_ns, c.gnss.external["other"].chrony.is_none()), (40, true));
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
         assert!(Config::parse(r#"{"gnss":{"attach":"some"}}"#).is_err());
         assert!(Config::parse(r#"{"mqtt":{"prefix":"a/#"}}"#).is_err());

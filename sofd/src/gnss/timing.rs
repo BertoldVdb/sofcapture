@@ -25,6 +25,8 @@ pub const QERR_SIGN: i64 = -1;
 pub enum Source {
     TimTp,
     Zda,
+    /// An MQTT client's own tags.
+    External,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,10 +45,17 @@ pub struct PpsDecision {
     idx: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    /// Device frame number (unwrapped or 11-bit) and microframe (high speed).
+    Frame { frame: u64, microframe: u8 },
+    /// sofd's own counter, as the client read it from the model topic.
+    Counter { epoch: u64, counter: i64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct Tag {
-    /// The device's unwrapped frame number (its low 11 bits are the bus frame number).
-    pub frame: u64,
+    pub at: At,
     pub utc_ns: Ns,
     pub unc_ns: Ns,
     /// CLOCK_MONOTONIC_RAW when the tag's sentence was read.
@@ -159,9 +168,9 @@ impl Labeler {
         let label: Label = match (between.len(), self.source) {
             (1, _) => between[0],
             (0, Source::TimTp) => Err("no_tim_tp"),
-            (0, Source::Zda) => Err("no_zda"),
+            (0, Source::Zda | Source::External) => Err("no_zda"),
             (_, Source::TimTp) => Err("multiple_tim_tp"),
-            (_, Source::Zda) => Err("multiple_zda"),
+            (_, Source::Zda | Source::External) => Err("multiple_zda"),
         };
         let fix_ok = matches!(self.fix, Some((true, i)) if self.idx - i <= FIX_MAX_AGE);
         let interval_ok =
@@ -194,7 +203,8 @@ impl Labeler {
                 self.prev = Some(Pulse { label: cand, ..cur });
                 self.decided(d, decisions, tags);
             }
-            Source::Zda => {
+            // External tags never reach a labeler.
+            Source::Zda | Source::External => {
                 // ZDA describes the previous pulse.
                 if let Some(p) = self.prev.take() {
                     let cand = label.ok().map(|l| l.0);
@@ -236,7 +246,7 @@ impl Labeler {
                 let scale = (utc - u0) as f64 / (d.tick - t0) as f64;
                 for &(tick, frame, t_rx) in self.pending.iter().filter(|p| p.0 > t0 && p.0 <= d.tick) {
                     tags.push(Tag {
-                        frame,
+                        at: At::Frame { frame, microframe: 0 },
                         utc_ns: u0 + ((tick - t0) as f64 * scale).round() as Ns,
                         unc_ns: TAG_UNC_NS,
                         t_rx,
@@ -309,7 +319,7 @@ mod tests {
         // Tags between accepted pulses 1-2, 2-3, 3-4.
         assert_eq!(t.len(), 30);
         let first = &t[0];
-        assert_eq!(first.frame, 1050);
+        assert_eq!(first.at, At::Frame { frame: 1050, microframe: 0 });
         let q = |k: i64| QERR_SIGN * ((UTC0 / SECOND + k - 315_964_800) % 7 * 3000 - 9000) / 1000;
         assert_eq!(d[1].utc_ns, Some(UTC0 + SECOND + q(1)));
         assert_eq!(first.utc_ns, UTC0 + SECOND + 50_000_000 + (q(1) + (q(2) - q(1)) / 20));

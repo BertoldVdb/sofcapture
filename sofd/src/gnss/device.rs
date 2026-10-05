@@ -183,8 +183,10 @@ pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Resu
     let feed = Arc::new(Feed::new(info.serial.clone()));
     {
         let mut h = hub.lock().unwrap();
-        if let Some(f) = h.get(&info.controller) {
-            bail!("controller {} already has board {} attached", info.controller, f.serial);
+        match h.get(&info.controller) {
+            Some(f) if f.client.is_some() => info!("{}: board {} replaces GNSS reference {}", info.controller, info.serial, f.serial),
+            Some(f) => bail!("controller {} already has board {} attached", info.controller, f.serial),
+            None => {}
         }
         h.insert(info.controller.clone(), feed.clone());
     }

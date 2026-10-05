@@ -3,6 +3,7 @@
 //! - `status` (retained; the will sets it offline)
 //! - `controllers/<id>/info|model` (retained), `.../sample`, `.../event`
 //! - `controllers/<id>/want/<client>` (retained, written by clients): sample this controller
+//! - `controllers/<id>/ref/<client>` (written by clients): SOF tags of an external GNSS reference
 //! - `gnss/<serial>/status` (retained), `.../pps`, `.../event`, `.../nmea/<address>`,
 //!   `.../ubx/<class>/<id>`, `.../rtcm3/<type>` (raw frames), `.../tx` (client → receiver)
 //! - `cmd/<name>` (request/response through the MQTT 5 response topic)
@@ -36,6 +37,8 @@ pub enum In {
     /// A sampling request; `rate_hz` None = the request was withdrawn.
     Want { controller: String, client: String, rate_hz: Option<Option<f64>> },
     Tx { serial: String, data: Vec<u8> },
+    /// `t_rx`: arrival time, CLOCK_MONOTONIC_RAW.
+    Ref { controller: String, client: String, payload: Vec<u8>, t_rx: crate::clock::Ns },
     Cmd { name: String, payload: Vec<u8>, reply_to: Option<(String, Option<Bytes>)> },
 }
 
@@ -96,7 +99,7 @@ impl Mqtt {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
                             info!("mqtt: connected to {broker}, prefix {p}");
                             last_error = None;
-                            for t in ["controllers/+/want/+", "gnss/+/tx", "cmd/+"] {
+                            for t in ["controllers/+/want/+", "controllers/+/ref/+", "gnss/+/tx", "cmd/+"] {
                                 if let Err(e) = c.try_subscribe(format!("{p}/{t}"), QoS::AtLeastOnce) {
                                     warn!("mqtt: subscribing {t}: {e}");
                                 }
@@ -189,6 +192,12 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
             };
             Some(In::Want { controller: ctrl.to_string(), client: client.to_string(), rate_hz })
         }
+        ["controllers", ctrl, "ref", client] if !p.payload.is_empty() => Some(In::Ref {
+            controller: ctrl.to_string(),
+            client: client.to_string(),
+            payload: p.payload.to_vec(),
+            t_rx: crate::clock::raw(),
+        }),
         ["gnss", serial, "tx"] if !p.payload.is_empty() => Some(In::Tx { serial: serial.to_string(), data: p.payload.to_vec() }),
         ["cmd", name] => {
             let props = p.properties.as_ref();
@@ -231,6 +240,8 @@ mod tests {
         assert!(matches!(w, Some(In::Want { rate_hz: Some(None), .. })));
         assert_eq!(parse("sofd/pc", &publish("sofd/pc/gnss/E07/tx", b"\xb5b")), Some(In::Tx { serial: "E07".into(), data: b"\xb5b".to_vec() }));
         assert_eq!(parse("sofd/pc", &publish("sofd/pcx/gnss/E07/tx", b"x")), None);
+        let r = parse("sofd/pc", &publish("sofd/pc/controllers/c/ref/app1", b"{}"));
+        assert!(matches!(r, Some(In::Ref { controller, client, .. }) if controller == "c" && client == "app1"));
     }
 
     #[test]

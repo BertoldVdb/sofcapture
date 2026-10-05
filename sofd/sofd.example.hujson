@@ -30,5 +30,9 @@
     "boards": {
       // "E072A1F9D198": { "sof_delay_ns": 0 },
     },
+    // MQTT clients allowed to act as GNSS reference (see MQTT-GUIDE.md)
+    "external": {
+      // "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 },
+    },
   },
 }

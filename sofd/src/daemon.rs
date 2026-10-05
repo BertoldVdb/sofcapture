@@ -8,7 +8,9 @@ use crate::discovery::{self, BackendKind, DeviceQuery, MmioOverride, UsbDevice};
 use crate::gnss::device::{self, Board, BoardInfo};
 use crate::gnss::firmware::Image;
 use crate::gnss::framer::Kind;
-use crate::gnss::{session, Hub};
+use crate::gnss::external::{self, LOST_AFTER_S};
+use crate::gnss::timing::{Source, Tag};
+use crate::gnss::{session, Feed, Hub};
 use crate::mqtt::{self, Mqtt};
 use crate::power;
 use crate::sampler::{Sampler, SamplerConfig, MAX_RATE_HZ, MIN_RATE_HZ};
@@ -45,7 +47,7 @@ pub enum Msg {
 pub struct SampleOut {
     pub controller: String,
     pub event: Value,
-    /// Serial of the board on this controller.
+    /// Board serial or `mqtt:<client>`.
     pub board: Option<String>,
     /// Set while the GNSS reference is valid.
     pub chrony: Option<chrony::Point>,
@@ -122,6 +124,14 @@ struct Slot {
     update_given_up: bool,
 }
 
+/// An MQTT client acting as a controller's GNSS reference.
+struct ExtRef {
+    client: String,
+    feed: Arc<Feed>,
+    last: Instant,
+    chrony_busy: bool,
+}
+
 struct ImageSlot {
     image: Option<Arc<Image>>,
     mtime: Option<SystemTime>,
@@ -141,6 +151,10 @@ pub struct Daemon {
     start_failed: BTreeMap<String, (String, Instant)>,
     slots: BTreeMap<String, Slot>,
     hub: Hub,
+    /// controller -> the external reference feeding it
+    refs: BTreeMap<String, ExtRef>,
+    /// Last problem told to each client, so it is told only once.
+    ref_told: BTreeMap<(String, String), String>,
     images: BTreeMap<PathBuf, ImageSlot>,
     /// serial -> (image ELF SHA-256, attempts)
     update_tries: BTreeMap<String, (String, u32)>,
@@ -169,6 +183,8 @@ impl Daemon {
             start_failed: BTreeMap::new(),
             slots: BTreeMap::new(),
             hub: Hub::default(),
+            refs: BTreeMap::new(),
+            ref_told: BTreeMap::new(),
             images: BTreeMap::new(),
             update_tries: BTreeMap::new(),
             mqtt,
@@ -236,6 +252,13 @@ impl Daemon {
         self.print(&ev);
     }
 
+    fn controller_event(&self, controller: &str, ev: &Value) {
+        if let Some(m) = &self.mqtt {
+            m.publish_event(&format!("controllers/{controller}/event"), ev);
+        }
+        self.print(ev);
+    }
+
     fn publish_status(&mut self, serial: &str) {
         let Some(slot) = self.slots.get(serial) else { return };
         if let Some(m) = &self.mqtt {
@@ -256,12 +279,7 @@ impl Daemon {
     fn handle(&mut self, m: Msg) {
         match m {
             Msg::Sample(s) => self.on_sample(*s),
-            Msg::Controller { controller, event } => {
-                if let Some(m) = &self.mqtt {
-                    m.publish_event(&format!("controllers/{controller}/event"), &event);
-                }
-                self.print(&event);
-            }
+            Msg::Controller { controller, event } => self.controller_event(&controller, &event),
             Msg::Board { serial, id, out } => {
                 // Drop late messages from a replaced session.
                 if self.slots.get(&serial).and_then(|s| s.board.as_ref()).is_some_and(|b| b.id == id) {
@@ -284,17 +302,34 @@ impl Daemon {
             m.publish_json(&format!("controllers/{c}/model"), &Value::Object(model), true);
         }
         self.print(&s.event);
-        let (Some(serial), Some(p)) = (s.board, s.chrony) else { return };
-        let Some(path) = self.slots.get(&serial).and_then(|sl| sl.cfg.chrony.clone()) else { return };
-        let busy = match self.chrony.send(&path, &serial, p, clock::raw()) {
+        let (Some(name), Some(p)) = (s.board, s.chrony) else { return };
+        let client = name.strip_prefix(external::NAME_PREFIX);
+        let path = match client {
+            Some(c) => self.gnss.external.get(c).and_then(|e| e.chrony.clone()),
+            None => self.slots.get(&name).and_then(|sl| sl.cfg.chrony.clone()),
+        };
+        let Some(path) = path else { return };
+        let busy = match self.chrony.send(&path, &name, p, clock::raw()) {
             Sent::Ok => None,
             Sent::Busy(owner) => Some(owner),
         };
-        let slot = self.slots.get_mut(&serial).expect("checked above");
-        let was = std::mem::replace(&mut slot.chrony_busy, busy.is_some());
+        let flag = match client {
+            Some(_) => self.refs.get_mut(&s.controller).filter(|r| r.feed.serial == name).map(|r| &mut r.chrony_busy),
+            None => self.slots.get_mut(&name).map(|sl| &mut sl.chrony_busy),
+        };
+        let was = flag.map(|f| std::mem::replace(f, busy.is_some())).unwrap_or(false);
         if let (Some(owner), false) = (busy, was) {
-            warn!("{serial}: chrony socket {} is fed by board {owner}", path.display());
-            self.board_event(&serial, json!({"event": "chrony_busy", "socket": path, "owner": owner}));
+            warn!("{name}: chrony socket {} is fed by {owner}", path.display());
+            let ev = json!({"event": "chrony_busy", "socket": path, "owner": owner});
+            match client {
+                Some(c) => {
+                    let mut ev = ev;
+                    ev["controller"] = json!(s.controller);
+                    ev["client"] = json!(c);
+                    self.controller_event(&s.controller, &ev);
+                }
+                None => self.board_event(&name, ev),
+            }
         }
     }
 
@@ -402,6 +437,7 @@ impl Daemon {
                 self.reconcile();
                 self.publish_infos();
             }
+            mqtt::In::Ref { controller, client, payload, t_rx } => self.on_ref(&controller, &client, &payload, t_rx),
             mqtt::In::Tx { serial, data } => match self.slots.get(&serial).and_then(|s| s.board.as_ref()) {
                 Some(b) => b.send(data),
                 None => warn!("{serial}: tx for a board that is not attached"),
@@ -420,6 +456,85 @@ impl Daemon {
                     (Some((topic, corr)), Some(m)) => m.reply(&topic, corr, &reply),
                     _ => warn!("cmd/{name} without a response topic"),
                 }
+            }
+        }
+    }
+
+    /// A board on the same controller takes precedence.
+    fn on_ref(&mut self, controller: &str, client: &str, payload: &[u8], t_rx: Ns) {
+        let Some(ext) = self.gnss.external.get(client).cloned() else {
+            return self.ref_problem(controller, client, json!({"event": "ref_rejected", "reason": "not_allowed"}));
+        };
+        let tags = match external::parse(payload) {
+            Ok(t) => t,
+            Err(e) => return self.ref_problem(controller, client, json!({"event": "ref_rejected", "reason": "invalid", "message": e})),
+        };
+        let attached = self.hub.lock().unwrap().get(controller).cloned();
+        let feed = match (attached, self.refs.get(controller)) {
+            (Some(f), Some(r)) if r.client == client && Arc::ptr_eq(&f, &r.feed) => f,
+            (Some(f), _) => {
+                return self.ref_problem(controller, client, json!({"event": "ref_busy", "owner": f.serial}));
+            }
+            (None, _) => {
+                let f = Arc::new(Feed::external(client));
+                self.hub.lock().unwrap().insert(controller.into(), f.clone());
+                info!("{controller}: MQTT client {client} is the GNSS reference");
+                self.refs.insert(controller.into(), ExtRef { client: client.into(), feed: f.clone(), last: Instant::now(), chrony_busy: false });
+                f
+            }
+        };
+        self.ref_told.remove(&(controller.to_string(), client.to_string()));
+        for t in tags {
+            feed.push(Tag { at: t.at, utc_ns: t.t_gnss_ns - ext.sof_delay_ns, unc_ns: t.unc_ns, t_rx, source: Source::External });
+        }
+        if let Some(r) = self.refs.get_mut(controller) {
+            r.last = Instant::now();
+        }
+    }
+
+    /// Sent once until it changes.
+    fn ref_problem(&mut self, controller: &str, client: &str, mut ev: Value) {
+        let key = (controller.to_string(), client.to_string());
+        let what = format!("{}/{}", ev["event"], ev["reason"]);
+        if self.ref_told.get(&key) == Some(&what) {
+            return;
+        }
+        warn!("{controller}: tags from {client}: {ev}");
+        self.ref_told.insert(key, what);
+        ev["controller"] = json!(controller);
+        ev["client"] = json!(client);
+        self.controller_event(controller, &ev);
+    }
+
+    /// Drops external references that went quiet or were taken over by a board.
+    fn check_refs(&mut self) {
+        let lost: Vec<(String, Option<String>)> = {
+            let hub = self.hub.lock().unwrap();
+            self.refs
+                .iter()
+                .filter_map(|(c, r)| match hub.get(c) {
+                    Some(f) if Arc::ptr_eq(f, &r.feed) => {
+                        (r.last.elapsed() > Duration::from_secs(LOST_AFTER_S)).then(|| (c.clone(), None))
+                    }
+                    other => Some((c.clone(), other.map(|f| f.serial.clone()))),
+                })
+                .collect()
+        };
+        for (c, owner) in lost {
+            let r = self.refs.remove(&c).expect("listed above");
+            self.chrony.release(&r.feed.serial);
+            match owner {
+                None => {
+                    let mut hub = self.hub.lock().unwrap();
+                    if hub.get(&c).is_some_and(|f| Arc::ptr_eq(f, &r.feed)) {
+                        hub.remove(&c);
+                    }
+                    drop(hub);
+                    info!("{c}: GNSS reference {} lost (no tags for {LOST_AFTER_S} s)", r.client);
+                    self.ref_told.remove(&(c.clone(), r.client.clone()));
+                    self.controller_event(&c, &json!({"event": "ref_lost", "controller": c, "client": r.client}));
+                }
+                Some(owner) => self.ref_problem(&c, &r.client, json!({"event": "ref_busy", "owner": owner})),
             }
         }
     }
@@ -457,6 +572,7 @@ impl Daemon {
         };
         self.check_images();
         self.scan_boards(&devices);
+        self.check_refs();
         self.reconcile();
         self.publish_infos();
     }

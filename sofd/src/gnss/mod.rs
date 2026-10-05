@@ -2,6 +2,7 @@
 //! giving their controller's frame times in GNSS UTC.
 
 pub mod device;
+pub mod external;
 pub mod firmware;
 pub mod framer;
 pub mod join;
@@ -16,16 +17,29 @@ use timing::Tag;
 
 const MAX_QUEUED_TAGS: usize = 256;
 
-/// SOF tags of one attached device, waiting for its controller's sampler.
+/// Tags from one board or MQTT client, waiting for the sampler.
 pub struct Feed {
-    /// USB serial of the board.
+    /// USB serial of the board, or `mqtt:<client>`.
     pub serial: String,
+    /// Set for an MQTT reference.
+    pub client: Option<String>,
+    /// See `join::BOARD_MAX_LAG`.
+    pub max_lag: i64,
     tags: Mutex<VecDeque<Tag>>,
 }
 
 impl Feed {
     pub fn new(serial: String) -> Self {
-        Self { serial, tags: Mutex::new(VecDeque::new()) }
+        Self { serial, client: None, max_lag: join::BOARD_MAX_LAG, tags: Mutex::new(VecDeque::new()) }
+    }
+
+    pub fn external(client: &str) -> Self {
+        Self {
+            serial: format!("{}{client}", external::NAME_PREFIX),
+            client: Some(client.into()),
+            max_lag: join::MQTT_MAX_LAG,
+            tags: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub fn push(&self, t: Tag) {

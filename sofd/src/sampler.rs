@@ -5,7 +5,7 @@ use crate::chrony;
 use crate::clock::{self, Ns, RealtimeSync};
 use crate::daemon::{Msg, SampleOut};
 use crate::gnss::join::Join;
-use crate::gnss::timing::Source;
+use crate::gnss::timing::{At, Source};
 use crate::gnss::{Feed, Hub};
 use crate::model::{self, Fit, Model};
 use log::{debug, warn};
@@ -87,12 +87,11 @@ struct SampleEvent<'a> {
     gnss: Option<GnssRef<'a>>,
 }
 
-/// The sofgps board on this controller, while one is attached.
 #[derive(Serialize)]
 struct GnssRef<'a> {
-    /// USB serial of the board.
+    /// USB serial of the board, or `mqtt:<client>`.
     board: &'a str,
-    /// What labelled the pulses of the newest tag (`tim_tp` or `zda`).
+    /// What labelled the newest tag: `tim_tp`, `zda` or `external`.
     source: Option<Source>,
     /// host frame = device frame + frame_offset.
     frame_offset: Option<i64>,
@@ -193,6 +192,11 @@ fn run(
     let mut join = Join::default();
     let mut feed: Option<Arc<Feed>> = None;
     let mut gnss_source: Option<Source> = None;
+    // Newest GNSS tag gave sofd's counter directly.
+    let mut by_counter = false;
+    let mut last_ok = false;
+    // Last state reported to an external reference.
+    let mut ref_state: Option<&'static str> = None;
     // When the newest GNSS tag was received (raw clock).
     let mut last_tag_rx: Option<Ns> = None;
     // (t_raw, realtime - raw) of the previous sample, for step detection.
@@ -334,33 +338,56 @@ fn run(
         let t_rt_fs = fit_rt.as_ref().map(|f| f.predict(frame_counter));
         let bus_frame = if hs { raw >> 3 } else { raw } & 0x7ff;
 
-        // GNSS reference: SOF tags of the attached sofgps device, matched to
-        // this controller's frames through the bus frame number.
+        // GNSS reference: match SOF tags to our frames by bus frame number.
         let attached = hub.lock().unwrap().get(id).cloned();
         if feed.as_ref().map(Arc::as_ptr) != attached.as_ref().map(Arc::as_ptr) {
             feed = attached;
             model_gnss.clear();
-            join.reset();
+            join = Join::new(feed.as_ref().map_or(0, |f| f.max_lag));
             gnss_source = None;
             last_tag_rx = None;
+            ref_state = None;
+            last_ok = false;
         }
         if let (Some(fd), Some(f)) = (&feed, &fit) {
             let per_frame: i64 = if hs { 8 } else { 1 };
             let frame_now = counter.div_euclid(per_frame);
             let bus_of = |h: i64| (bus_frame as i64 + h - frame_now).rem_euclid(2048) as u32;
             for tag in fd.drain() {
-                let at_rx = f.counter_ref as f64 + (tag.t_rx - f.t_ref_ns) as f64 / f.period_ns;
-                if let Some(h) = join.host_frame(tag.frame, at_rx / per_frame as f64, bus_of) {
-                    model_gnss.push(h * per_frame, tag.utc_ns, tag.unc_ns);
+                let matched = match tag.at {
+                    At::Frame { frame, microframe } => {
+                        let at_rx = f.counter_ref as f64 + (tag.t_rx - f.t_ref_ns) as f64 / f.period_ns;
+                        let micro = if hs { i64::from(microframe) } else { 0 };
+                        join.host_frame(frame, at_rx / per_frame as f64, bus_of).map(|h| h * per_frame + micro).ok_or("no_match")
+                    }
+                    At::Counter { epoch: e, counter: c } => if e == epoch { Ok(c) } else { Err("epoch") },
+                };
+                last_ok = matched.is_ok();
+                if let Ok(c) = matched {
+                    model_gnss.push(c, tag.utc_ns, tag.unc_ns);
                     gnss_source = Some(tag.source);
                     last_tag_rx = Some(tag.t_rx);
+                    by_counter = matches!(tag.at, At::Counter { .. });
+                }
+                // Tell external references about changes; they can't see why we reject.
+                let state = matched.map_or_else(|r| r, |_| "accepted");
+                if let Some(client) = fd.client.as_deref().filter(|_| ref_state != Some(state)) {
+                    ref_state = Some(state);
+                    let ev = match matched {
+                        Ok(_) => json!({"event": "ref_accepted", "controller": id, "client": client,
+                                        "frame_offset": if by_counter { None } else { join.offset() }}),
+                        Err(reason) => json!({"event": "ref_rejected", "controller": id, "client": client, "reason": reason}),
+                    };
+                    if out.send(Msg::Controller { controller: id.into(), event: ev }).is_err() {
+                        return;
+                    }
                 }
             }
         }
         let fit_gnss = model_gnss.fit(unit as f64);
         let t_gnss_fs = fit_gnss.as_ref().map(|f| f.predict(frame_counter));
         let gnss_valid = fit_gnss.as_ref().is_some_and(|f| f.n >= GNSS_MIN_POINTS)
-            && join.offset().is_some()
+            && last_ok
             && last_tag_rx.is_some_and(|t| s.t_ns - t < GNSS_MAX_AGE_NS);
         let t_realtime = s.t_ns + real_off;
         let chrony_point = fit_gnss
@@ -370,7 +397,7 @@ fn run(
         let gnss = feed.as_ref().map(|fd| GnssRef {
             board: &fd.serial,
             source: gnss_source,
-            frame_offset: join.offset(),
+            frame_offset: if by_counter { None } else { join.offset() },
             realtime_minus_gnss_ns: t_rt_fs.zip(t_gnss_fs).map(|(r, g)| r - g),
         });
 
