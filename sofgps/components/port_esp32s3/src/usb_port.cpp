@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "port_internal.h"
 #include "soc/usb_dwc_struct.h"
+#include "soc/usb_wrap_struct.h"
 #include "sofgps/hal.h"
 #include "tusb.h"
 
@@ -71,9 +72,14 @@ extern "C" void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p) 
 
 extern "C" void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
   (void)itf;
-  (void)dtr;
   (void)rts;
   s_line_state_events++;
+#if CONFIG_SOFGPS_REQUIRE_DTR
+  // Port closed: drop queued data so the next open starts fresh.
+  if (!dtr) tud_cdc_write_clear();
+#else
+  (void)dtr;
+#endif
 }
 
 extern "C" void tud_cdc_notify_complete_cb(uint8_t itf) {
@@ -122,6 +128,9 @@ void usb_start() {
   phy.otg_mode = USB_OTG_MODE_DEVICE;
   phy.otg_speed = USB_PHY_SPEED_FULL;
   ESP_ERROR_CHECK(usb_new_phy(&phy, &s_phy));
+  // After any reset the host must see us leave the bus. TinyUSB's own
+  // disconnect is only microseconds long, too short to notice.
+  port::usb_detach(port::kUsbDetachMs);
 
   // TinyUSB by default overwrites the TX FIFO while DTR is low, which cuts
   // messages in half. Turn that off.
@@ -138,6 +147,27 @@ void usb_start() {
   xTaskCreatePinnedToCore(usb_task, "tinyusb", 4096, nullptr, kUsbTaskPriority, nullptr,
                           kUsbTaskCore);
 }
+
+}  // namespace sofgps::hal
+
+namespace sofgps::port {
+
+void usb_detach(uint32_t ms) {
+  usb_wrap_otg_conf_reg_t conf;
+  conf.val = USB_WRAP.otg_conf.val;
+  conf.pad_pull_override = 1;
+  conf.dp_pullup = 0;
+  conf.dp_pulldown = 1;
+  conf.dm_pullup = 0;
+  conf.dm_pulldown = 1;
+  USB_WRAP.otg_conf.val = conf.val;
+  USB_DWC.dctl_reg.sftdiscon = 1;
+  vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+}  // namespace sofgps::port
+
+namespace sofgps::hal {
 
 bool usb_ready() { return tud_mounted() && !tud_suspended(); }
 

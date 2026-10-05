@@ -7,6 +7,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "mbedtls/sha256.h"
+#include "port_internal.h"
 #include "sofgps/hal.h"
 
 namespace {
@@ -118,6 +119,10 @@ AppInfo app_info() {
   return info;
 }
 
-void restart() { esp_restart(); }
+void restart() {
+  // Drop off the bus first so the host notices the device is gone.
+  port::usb_detach(port::kUsbDetachMs);
+  esp_restart();
+}
 
 }  // namespace sofgps::hal

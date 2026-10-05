@@ -66,12 +66,13 @@ menu "sofgps application"
 
     config SOFGPS_REQUIRE_DTR
         bool "Only send to the host while it asserts DTR"
-        default n
+        default y
         help
             Linux raises DTR when the port is opened and drops it on close.
-            While DTR is low, GPS and timing messages are discarded instead of
-            piling up, so a fresh open starts with live data. Disable for host
-            software that never asserts DTR.
+            While DTR is low, messages are discarded, so a fresh open starts
+            with live data. This also avoids sending data before the host has
+            set up the port, which a new Linux tty would echo back. Disable for
+            host software that never asserts DTR.
 
     config SOFGPS_OUTBOX_BYTES
         int "GPS->host message queue size (bytes)"

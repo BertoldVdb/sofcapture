@@ -44,6 +44,11 @@ void timer_init();
 void uart_init();
 void sys_init();
 
+// Drops off the USB bus for `ms`. Without this a software reset leaves the
+// host talking to the old device. Shorter than 250 ms is unreliable behind hubs.
+constexpr uint32_t kUsbDetachMs = 300;
+void usb_detach(uint32_t ms);
+
 extern portMUX_TYPE g_soft_capture_mux;
 
 #if CONFIG_SOFGPS_SOF_DEBUG
