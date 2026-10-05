@@ -63,7 +63,9 @@ impl Tty {
             t.c_cc[libc::VTIME] = 0;
             check(libc::cfsetspeed(&mut t, speed(baud)?))?;
             check(libc::tcsetattr(fd, libc::TCSANOW, &t))?;
-            check(libc::tcflush(fd, libc::TCIOFLUSH))?;
+            // Input only: a new ttyACM echoes early bytes back to the device, and
+            // flushing those in-flight writes locks up the Raspberry Pi's dwc_otg.
+            check(libc::tcflush(fd, libc::TCIFLUSH))?;
         }
         Ok(tty)
     }
@@ -282,6 +284,11 @@ fn run(
             if !send(BoardOut::Frame(kind, f)) {
                 return None;
             }
+        }
+        // Close the port before the device restarts after OTA,OK: transfers cancelled
+        // when it drops off the bus can lock up the Raspberry Pi's dwc_otg.
+        if session.restarting() {
+            return Some("device restarting after the update".into());
         }
     }
     None

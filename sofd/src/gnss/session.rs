@@ -230,6 +230,11 @@ impl Session {
         }
     }
 
+    /// Firmware written; the device is about to restart.
+    pub fn restarting(&self) -> bool {
+        matches!(self.rx, Rx::OtaDone { .. })
+    }
+
     /// False during a firmware transfer.
     pub fn accepts_tx(&self) -> bool {
         !matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. })
@@ -1113,6 +1118,7 @@ mod tests {
         let mut r = Run::with(cfg, Fake::new(9600, false, true));
         r.for_secs(5);
         assert_eq!(r.session.state(), "restarting", "{:?}", r.states());
+        assert!(r.session.restarting());
         // The image arrived intact: nothing (PING, setup) was mixed into it.
         assert!(r.fake.ota_image == img.data);
         assert!(r.out.events.iter().any(|e| e["state"] == "updating" && e["message"] == "firmware v1 -> v2"));

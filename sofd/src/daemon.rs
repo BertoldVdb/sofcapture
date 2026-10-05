@@ -41,6 +41,8 @@ const RUNNING_STATES: [&str; 3] = ["ubx", "passive", "nmea_fallback"];
 const IMAGE_SETTLE: Duration = Duration::from_secs(2);
 /// Failed updates to one image before giving up on a board.
 const MAX_UPDATE_TRIES: u32 = 2;
+/// Reopen a restarting board after this even if it never left the bus.
+const RESTART_HOLD: Duration = Duration::from_secs(5);
 
 pub enum Msg {
     Sample(Box<SampleOut>),
@@ -480,9 +482,9 @@ impl Daemon {
                 let restarting = slot.state == "restarting";
                 let slot = self.slots.get_mut(serial).unwrap();
                 slot.board = None;
-                // A board restarting into new firmware comes back at once.
+                // Reopen once it re-enumerates, not while the old device is still leaving.
                 slot.backoff = if restarting { Duration::ZERO } else { backoff(slot.backoff) };
-                slot.retry_at = Instant::now() + slot.backoff;
+                slot.retry_at = Instant::now() + if restarting { RESTART_HOLD } else { slot.backoff };
                 self.chrony.release(serial);
                 self.board_event(serial, json!({"event": "detached", "reason": reason}));
                 self.set_status(serial, json!({"state": "detached", "message": reason}));
