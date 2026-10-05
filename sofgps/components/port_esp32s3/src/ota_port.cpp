@@ -34,7 +34,12 @@ bool ota_begin(uint32_t size) {
              (unsigned long)s_target->size);
     return false;
   }
-  esp_err_t err = esp_ota_begin(s_target, size, &s_handle);
+  // Also erase the sector after the image, where the signature lives. A stale
+  // signature from an earlier upload would let an unsigned image pass.
+  const uint32_t sector = 4096;
+  uint32_t erase = (size + sector - 1) / sector * sector + sector;
+  if (erase > s_target->size) erase = s_target->size;
+  esp_err_t err = esp_ota_begin(s_target, erase, &s_handle);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(err));
     return false;

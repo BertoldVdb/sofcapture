@@ -5,3 +5,5 @@ dependencies.lock
 sdkconfig
 sdkconfig.old
 __pycache__/
+# app signing key (see README)
+keys/
