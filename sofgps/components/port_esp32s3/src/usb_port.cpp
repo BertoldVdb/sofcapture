@@ -26,19 +26,27 @@ void* s_cb_ctx;
 uint32_t s_line_coding_events;
 uint32_t s_line_state_events;
 uint32_t s_last_baud;
+// DCD state, shared between the timing and TinyUSB tasks.
+portMUX_TYPE s_dcd_mux = portMUX_INITIALIZER_UNLOCKED;
 bool s_dcd_wanted;
 bool s_dcd_sent;
 bool s_dcd_valid;  // s_dcd_sent is what the host has seen
 uint32_t s_cpu_hz;
 
-// SERIAL_STATE notification carrying DCD (and DSR, always on).
+// Sends DCD to the host. If the wanted level changes meanwhile, the
+// notify-complete callback sends again.
 bool dcd_send() {
+  portENTER_CRITICAL(&s_dcd_mux);
+  bool want = s_dcd_wanted;
+  portEXIT_CRITICAL(&s_dcd_mux);
   cdc_notify_uart_state_t st = {};
   st.dsr = 1;
-  st.dcd = s_dcd_wanted;
+  st.dcd = want;
   if (!tud_cdc_notify_uart_state(&st)) return false;
-  s_dcd_sent = s_dcd_wanted;
+  portENTER_CRITICAL(&s_dcd_mux);
+  s_dcd_sent = want;
   s_dcd_valid = true;
+  portEXIT_CRITICAL(&s_dcd_mux);
   return true;
 }
 
@@ -70,10 +78,17 @@ extern "C" void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
 
 extern "C" void tud_cdc_notify_complete_cb(uint8_t itf) {
   (void)itf;
-  if (s_dcd_valid && s_dcd_sent != s_dcd_wanted) dcd_send();
+  portENTER_CRITICAL(&s_dcd_mux);
+  bool resend = s_dcd_valid && s_dcd_sent != s_dcd_wanted;
+  portEXIT_CRITICAL(&s_dcd_mux);
+  if (resend) dcd_send();
 }
 
-extern "C" void tud_mount_cb(void) { s_dcd_valid = false; }
+extern "C" void tud_mount_cb(void) {
+  portENTER_CRITICAL(&s_dcd_mux);
+  s_dcd_valid = false;
+  portEXIT_CRITICAL(&s_dcd_mux);
+}
 
 extern "C" void tud_cdc_rx_cb(uint8_t itf) {
   (void)itf;
@@ -179,9 +194,11 @@ void cdc_set_callbacks(LineCodingCallback lc, CdcRxCallback rx, void* ctx) {
 bool cdc_connected() { return tud_cdc_connected(); }
 
 bool cdc_set_dcd(bool on) {
+  portENTER_CRITICAL(&s_dcd_mux);
   s_dcd_wanted = on;
-  if (s_dcd_valid && s_dcd_sent == on) return true;
-  return dcd_send();
+  bool done = s_dcd_valid && s_dcd_sent == on;
+  portEXIT_CRITICAL(&s_dcd_mux);
+  return done || dcd_send();
 }
 size_t cdc_write(const uint8_t* data, size_t len) { return tud_cdc_write(data, len); }
 void cdc_write_flush() { tud_cdc_write_flush(); }

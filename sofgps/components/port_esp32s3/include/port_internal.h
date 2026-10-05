@@ -25,16 +25,18 @@ constexpr int kPpsCaptureChannel = 0;
 constexpr int kCalCaptureChannel = 1;
 constexpr int kSoftCaptureChannel = 2;
 
-// Latch the running capture timer into a channel and return it. The capture
-// lands a clock or two after the trigger write, so poll until the register
-// moves away from its previous value.
+// Captures the timer by software. The value lands a clock or two after the
+// trigger, so poll until it changes (bounded, in case the timer is stopped).
+// Call with interrupts masked.
+constexpr int kSoftCapturePolls = 1000;
 __attribute__((always_inline)) static inline uint32_t soft_capture(int channel) {
   uint32_t prev = MCPWM0.cap_chn[channel].capn_value;
   MCPWM0.cap_chn_cfg[channel].capn_sw = 1;
   uint32_t v;
+  int polls = 0;
   do {
     v = MCPWM0.cap_chn[channel].capn_value;
-  } while (v == prev);
+  } while (v == prev && ++polls < kSoftCapturePolls);
   return v;
 }
 

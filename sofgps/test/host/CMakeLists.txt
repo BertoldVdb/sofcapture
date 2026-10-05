@@ -27,6 +27,7 @@ add_executable(sofgps_tests
     test_ota_receiver.cpp
     test_sof_schedule.cpp
     test_cal_signal.cpp
+    test_pps_filter.cpp
 )
 target_include_directories(sofgps_tests PRIVATE ${CORE}/include ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(sofgps_tests PRIVATE -Wall -Wextra -g)

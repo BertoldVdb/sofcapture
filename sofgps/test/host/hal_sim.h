@@ -19,6 +19,7 @@ struct State {
   // OTA stubs
   bool ota_begin_ok = true;
   bool ota_end_ok = true;
+  uint64_t ota_begin_ticks = 0;  // slot erase time
   bool ota_active = false;
   uint64_t ota_bytes = 0;
   int ota_aborts = 0;

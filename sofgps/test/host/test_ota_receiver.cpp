@@ -3,6 +3,7 @@
 
 #include "check.h"
 #include "hal_sim.h"
+#include "sofgps/hal.h"
 #include "sofgps/ota_receiver.h"
 
 using namespace sofgps;
@@ -24,7 +25,7 @@ void reply(const char* s, size_t n, void* ctx) {
 
 const std::string kSha(64, 'a');
 
-void start(OtaReceiver& r, const std::string& args) { r.start(args.c_str(), args.size(), 1000); }
+void start(OtaReceiver& r, const std::string& args) { r.start(args.c_str(), args.size()); }
 
 }  // namespace
 
@@ -116,4 +117,52 @@ TEST(ota_timeout_aborts) {
   CHECK(out.has("ERR,OTATIMEOUT"));
   CHECK_EQ(sim::state().ota_aborts, 1);
   CHECK_EQ(r.feed(data.data(), data.size(), 9000000), 0u);
+}
+
+TEST(ota_timeout_starts_after_slot_erase) {
+  sim::reset();
+  sim::state().ota_begin_ticks = 3ull * sim::state().tick_hz;  // a 3 s erase
+  Replies out;
+  OtaReceiver r(reply, &out);
+  uint64_t before = hal::uptime_us();
+  start(r, "1000," + kSha);
+  uint64_t after = hal::uptime_us();
+  CHECK_EQ(after - before, 3000000u);
+  r.poll(before + OtaReceiver::kTimeoutUs + 1);  // would have expired from before
+  CHECK(r.receiving());
+  r.poll(after + OtaReceiver::kTimeoutUs + 1);
+  CHECK(!r.receiving());
+  CHECK(out.has("ERR,OTATIMEOUT"));
+}
+
+TEST(ota_busy_does_not_abort_running_transfer) {
+  sim::reset();
+  Replies out;
+  OtaReceiver r(reply, &out);
+  start(r, "100," + kSha);
+  std::vector<uint8_t> data(50, 1);
+  r.feed(data.data(), data.size(), 2000);
+  start(r, "100," + kSha);
+  CHECK(out.has("ERR,OTABUSY"));
+  CHECK(r.receiving());
+  CHECK(sim::state().ota_active);
+  CHECK_EQ(sim::state().ota_aborts, 0);
+  r.feed(data.data(), data.size(), 3000);
+  CHECK(r.finished());
+  CHECK(out.has("OTA,OK"));
+}
+
+TEST(ota_cancel_aborts_only_a_running_transfer) {
+  sim::reset();
+  Replies out;
+  OtaReceiver r(reply, &out);
+  r.cancel("OTALINK");  // idle: no reply
+  CHECK(out.lines.empty());
+  start(r, "100," + kSha);
+  r.cancel("OTALINK");
+  CHECK(!r.receiving());
+  CHECK(out.has("ERR,OTALINK"));
+  CHECK_EQ(sim::state().ota_aborts, 1);
+  start(r, "100," + kSha);
+  CHECK(r.receiving());
 }

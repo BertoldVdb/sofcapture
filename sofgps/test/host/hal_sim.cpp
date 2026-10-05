@@ -106,6 +106,7 @@ void led_set(bool) {}
 bool ota_begin(uint32_t) {
   sim::State& s = sim::state();
   if (!s.ota_begin_ok) return false;
+  s.now += s.ota_begin_ticks;
   s.ota_active = true;
   s.ota_bytes = 0;
   return true;

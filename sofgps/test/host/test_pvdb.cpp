@@ -38,12 +38,20 @@ TEST(pvdb_format_pps_and_sof) {
 
 TEST(pvdb_format_info_and_err) {
   char s[pvdb::kMaxSentence];
-  pvdb::Info info{80000000, 100, 1, 2, 3, 4, 5, nullptr};
+  pvdb::Info info{80000000, 100, 1, 2, 3, 4, 5, nullptr, 0};
   size_t n = pvdb::format_info(s, sizeof s, info);
-  CHECK(std::string(s, n) == with_checksum("PVDB,SOFPPS,INFO,80000000,100,1,2,3,4,5,"));
+  CHECK(std::string(s, n) == with_checksum("PVDB,SOFPPS,INFO,80000000,100,1,2,3,4,5,,0"));
   info.tag = "req-42";
+  info.pps_rejected = 6;
   n = pvdb::format_info(s, sizeof s, info);
-  CHECK(std::string(s, n) == with_checksum("PVDB,SOFPPS,INFO,80000000,100,1,2,3,4,5,req-42"));
+  CHECK(std::string(s, n) == with_checksum("PVDB,SOFPPS,INFO,80000000,100,1,2,3,4,5,req-42,6"));
+  // longest possible INFO
+  info = {4294967295u, 4294967295u, 4294967295u, 4294967295u, 4294967295u, 4294967295u,
+          4294967295u, "0123456789abcdef", 4294967295u};
+  n = pvdb::format_info(s, sizeof s, info);
+  CHECK(std::string(s, n) ==
+        with_checksum("PVDB,SOFPPS,INFO,4294967295,4294967295,4294967295,4294967295,4294967295,"
+                      "4294967295,4294967295,0123456789abcdef,4294967295"));
   n = pvdb::format_err(s, sizeof s, "BADDIV");
   CHECK(std::string(s, n) == with_checksum("PVDB,SOFPPS,ERR,BADDIV"));
 }

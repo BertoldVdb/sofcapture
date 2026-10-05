@@ -58,9 +58,9 @@ size_t format_info(char* out, size_t cap, const Info& info) {
   char body[140];
   snprintf(body, sizeof body,
            "PVDB,SOFPPS,INFO,%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32
-           ",%" PRIu32 ",%s",
+           ",%" PRIu32 ",%s,%" PRIu32,
            info.tick_hz, info.divider, info.pps, info.sof_tags, info.sof_missed, info.dropped,
-           info.parse_errors, info.tag ? info.tag : "");
+           info.parse_errors, info.tag ? info.tag : "", info.pps_rejected);
   return format(out, cap, body);
 }
 

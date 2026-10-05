@@ -17,8 +17,8 @@ class OtaReceiver {
 
   OtaReceiver(Reply reply, void* ctx) : reply_(reply), ctx_(ctx) {}
 
-  // Handles the arguments after "OTA,". Replies READY or ERR.
-  void start(const char* args, size_t len, uint64_t now_us);
+  // args: what follows "OTA,". The timeout starts after the slow slot erase.
+  void start(const char* args, size_t len);
 
   // Returns bytes used; anything after the image is normal traffic.
   size_t feed(const uint8_t* data, size_t len, uint64_t now_us);
@@ -26,11 +26,15 @@ class OtaReceiver {
   // Call regularly; checks the timeout.
   void poll(uint64_t now_us);
 
+  // Aborts a running transfer with ERR,<reason>.
+  void cancel(const char* reason);
+
   bool receiving() const { return receiving_; }
   bool finished() const { return finished_; }  // restart when convenient
 
  private:
-  void fail(const char* reason);
+  void fail(const char* reason);  // abort, then err()
+  void err(const char* reason);   // reply ERR,<reason>
   void say(const char* status, uint32_t value, bool with_value);
 
   Reply reply_;

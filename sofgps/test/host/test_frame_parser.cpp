@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -247,8 +248,7 @@ TEST(parser_oversize_frames_dropped) {
 
 TEST(parser_abort_partial_recovers_from_bad_length) {
   Fixture f;
-  // A UBX header claiming a 1000-byte payload (within kMaxUbx), then nothing
-  // more arrives.
+  // UBX header for a 1000-byte payload, then nothing.
   f.feed(std::vector<uint8_t>{0xB5, 0x62, 0x01, 0x07, 0xE8, 0x03, 1, 2, 3});
   CHECK(f.parser.in_frame());
   f.parser.abort_partial();
@@ -298,18 +298,81 @@ TEST(parser_text_inside_ubx_is_not_a_sentence) {
   CHECK(f.sink.frames[0].data == frame);
 }
 
-TEST(parser_oversize_ubx_header_does_not_swallow_stream) {
+TEST(parser_ubx_up_to_buffer_size_accepted) {
   Fixture f;
-  // Claims a payload just over the limit: rejected at the header, and the
-  // sentence right behind it is still found.
-  size_t payload = FrameParser::kMaxUbx - 8 + 1;
-  f.feed(std::vector<uint8_t>{0xB5, 0x62, 0x01, 0x07, static_cast<uint8_t>(payload & 0xFF),
-                              static_cast<uint8_t>(payload >> 8)});
-  CHECK(!f.parser.in_frame());
+  std::vector<uint8_t> big = ubx(0x02, 0x15, std::vector<uint8_t>(3000, 0x11));
+  std::vector<uint8_t> full = ubx(0x02, 0x15, std::vector<uint8_t>(sizeof f.buf - 8, 0x22));
+  f.feed(big + full + kAckAck);
+  CHECK_EQ(f.sink.frames.size(), 3u);
+  CHECK(f.sink.frames[0].data == big);
+  CHECK(f.sink.frames[1].data == full);
+  CHECK(f.sink.frames[2].data == kAckAck);
+  CHECK_EQ(f.parser.stats().oversize, 0u);
+}
+
+TEST(parser_oversize_ubx_skipped_by_declared_length) {
+  uint8_t small[64];
+  Sink sink;
+  FrameParser p(small, sizeof small, collect, &sink);
+  // Payload ends with a fake frame start.
+  std::vector<uint8_t> payload(100, 0xAA);
+  const std::vector<uint8_t> fake = {'$', 0xB5, 0x62, 0x01, 0x02, 40, 0x00};
+  std::copy(fake.begin(), fake.end(), payload.end() - fake.size());
+  std::vector<uint8_t> big = ubx(1, 2, payload);
+  std::vector<uint8_t> stream = big + kAckAck + bytes(nmea("GPZDA,1"));
+  p.feed(stream.data(), stream.size());
+  CHECK_EQ(sink.frames.size(), 2u);
+  CHECK(sink.frames[0].data == kAckAck);
+  CHECK(sink.frames[1].type == FrameType::Nmea);
+  CHECK_EQ(p.stats().oversize, 1u);
+  CHECK_EQ(p.stats().junk_bytes, big.size());
+}
+
+TEST(parser_oversize_rtcm_skipped_by_declared_length) {
+  uint8_t small[64];
+  Sink sink;
+  FrameParser p(small, sizeof small, collect, &sink);
+  std::vector<uint8_t> payload(200, 0x00);
+  payload[190] = 0xB5;
+  payload[191] = 0x62;
+  std::vector<uint8_t> stream = rtcm(payload) + kAckAck;
+  p.feed(stream.data(), stream.size());
+  CHECK_EQ(sink.frames.size(), 1u);
+  CHECK(sink.frames[0].data == kAckAck);
+  CHECK_EQ(p.stats().oversize, 1u);
+}
+
+TEST(parser_oversize_skip_ended_by_abort_partial) {
+  Fixture f;
+  // Header claims 65535 bytes, then the stream stops.
+  f.feed(std::vector<uint8_t>{0xB5, 0x62, 0x01, 0x07, 0xFF, 0xFF, 1, 2, 3});
   CHECK_EQ(f.parser.stats().oversize, 1u);
+  CHECK(f.parser.in_frame());
+  CHECK(f.parser.partial_len() > 0u);
+  f.parser.abort_partial();
+  CHECK(!f.parser.in_frame());
+  CHECK_EQ(f.parser.stats().timeouts, 1u);
   f.feed(kGga);
   CHECK_EQ(f.sink.frames.size(), 1u);
   CHECK(f.sink.frames[0].type == FrameType::Nmea);
+}
+
+TEST(parser_nmea_longest_sentence_fits_buffer) {
+  for (size_t cap : {size_t{16}, FrameParser::kMaxNmea}) {
+    uint8_t buf[300];
+    memset(buf, 0xEE, sizeof buf);
+    Sink sink;
+    FrameParser p(buf, cap, collect, &sink);
+    std::string fits = nmea(std::string(cap - 6, 'A'));
+    std::string over = nmea(std::string(cap - 5, 'A'));
+    CHECK_EQ(fits.size(), cap);
+    p.feed(reinterpret_cast<const uint8_t*>(fits.data()), fits.size());
+    p.feed(reinterpret_cast<const uint8_t*>(over.data()), over.size());
+    CHECK_EQ(sink.frames.size(), 1u);
+    CHECK(sink.frames[0].data == bytes(fits));
+    CHECK_EQ(p.stats().oversize, 1u);
+    CHECK_EQ(buf[cap], 0xEE);  // nothing written past the buffer
+  }
 }
 
 TEST(parser_reset_discards_partial) {
@@ -318,4 +381,20 @@ TEST(parser_reset_discards_partial) {
   f.parser.reset();
   f.feed(kAckAck);
   CHECK_EQ(f.sink.frames.size(), 1u);
+}
+
+TEST(parser_declared_len_and_frame_age_limit) {
+  Fixture f;
+  CHECK_EQ(f.parser.declared_len(), FrameParser::kMaxNmea);
+  // 3000-byte payload
+  f.feed(std::vector<uint8_t>{0xB5, 0x62, 0x02, 0x15, 0xB8, 0x0B});
+  CHECK(f.parser.in_frame());
+  CHECK_EQ(f.parser.declared_len(), 6u + 3000 + 2);
+  f.parser.abort_partial();
+  f.feed(std::string("$GPZDA"));
+  CHECK_EQ(f.parser.declared_len(), FrameParser::kMaxNmea);
+  // 1.067 s on the wire, +25%, +100 ms
+  CHECK_EQ(FrameParser::max_frame_us(4096, 38400, 100000), 1066666u + 266666 + 100000);
+  CHECK_EQ(FrameParser::max_frame_us(82, 9600, 100000), 85416u + 21354 + 100000);
+  CHECK(FrameParser::max_frame_us(256, 0, 100000) > 8000000u);
 }

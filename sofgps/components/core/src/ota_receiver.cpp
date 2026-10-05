@@ -41,15 +41,19 @@ void OtaReceiver::say(const char* status, uint32_t value, bool with_value) {
 void OtaReceiver::fail(const char* reason) {
   if (receiving_) hal::ota_abort();
   receiving_ = false;
+  err(reason);
+}
+
+void OtaReceiver::err(const char* reason) {
   char s[pvdb::kMaxSentence];
   size_t n = pvdb::format_err(s, sizeof s, reason);
   reply_(s, n, ctx_);
 }
 
 // args: "<size>,<sha256hex>"
-void OtaReceiver::start(const char* args, size_t len, uint64_t now_us) {
+void OtaReceiver::start(const char* args, size_t len) {
   if (receiving_ || finished_) {
-    fail("OTABUSY");
+    err("OTABUSY");
     return;
   }
   char buf[96];
@@ -82,7 +86,7 @@ void OtaReceiver::start(const char* args, size_t len, uint64_t now_us) {
   size_ = static_cast<uint32_t>(size);
   received_ = 0;
   next_ack_ = kAckBytes;
-  last_rx_us_ = now_us;
+  last_rx_us_ = hal::uptime_us();  // timeout starts after the erase
   receiving_ = true;
   say("READY", 0, false);
 }
@@ -116,6 +120,10 @@ size_t OtaReceiver::feed(const uint8_t* data, size_t len, uint64_t now_us) {
 
 void OtaReceiver::poll(uint64_t now_us) {
   if (receiving_ && now_us - last_rx_us_ > kTimeoutUs) fail("OTATIMEOUT");
+}
+
+void OtaReceiver::cancel(const char* reason) {
+  if (receiving_) fail(reason);
 }
 
 }  // namespace sofgps

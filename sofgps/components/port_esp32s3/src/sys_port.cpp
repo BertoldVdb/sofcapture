@@ -59,8 +59,13 @@ void sleep_us(uint32_t us) {
     return;
   }
   s_sleeper = xTaskGetCurrentTaskHandle();
-  ulTaskNotifyTake(pdTRUE, 0);  // discard a stale notification
-  ESP_ERROR_CHECK(esp_timer_start_once(s_sleep_timer, us));
+  // A timed-out earlier wait may have left the timer armed.
+  esp_timer_stop(s_sleep_timer);  // fails harmlessly if not running
+  ulTaskNotifyTake(pdTRUE, 0);    // clear a stale notification
+  if (esp_timer_start_once(s_sleep_timer, us) != ESP_OK) {
+    esp_rom_delay_us(us);
+    return;
+  }
   ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(us / 1000 + 10));
 }
 

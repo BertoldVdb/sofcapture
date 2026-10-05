@@ -31,6 +31,12 @@ void FrameParser::abort_partial() {
   reset();
 }
 
+uint64_t FrameParser::max_frame_us(size_t bytes, uint32_t baud, uint64_t slack_us) {
+  if (baud == 0) baud = 300;  // unknown: assume the slowest
+  uint64_t wire = static_cast<uint64_t>(bytes) * 10 * 1000000 / baud;
+  return wire + wire / 4 + slack_us;
+}
+
 void FrameParser::feed(const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; ++i) byte(data[i]);
 }
@@ -59,6 +65,7 @@ void FrameParser::emit(FrameType type) {
 
 void FrameParser::start(uint8_t b) {
   len_ = 0;
+  declared_ = 0;
   if (b == '$' || b == '!') {
     buf_[len_++] = b;
     nmea_xor_ = 0;
@@ -74,6 +81,15 @@ void FrameParser::start(uint8_t b) {
     if (b != '\r' && b != '\n') stats_.junk_bytes++;
     state_ = State::Idle;
   }
+}
+
+// Too big for the buffer: skip it using the length from its header.
+void FrameParser::skip_oversize() {
+  stats_.oversize++;
+  stats_.junk_bytes += static_cast<uint32_t>(len_);
+  need_ -= len_;
+  len_ = 0;
+  state_ = State::Skip;
 }
 
 // Drop the partial frame and retry b as a frame start.
@@ -102,8 +118,8 @@ void FrameParser::byte(uint8_t b) {
       } else if (b == '$' || b == '!') {
         abort_to_idle(b);
       } else if (nmea_printable(b)) {
-        // Room for "*hh\r\n" must remain.
-        if (len_ + 5 > kMaxNmea || len_ + 5 > cap_) {
+        // leave room for "*hh\r\n"
+        if (len_ + 6 > kMaxNmea || len_ + 6 > cap_) {
           stats_.oversize++;
           stats_.junk_bytes += static_cast<uint32_t>(len_);
           len_ = 0;
@@ -152,9 +168,9 @@ void FrameParser::byte(uint8_t b) {
       if (len_ == 6) {
         size_t payload = buf_[4] | (static_cast<size_t>(buf_[5]) << 8);
         need_ = 6 + payload + 2;
-        if (need_ > cap_ || need_ > kMaxUbx) {
-          stats_.oversize++;
-          state_ = State::Idle;
+        declared_ = need_;
+        if (need_ > cap_) {
+          skip_oversize();
         } else {
           state_ = State::UbxBody;
         }
@@ -177,9 +193,9 @@ void FrameParser::byte(uint8_t b) {
         }
         size_t payload = (static_cast<size_t>(buf_[1] & 0x03) << 8) | buf_[2];
         need_ = 3 + payload + 3;
+        declared_ = need_;
         if (need_ > cap_) {
-          stats_.oversize++;
-          state_ = State::Idle;
+          skip_oversize();
         } else {
           state_ = State::RtcmBody;
         }
@@ -189,6 +205,11 @@ void FrameParser::byte(uint8_t b) {
     case State::RtcmBody:
       buf_[len_++] = b;
       if (len_ == need_) finish_rtcm();
+      break;
+
+    case State::Skip:
+      stats_.junk_bytes++;
+      if (--need_ == 0) state_ = State::Idle;
       break;
   }
 }

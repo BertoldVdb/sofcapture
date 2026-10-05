@@ -1,12 +1,12 @@
 menu "sofgps application"
 
     config SOFGPS_SOF_DIVIDER
-        int "Default SOF divider (tag frames where frame % N == 0)"
+        int "Default SOF divider (tag one frame in every N)"
         range 1 1000000
         default 100
         help
-            100 tags ten SOFs per second. Changeable at runtime with
-            $PVDB,SOFPPS,DIV,<n>*hh on the CDC port.
+            100 gives ten tagged SOFs per second. Can be changed at runtime with
+            $PVDB,SOFPPS,DIV,<n>*hh.
 
     config SOFGPS_SOF_DEBUG
         bool "Emit SOF spin diagnostics (SOFDBG sentences)"
@@ -87,8 +87,24 @@ menu "sofgps application"
             Otherwise a corrupted UBX/RTCM length could make the parser wait for
             kilobytes and swallow the messages that follow.
 
+    config SOFGPS_FRAME_SLACK_MS
+        int "Slack on a GPS frame's arrival time (ms)"
+        range 20 2000
+        default 100
+        help
+            A partial frame is dropped if it isn't complete within 1.25 times
+            its expected wire time plus this slack. This catches false frame
+            starts with a large length, and frames that trickle in too slowly to
+            hit the idle timeout.
+
     config SOFGPS_PARSER_BYTES
         int "Largest GPS frame accepted (bytes)"
+        range 1029 65535
         default 4096
+        help
+            Largest UBX frame passed to the host; larger ones are skipped and
+            counted in parse_errors. The minimum is the largest RTCM3 frame.
+            Must be below SOFGPS_OUTBOX_BYTES. The default fits a UBX-RXM-RAWX
+            with 127 measurements.
 
 endmenu

@@ -14,7 +14,9 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_gpio.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hal/gpio_ll.h"
 #include "hal/ledc_ll.h"
@@ -41,6 +43,40 @@ portMUX_TYPE s_start_mux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t* s_buf;
 sofgps::hal::CalCallback s_cb;
 void* s_cb_ctx;
+
+// A timer wakes us this long before a SQ40 burst ends; we busy-wait the rest.
+constexpr uint32_t kSq40SpinUs = 100;
+esp_timer_handle_t s_stop_timer;
+SemaphoreHandle_t s_stop_sem;
+
+void IRAM_ATTR on_stop_timer(void*) {
+  BaseType_t woken = pdFALSE;
+  xSemaphoreGiveFromISR(s_stop_sem, &woken);
+  if (woken) esp_timer_isr_dispatch_need_yield();
+}
+
+bool stop_timer_init() {
+  s_stop_sem = xSemaphoreCreateBinary();
+  if (!s_stop_sem) return false;
+  esp_timer_create_args_t args = {};
+  args.callback = on_stop_timer;
+  args.dispatch_method = ESP_TIMER_ISR;
+  args.name = "cal_stop";
+  return esp_timer_create(&args, &s_stop_timer) == ESP_OK;
+}
+
+void wait_until(int64_t stop_at_us) {
+  int64_t left = stop_at_us - esp_timer_get_time();
+  if (left > static_cast<int64_t>(kSq40SpinUs)) {
+    esp_timer_stop(s_stop_timer);   // fails harmlessly if not running
+    xSemaphoreTake(s_stop_sem, 0);  // clear a stale wake-up
+    if (esp_timer_start_once(s_stop_timer, left - kSq40SpinUs) == ESP_OK) {
+      xSemaphoreTake(s_stop_sem, pdMS_TO_TICKS(left / 1000 + 10));
+    }
+  }
+  while (esp_timer_get_time() < stop_at_us) {
+  }
+}
 
 bool IRAM_ATTR on_cal_capture(mcpwm_cap_channel_handle_t, const mcpwm_capture_event_data_t* e,
                               void*) {
@@ -121,7 +157,7 @@ bool cal_init(CalCallback cb, void* ctx) {
     return false;
   }
 
-  s_ledc_ok = ledc_init();
+  s_ledc_ok = ledc_init() && stop_timer_init();
   if (!s_ledc_ok) ESP_LOGE(TAG, "LEDC 40 MHz setup failed; SQ40 unavailable");
   route_spi();  // ledc_channel_config took over the output pad
 
@@ -159,7 +195,7 @@ bool cal_burst_square40(uint32_t duration_us) {
                                   ledc_periph_signal[kLedcMode].sig_out0_idx + kLedcChannel,
                                   false, false);
   square40_start();
-  vTaskDelay(pdMS_TO_TICKS((duration_us + 999) / 1000));
+  wait_until(esp_timer_get_time() + duration_us);
   ledc_stop(kLedcMode, kLedcChannel, 0);
   gpio_ll_set_level(&GPIO, CONFIG_SOFGPS_CAL_CS_GPIO, 1);
   route_spi();

@@ -15,6 +15,7 @@
 #include "sofgps/hal.h"
 #include "sofgps/msg_queue.h"
 #include "sofgps/ota_receiver.h"
+#include "sofgps/pps_filter.h"
 #include "sofgps/pvdb.h"
 #include "sofgps/sof_spin_source.h"
 #include "sofgps/timing_reporter.h"
@@ -22,6 +23,15 @@
 #if CONFIG_SOFGPS_SOF_DEBUG
 #include "port_internal.h"
 #endif
+
+// Kconfig leaves "n" booleans undefined; treat them as 0.
+#ifndef CONFIG_SOFGPS_SOF_DITHER
+#define CONFIG_SOFGPS_SOF_DITHER 0
+#endif
+
+// Any GPS frame plus its 2-byte header must fit in the outbox.
+static_assert(CONFIG_SOFGPS_PARSER_BYTES + 2 <= CONFIG_SOFGPS_OUTBOX_BYTES,
+              "SOFGPS_PARSER_BYTES must be below SOFGPS_OUTBOX_BYTES");
 
 using namespace sofgps;
 
@@ -95,8 +105,7 @@ volatile CalMode s_cal_mode_now = CalMode::Off;
 volatile bool s_cal_synced_now = false;
 volatile uint32_t s_cal_n_now = 0;
 
-// Host-silence watchdog: restart if no bulk-OUT data arrives from the host
-// for this long (control requests do not count). Recovers a wedged USB path.
+// Restart if the host sends no data for this long, to recover a stuck USB link.
 constexpr uint32_t kHostSilenceS = 60;
 uint32_t s_host_activity_s;  // uptime in seconds
 
@@ -111,8 +120,14 @@ TimingEvent make_event(EvKind kind, uint32_t tick = 0, uint64_t frame = 0) {
 void post(const TimingEvent& ev) { xQueueSend(s_timing_q, &ev, 0); }
 void post(EvKind kind, uint32_t tick = 0, uint64_t frame = 0) { post(make_event(kind, tick, frame)); }
 
+// Drops extra edges from ringing or a slow PPS edge.
+PpsFilter s_pps_filter;
+uint32_t s_tick_hz;  // cached for the ISR
+
 bool IRAM_ATTR on_pps_isr(uint32_t tick, void*) {
-  TimingEvent ev = make_event(EvKind::Pps, tick, hal::uptime_us());
+  uint64_t now = hal::uptime_us();
+  if (!s_pps_filter.accept(tick, now, s_tick_hz)) return false;
+  TimingEvent ev = make_event(EvKind::Pps, tick, now);
   BaseType_t woken = pdFALSE;
   xQueueSendFromISR(s_timing_q, &ev, &woken);
   if (s_cal_task) vTaskNotifyGiveFromISR(s_cal_task, &woken);  // start a calibration burst
@@ -222,6 +237,8 @@ bool serial_ok(uint64_t now_us) {
 
 // GPS bytes read by gps_rx but not yet in the outbox.
 std::atomic<uint32_t> s_rx_held{0};
+// Current GPS baud rate, for the frame timeout.
+std::atomic<uint32_t> s_gps_baud{CONFIG_SOFGPS_GPS_DEFAULT_BAUD};
 // Uptime (ms, rounded up) when the UART driver last handed us GPS bytes.
 std::atomic<uint32_t> s_rx_handover_ms{0};
 
@@ -237,6 +254,7 @@ uint32_t gps_rx_idle_ms(uint64_t edge_us) {
 void gps_rx_task(void*) {
   static uint8_t buf[512];
   uint64_t last_rx = 0;
+  uint64_t frame_start = 0;  // 0: no frame in progress
   hal::watchdog_register_task();
   for (;;) {
     hal::watchdog_feed();
@@ -253,6 +271,16 @@ void gps_rx_task(void*) {
     } else if (s_parser->in_frame() &&
                now - last_rx > static_cast<uint64_t>(CONFIG_SOFGPS_FRAME_TIMEOUT_MS) * 1000) {
       s_parser->abort_partial();
+    }
+    if (!s_parser->in_frame()) {
+      frame_start = 0;
+    } else if (frame_start == 0) {
+      frame_start = now;
+    } else if (now - frame_start >
+               FrameParser::max_frame_us(s_parser->declared_len(), s_gps_baud.load(),
+                                         static_cast<uint64_t>(CONFIG_SOFGPS_FRAME_SLACK_MS) * 1000)) {
+      s_parser->abort_partial();
+      frame_start = 0;
     }
     s_rx_held.store(s_parser->partial_len());
   }
@@ -308,7 +336,10 @@ void usb_tx_task(void*) {
 
 // ---- host -> GPS -----------------------------------------------------------
 
-void on_line_coding(const hal::LineCoding& lc, void*) { hal::gps_uart_configure(lc); }
+void on_line_coding(const hal::LineCoding& lc, void*) {
+  hal::gps_uart_configure(lc);
+  if (lc.baud >= 300 && lc.baud <= 5000000) s_gps_baud.store(lc.baud);  // same range as gps_uart_configure
+}
 
 void on_cdc_rx(void*) {
   if (s_h2g_task) xTaskNotifyGive(s_h2g_task);
@@ -359,7 +390,7 @@ void on_command(const char* fields, size_t len, void*) {
   } else if (len == 6 && memcmp(fields, "SIMPPS", 6) == 0) {
     hal::pps_inject();  // test hook: fake a PPS edge
   } else if (len > 4 && memcmp(fields, "OTA,", 4) == 0) {
-    s_ota->start(fields + 4, len - 4, hal::uptime_us());
+    s_ota->start(fields + 4, len - 4);
   } else {
     post(EvKind::Error, 2, 0);
   }
@@ -385,26 +416,44 @@ void on_host_frame(FrameType type, const uint8_t* data, size_t len, void*) {
   }
 }
 
+// Largest frame the host can send to the GPS.
+constexpr size_t kHostFrameBytes = 2048;
+// Yield after this many chunks so a long OTA upload can't starve the idle task.
+constexpr int kHostChunksPerPass = 16;
+
 void host_to_gps_task(void*) {
   static uint8_t buf[512];
-  static uint8_t frame_buf[FrameParser::kMaxUbx];
+  static uint8_t frame_buf[kHostFrameBytes];
   FrameParser host_frames(frame_buf, sizeof frame_buf, on_host_frame, nullptr);
   uint64_t last_host_byte = 0;
+  bool more = false;  // previous pass left data unread
   hal::watchdog_register_task();
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    if (more) {
+      vTaskDelay(1);
+    } else {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    }
     hal::watchdog_feed();
     uint64_t now = hal::uptime_us();
     if (host_frames.in_frame() &&
         now - last_host_byte > static_cast<uint64_t>(CONFIG_SOFGPS_FRAME_TIMEOUT_MS) * 1000) {
       host_frames.abort_partial();
     }
+    // Host went away mid-update: what it sends next isn't the rest of this image.
+    if (s_ota->receiving() && !host_listening()) s_ota->cancel("OTALINK");
     s_ota->poll(now);
     if (s_ota->finished()) {
       vTaskDelay(pdMS_TO_TICKS(500));  // let OTA,OK go out first
       hal::restart();
     }
-    while (hal::cdc_read_available()) {
+    more = false;
+    for (int chunk = 0; hal::cdc_read_available(); ++chunk) {
+      if (chunk == kHostChunksPerPass) {
+        more = true;
+        break;
+      }
+      hal::watchdog_feed();
       last_host_byte = hal::uptime_us();
       s_host_activity_s = static_cast<uint32_t>(last_host_byte / 1000000);
       size_t n = hal::cdc_read(buf, sizeof buf);
@@ -431,6 +480,7 @@ void send_info(const TimingReporter& reporter, const char* tag = nullptr) {
   if (s_spin) info.sof_missed = s_spin->stats().late + s_spin->stats().timeouts;
   info.dropped = s_outbox.dropped();
   info.parse_errors = s_parser->stats().errors();
+  info.pps_rejected = s_pps_filter.rejected();
   char s[pvdb::kMaxSentence];
   size_t n = pvdb::format_info(s, sizeof s, info);
   emit_sentence(s, n, nullptr);
@@ -544,6 +594,8 @@ void timing_task(void*) {
       }
 #if CONFIG_SOFGPS_HOST_WDT
       uint32_t now_s = static_cast<uint32_t>(now / 1000000);
+      // A suspended bus is supposed to be quiet.
+      if (hal::usb_stats().suspended) s_host_activity_s = now_s;
       if (now_s - s_host_activity_s > kHostSilenceS) {
         ESP_LOGW(TAG, "no host activity for %lus, restarting", (unsigned long)kHostSilenceS);
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -574,6 +626,7 @@ extern "C" void app_main() {
 
   hal::cdc_set_callbacks(on_line_coding, on_cdc_rx, nullptr);
   hal::usb_start();
+  s_tick_hz = hal::tick_hz();
   hal::pps_capture_start(on_pps_isr, nullptr);
 
   xTaskCreatePinnedToCore(timing_task, "timing", 4096, nullptr, 6, nullptr, 0);

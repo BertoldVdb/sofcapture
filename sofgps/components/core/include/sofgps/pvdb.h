@@ -1,18 +1,16 @@
 // $PVDB,SOFPPS sentences and host commands.
 // Device -> host
-//   $PVDB,SOFPPS,PPS,<tick>*hh
+//   $PVDB,SOFPPS,PPS,<tick>,<rx_idle_ms>*hh
 //   $PVDB,SOFPPS,SOF,<tick>,<frame>*hh
-//   $PVDB,SOFPPS,INFO,<tick_hz>,<divider>,<pps>,<sof_tags>,<sof_missed>,<dropped>,<parse_errors>,<tag>*hh
+//   $PVDB,SOFPPS,INFO,<tick_hz>,<divider>,<pps>,<sof_tags>,<sof_missed>,<dropped>,<parse_errors>,<tag>,<pps_rejected>*hh
 //   $PVDB,SOFPPS,ERR,<text>*hh
 //   $PVDB,SOFPPS,USB,<mounted>,<suspended>,<dtr>,<line_coding_events>,<line_state_events>,<baud>*hh
 //   $PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending_verify>,<elf_sha256>,<reset_reason>*hh
 //   $PVDB,SOFPPS,OTA,<READY|ACK,<bytes>|OK>*hh
 //   $PVDB,SOFPPS,CAL,<tick>,<NOISE|SQ2|SQ20|SQ40>,<pps_synced>,<n>*hh   burst start
-// Host -> device (checksum required; the bytes are also forwarded to the GPS)
-//   $PVDB,SOFPPS,DIV,<n>*hh      tag every n-th frame (frame % n == 0)
-//   $PVDB,SOFPPS,INFO[,<tag>]*hh request an INFO sentence; <tag> (up to 16 chars of
-//                                [A-Za-z0-9._-]) is echoed in it, so everything after
-//                                that INFO is data produced after the request
+// Host -> device (checksum required; commands are not forwarded to the GPS)
+//   $PVDB,SOFPPS,DIV,<n>*hh      tag one frame in every n (see sof_schedule.h)
+//   $PVDB,SOFPPS,INFO[,<tag>]*hh request INFO; the tag is echoed back in it
 //   $PVDB,SOFPPS,PING*hh         no reply; keeps the host-silence watchdog quiet
 //   $PVDB,SOFPPS,VER*hh          request a VER sentence (also confirms a new image)
 //   $PVDB,SOFPPS,SIMPPS*hh       test hook: act as if a PPS edge arrived now
@@ -47,7 +45,8 @@ struct Info {
   uint32_t sof_missed;
   uint32_t dropped;
   uint32_t parse_errors;
-  const char* tag;  // echoed request tag, nullptr or "" for periodic sentences
+  const char* tag;  // nullptr or "" if not requested
+  uint32_t pps_rejected;  // last, so older parsers still work
 };
 
 // 1..kMaxTag chars of [A-Za-z0-9._-].
