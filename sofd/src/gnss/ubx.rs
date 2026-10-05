@@ -5,17 +5,39 @@ use crate::clock::Ns;
 
 pub type Id = (u8, u8);
 pub const NAV_STATUS: Id = (0x01, 0x03);
+pub const NAV_SOL: Id = (0x01, 0x06);
+pub const NAV_PVT: Id = (0x01, 0x07);
 pub const NAV_TIMEGPS: Id = (0x01, 0x20);
+pub const NAV_TIMEUTC: Id = (0x01, 0x21);
+pub const NAV_SVINFO: Id = (0x01, 0x30);
+pub const NAV_SAT: Id = (0x01, 0x35);
 pub const ACK_NAK: Id = (0x05, 0x00);
 pub const ACK_ACK: Id = (0x05, 0x01);
 pub const CFG_PRT: Id = (0x06, 0x00);
 pub const CFG_MSG: Id = (0x06, 0x01);
 pub const CFG_VALSET: Id = (0x06, 0x8A);
 pub const MON_VER: Id = (0x0A, 0x04);
+pub const MON_HW: Id = (0x0A, 0x09);
+pub const MON_SPAN: Id = (0x0A, 0x31);
 pub const TIM_TP: Id = (0x0D, 0x01);
 
 /// Enabled once per navigation solution.
 pub const ENABLED: [Id; 3] = [TIM_TP, NAV_TIMEGPS, NAV_STATUS];
+/// Large diagnostics go out only every this many epochs, so they don't crowd the pulse.
+pub const SLOW_EVERY: u8 = 5;
+
+/// Diagnostics forwarded to monitoring peers, with rates, for a receiver generation.
+pub fn diagnostics(generation: u8) -> Vec<(Id, u8)> {
+    let mut d = vec![];
+    if generation >= 7 {
+        d.push((NAV_PVT, 1));
+    } else {
+        d.extend([(NAV_SOL, 1), (NAV_TIMEUTC, 1)]);
+    }
+    d.push((if generation >= 8 { NAV_SAT } else { NAV_SVINFO }, SLOW_EVERY));
+    d.push((if generation >= 9 { MON_SPAN } else { MON_HW }, SLOW_EVERY));
+    d
+}
 
 const GPS_EPOCH_UNIX_S: i64 = 315_964_800;
 const WEEK_S: i64 = 604_800;
@@ -129,8 +151,27 @@ impl Version {
 
     /// u-blox 10 dropped CFG-PRT/CFG-MSG.
     pub fn uses_valset(&self) -> bool {
-        let hw = u32::from_str_radix(&self.hw, 16).unwrap_or(0);
-        self.protocol().is_some_and(|p| p >= 27.0) || hw == 0x0019_0000 || hw == 0x000A_0000
+        self.generation() >= 9
+    }
+
+    /// From the hardware version, else the protocol version; 5 if neither tells.
+    pub fn generation(&self) -> u8 {
+        match u32::from_str_radix(&self.hw, 16).unwrap_or(0) {
+            0x000A_0000 => return 10,
+            0x0019_0000 => return 9,
+            0x0008_0000 => return 8,
+            0x0007_0000 => return 7,
+            0x0004_0007 => return 6,
+            0x0004_0005 => return 5,
+            _ => {}
+        }
+        match self.protocol() {
+            Some(p) if p >= 27.0 => 9,
+            Some(p) if p >= 15.0 => 8,
+            Some(p) if p >= 14.0 => 7,
+            Some(p) if p >= 13.0 => 6,
+            _ => 5,
+        }
     }
 }
 
@@ -173,6 +214,9 @@ pub mod key {
             super::TIM_TP => 0x2091_017E,
             super::NAV_TIMEGPS => 0x2091_0048,
             super::NAV_STATUS => 0x2091_001B,
+            super::NAV_PVT => 0x2091_0007,
+            super::NAV_SAT => 0x2091_0016,
+            super::MON_SPAN => 0x2091_038C,
             _ => unreachable!("no CFG-MSGOUT key for {id:?}"),
         };
         if port == 2 { uart1 + 1 } else { uart1 }
@@ -241,6 +285,17 @@ mod tests {
         let v = Version::parse(&old).unwrap();
         assert_eq!(v.protocol(), None);
         assert!(!v.uses_valset());
+        assert_eq!(v.generation(), 5);
+        assert_eq!(diagnostics(5), [(NAV_SOL, 1), (NAV_TIMEUTC, 1), (NAV_SVINFO, SLOW_EVERY), (MON_HW, SLOW_EVERY)]);
+        assert_eq!(diagnostics(8), [(NAV_PVT, 1), (NAV_SAT, SLOW_EVERY), (MON_HW, SLOW_EVERY)]);
+        assert_eq!(diagnostics(10), [(NAV_PVT, 1), (NAV_SAT, SLOW_EVERY), (MON_SPAN, SLOW_EVERY)]);
+        // Keys as in the u-blox M9/M10 interface description.
+        assert_eq!(key::msgout(NAV_PVT, 1), 0x2091_0007);
+        assert_eq!(key::msgout(NAV_SAT, 1), 0x2091_0016);
+        assert_eq!(key::msgout(MON_SPAN, 1), 0x2091_038C);
+        let mut m8 = vec![0u8; 40];
+        m8[30..38].copy_from_slice(b"00080000");
+        assert_eq!(Version::parse(&m8).unwrap().generation(), 8);
     }
 
     #[test]

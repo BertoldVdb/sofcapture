@@ -1,19 +1,5 @@
-//! One attached sofgps device, as a state machine without I/O: it is fed the
-//! bytes read from the tty and the time, and writes through a `Port`.
-//!
-//! 1. Handshake: `INFO,<nonce>` until the device echoes it, which skips
-//!    whatever the device had queued before the port was opened; then VER.
-//! 2. Firmware: if an image is configured and the device runs another one
-//!    (ELF SHA-256 from VER), send it (`OTA`); the device then restarts and
-//!    the session ends with the tty.
-//! 3. Receiver setup (unless disabled): find the receiver at the target baud
-//!    or its initial baud (the device forwards only valid frames, so a wrong
-//!    baud is silence), identify it with UBX-MON-VER, enable TIM-TP,
-//!    NAV-TIMEGPS and NAV-STATUS, switch output to UBX only and the port to
-//!    the target baud (CFG-MSG/CFG-PRT up to u-blox 8, CFG-VALSET from
-//!    generation 9), RAM only. Any timeout restarts the whole process.
-//! 4. Running: pulses are labelled from TIM-TP. A receiver that does not
-//!    answer UBX is left as it is and labelled from NMEA ZDA.
+//! State machine for one sofgps device, without I/O: handshake, firmware update, receiver setup,
+//! then labelling pulses from TIM-TP, or from NMEA ZDA if the receiver doesn't answer UBX.
 
 use super::firmware::Image;
 use super::framer::{Framer, Kind};
@@ -103,6 +89,31 @@ struct Step {
     frame: Vec<u8>,
     /// None for the baud change: its ACK may be lost.
     ack: Option<ubx::Id>,
+    /// Diagnostics: skipped if rejected or unanswered.
+    optional: Option<String>,
+}
+
+impl Step {
+    fn required(frame: Vec<u8>, ack: Option<ubx::Id>) -> Self {
+        Self { frame, ack, optional: None }
+    }
+
+    fn optional(frame: Vec<u8>, ack: ubx::Id, what: String) -> Self {
+        Self { frame, ack: Some(ack), optional: Some(what) }
+    }
+}
+
+fn ubx_name(id: ubx::Id) -> String {
+    match id {
+        ubx::NAV_PVT => "NAV-PVT".into(),
+        ubx::NAV_SOL => "NAV-SOL".into(),
+        ubx::NAV_TIMEUTC => "NAV-TIMEUTC".into(),
+        ubx::NAV_SAT => "NAV-SAT".into(),
+        ubx::NAV_SVINFO => "NAV-SVINFO".into(),
+        ubx::MON_SPAN => "MON-SPAN".into(),
+        ubx::MON_HW => "MON-HW".into(),
+        (c, i) => format!("UBX {c:02x}/{i:02x}"),
+    }
 }
 
 enum Rx {
@@ -469,24 +480,36 @@ impl Session {
             return self.fail("receiver not identified", now, port, out);
         };
         let target = self.cfg.baud;
+        let diag = ubx::diagnostics(ver.generation());
         let steps = if ver.uses_valset() {
             let p = self.polled_port.as_ref().map_or(1, |p| p[0]);
             let p = if p == 2 { 2 } else { 1 };
             let mut items: Vec<(u32, u32)> = ubx::ENABLED.iter().map(|&id| (ubx::key::msgout(id, p), 1)).collect();
             items.push((ubx::key::uart_out_ubx(p), 1));
             items.push((ubx::key::uart_out_nmea(p), 0));
+            let diag_items: Vec<(u32, u32)> = diag.iter().map(|&(id, r)| (ubx::key::msgout(id, p), u32::from(r))).collect();
+            let names: Vec<String> = diag.iter().map(|&(id, _)| ubx_name(id)).collect();
             vec![
-                Step { frame: ubx::valset_ram(&items), ack: Some(ubx::CFG_VALSET) },
-                Step { frame: ubx::valset_ram(&[(ubx::key::uart_baud(p), target)]), ack: None },
+                Step::required(ubx::valset_ram(&items), Some(ubx::CFG_VALSET)),
+                Step::optional(ubx::valset_ram(&diag_items), ubx::CFG_VALSET, names.join(", ")),
+                Step::required(ubx::valset_ram(&[(ubx::key::uart_baud(p), target)]), None),
             ]
         } else {
-            let mut s: Vec<Step> =
-                ubx::ENABLED.iter().map(|&id| Step { frame: ubx::cfg_msg(id, 1), ack: Some(ubx::CFG_MSG) }).collect();
-            s.push(Step { frame: ubx::cfg_prt(self.polled_port.as_deref(), target), ack: None });
+            let mut s: Vec<Step> = ubx::ENABLED.iter().map(|&id| Step::required(ubx::cfg_msg(id, 1), Some(ubx::CFG_MSG))).collect();
+            s.extend(diag.iter().map(|&(id, r)| Step::optional(ubx::cfg_msg(id, r), ubx::CFG_MSG, ubx_name(id))));
+            s.push(Step::required(ubx::cfg_prt(self.polled_port.as_deref(), target), None));
             s
         };
         self.rx = Rx::Configure { steps, since: now, tries: 0, sends: 0, stale: 0 };
         self.status("configuring", None, out);
+        self.send_step(now, port);
+    }
+
+    fn skip_step(&mut self, why: &str, now: Ns, port: &mut dyn Port, out: &mut Output) {
+        let Rx::Configure { steps, tries, sends, stale, .. } = &mut self.rx else { return };
+        let what = steps.remove(0).optional.unwrap_or_default();
+        (*tries, *stale, *sends) = (0, *sends - 1, 0);
+        self.status("configuring", Some(format!("receiver {why} {what}; continuing without")), out);
         self.send_step(now, port);
     }
 
@@ -545,7 +568,11 @@ impl Session {
                     self.send_step(now, port);
                 }
                 Some((ubx::ACK_NAK, p)) if steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
-                    self.fail("receiver rejected a configuration message", now, port, out);
+                    if steps[0].optional.is_some() {
+                        self.skip_step("rejected", now, port, out);
+                    } else {
+                        self.fail("receiver rejected a configuration message", now, port, out);
+                    }
                 }
                 _ => {}
             },
@@ -637,10 +664,12 @@ impl Session {
                     }
                 }
             }
-            Rx::Configure { since, tries, .. } => {
+            Rx::Configure { since, tries, steps, .. } => {
                 if now - *since >= POLL_WAIT {
                     *tries += 1;
-                    if *tries >= ACK_TRIES {
+                    if *tries >= ACK_TRIES && steps[0].optional.is_some() {
+                        self.skip_step("did not acknowledge", now, port, out);
+                    } else if *tries >= ACK_TRIES {
                         self.fail("no acknowledgement from the receiver", now, port, out);
                     } else {
                         self.send_step(now, port);
@@ -713,6 +742,8 @@ mod tests {
         delayed: Vec<(i64, Vec<u8>)>,
         /// Drop the first CFG-MSG for this message.
         lose_cfg_msg: Option<ubx::Id>,
+        /// Messages it lacks: CFG-MSG for them gets a NAK.
+        nak: BTreeSet<ubx::Id>,
         now_ms: i64,
     }
 
@@ -736,6 +767,7 @@ mod tests {
                 delay_next_ack_ms: 0,
                 delayed: vec![],
                 lose_cfg_msg: None,
+                nak: BTreeSet::new(),
                 now_ms: 0,
             }
         }
@@ -788,6 +820,9 @@ mod tests {
                     if self.lose_cfg_msg == Some((p[0], p[1])) {
                         self.lose_cfg_msg = None;
                         return;
+                    }
+                    if self.nak.contains(&(p[0], p[1])) {
+                        return self.ack(id, false);
                     }
                     if let Some((_, d)) = self.slow_cfg_msg.filter(|(m, _)| *m == (p[0], p[1])) {
                         self.slow_cfg_msg = None;
@@ -971,7 +1006,10 @@ mod tests {
         r.for_secs(20);
         assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
         assert_eq!((r.fake.rx_baud, r.fake.nmea_out, r.fake.ubx_out), (38_400, false, true));
-        assert_eq!(r.fake.enabled.len(), 3);
+        // u-blox 5: base set plus legacy diagnostics.
+        let want: BTreeSet<ubx::Id> =
+            ubx::ENABLED.into_iter().chain([ubx::NAV_SOL, ubx::NAV_TIMEUTC, ubx::NAV_SVINFO, ubx::MON_HW]).collect();
+        assert_eq!(r.fake.enabled, want);
         r.check_tags(Source::TimTp);
         assert!(r.out.frames.iter().any(|(k, _)| *k == Kind::Nmea));
         assert!(r.out.events.iter().any(|e| e["event"] == "gnss_pps" && e["accepted"] == true));
@@ -1014,7 +1052,19 @@ mod tests {
         let mut r = Run::new(f);
         r.for_secs(25);
         assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
-        assert_eq!(r.fake.enabled.len(), 3);
+        assert!(ubx::ENABLED.iter().all(|id| r.fake.enabled.contains(id)));
+        r.check_tags(Source::TimTp);
+    }
+
+    #[test]
+    fn diagnostics_the_receiver_lacks_are_skipped() {
+        let mut f = Fake::new(9600, false, true);
+        f.nak = [ubx::NAV_SVINFO, ubx::MON_HW].into_iter().collect();
+        let mut r = Run::new(f);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(ubx::ENABLED.iter().all(|id| r.fake.enabled.contains(id)));
+        assert!(r.out.events.iter().any(|e| e["message"] == "receiver rejected NAV-SVINFO; continuing without"));
         r.check_tags(Source::TimTp);
     }
 
