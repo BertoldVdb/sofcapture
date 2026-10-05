@@ -13,6 +13,7 @@ mod model;
 mod mqtt;
 mod power;
 mod sampler;
+mod uevent;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_CONFIG: &str = "/etc/sofd/sofd.hujson";
+/// Holds the last epoch (systemd StateDirectory=sofd).
+const STATE_DIR: &str = "/var/lib/sofd";
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -97,8 +100,9 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// So a kill still restores power settings and the MQTT state.
 fn install_signal_handlers() {
-    for sig in [libc::SIGINT, libc::SIGTERM] {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
         unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
     }
@@ -165,6 +169,10 @@ fn main() -> Result<()> {
         }
         Cmd::Run { config } => {
             let cfg = load_config(config.as_deref())?;
+            match std::fs::create_dir_all(STATE_DIR) {
+                Ok(()) => sampler::persist_epochs(Path::new(STATE_DIR).join("epoch")),
+                Err(e) => warn!("{STATE_DIR}: {e}; epochs may repeat after a restart with the clock set back"),
+            }
             lock_memory(cfg.sampler.rt_prio);
             install_signal_handlers();
             let (tx, rx) = std::sync::mpsc::channel();

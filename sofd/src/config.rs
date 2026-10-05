@@ -186,7 +186,35 @@ impl Config {
                 anyhow::bail!("mqtt.prefix must be non-empty, without wildcards or a trailing '/'");
             }
         }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Range checks serde can't express.
+    fn validate(&self) -> Result<()> {
+        let s = &self.sampler;
+        let (lo, hi) = (crate::sampler::MIN_RATE_HZ, crate::sampler::MAX_RATE_HZ);
+        if !(lo..=hi).contains(&s.default_rate_hz) {
+            anyhow::bail!("sampler.default_rate_hz must be within {lo}..={hi}");
+        }
+        if !(3..=100_000).contains(&s.window) {
+            anyhow::bail!("sampler.window must be within 3..=100000");
+        }
+        if s.cpu.is_some_and(|c| c >= libc::CPU_SETSIZE as usize) {
+            anyhow::bail!("sampler.cpu must be below {}", libc::CPU_SETSIZE);
+        }
+        if s.rt_prio.is_some_and(|p| !(1..=99).contains(&p)) {
+            anyhow::bail!("sampler.rt_prio must be within 1..=99");
+        }
+        let delays = (self.gnss.boards.iter().map(|(k, b)| (format!("gnss.boards.{k}"), b.sof_delay_ns)))
+            .chain([("gnss.defaults".to_string(), self.gnss.defaults.sof_delay_ns)])
+            .chain(self.gnss.external.iter().map(|(k, e)| (format!("gnss.external.{k}"), Some(e.sof_delay_ns))));
+        for (what, d) in delays {
+            if d.is_some_and(|d| d.abs() > 1_000_000_000) {
+                anyhow::bail!("{what}.sof_delay_ns must be within ±1 s");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +308,17 @@ mod tests {
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
         assert!(Config::parse(r#"{"gnss":{"attach":"some"}}"#).is_err());
         assert!(Config::parse(r#"{"mqtt":{"prefix":"a/#"}}"#).is_err());
+        for bad in [
+            r#"{"sampler":{"default_rate_hz":0}}"#,
+            r#"{"sampler":{"default_rate_hz":5000}}"#,
+            r#"{"sampler":{"window":2}}"#,
+            r#"{"sampler":{"cpu":5000}}"#,
+            r#"{"sampler":{"rt_prio":0}}"#,
+            r#"{"gnss":{"defaults":{"sof_delay_ns":2000000000}}}"#,
+            r#"{"gnss":{"external":{"a":{"sof_delay_ns":-2000000000}}}}"#,
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

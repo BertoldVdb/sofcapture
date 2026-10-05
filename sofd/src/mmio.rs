@@ -55,7 +55,7 @@ impl Mmio {
     /// Fenced so the timestamps around it really bracket the access.
     #[inline]
     pub fn read32(&self, off: usize) -> u32 {
-        assert!(off % 4 == 0 && off + 4 <= self.len, "register offset {off:#x} outside mapping");
+        assert!(off.is_multiple_of(4) && off + 4 <= self.len, "register offset {off:#x} outside mapping");
         // arm64 doesn't order the device load against clock_gettime, so a stalled
         // read could finish after the next timestamp. x86's vDSO already orders it.
         #[cfg(target_arch = "aarch64")]

@@ -279,7 +279,7 @@ mod tests {
             tow_sub_ms: 0,
             qerr_ps: (s % 7 * 3000 - 9000) as i32,
             week: (s / 604_800) as u16,
-            flags: 1,
+            flags: 3,
             ref_info: 0,
         }
     }

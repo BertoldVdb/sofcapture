@@ -114,11 +114,14 @@ enum Rx {
     Probe { idx: usize, since: Ns },
     Identify { since: Ns, tries: u32 },
     PortPoll { since: Ns, tries: u32 },
-    Configure { steps: Vec<Step>, since: Ns, tries: u32 },
+    /// `stale`: ACKs still due for retries of the previous step. All CFG-MSG steps get the
+    /// same ACK, so a late one must not count for the next step.
+    Configure { steps: Vec<Step>, since: Ns, tries: u32, sends: u32, stale: u32 },
     Switch { since: Ns },
     Verify { since: Ns },
     Running { last_frame: Ns, last_tp: Ns },
-    Fallback { last_frame: Ns },
+    /// `last_label`: last ZDA or TIM-TP.
+    Fallback { last_label: Ns, last_tp: Option<Ns> },
     Passive { last_tp: Option<Ns> },
 }
 
@@ -140,6 +143,8 @@ pub struct Session {
     polled_port: Option<Vec<u8>>,
     firmware: Option<DeviceFirmware>,
     state: &'static str,
+    /// Until NAV-STATUS arrives, the NMEA fix is used.
+    last_nav_status: Option<Ns>,
 }
 
 impl Session {
@@ -163,6 +168,7 @@ impl Session {
             polled_port: None,
             firmware: None,
             state: "handshake",
+            last_nav_status: None,
         }
     }
 
@@ -305,6 +311,7 @@ impl Session {
             out.frames.push((kind, f.to_vec()));
         }
         let mut tim_tp = false;
+        let mut zda = false;
         if let Some(l) = &mut self.labeler {
             match (kind, msg) {
                 (Kind::Ubx, Some((ubx::TIM_TP, p))) => {
@@ -321,18 +328,26 @@ impl Session {
                 (Kind::Ubx, Some((ubx::NAV_STATUS, p))) => {
                     if let Some(ok) = ubx::fix_ok(p) {
                         l.on_fix(ok);
+                        self.last_nav_status = Some(now);
                     }
                 }
                 (Kind::Nmea, _) => match nmea::parse(f) {
-                    nmea::Info::Zda(label) => l.on_zda(label),
-                    // In UBX mode, NAV-STATUS is the fix source.
-                    nmea::Info::Fix(ok) if l.source() == Source::Zda => l.on_fix(ok),
+                    nmea::Info::Zda(label) => {
+                        zda = true;
+                        l.on_zda(label);
+                    }
+                    // NAV-STATUS wins while it arrives; otherwise use the NMEA fix.
+                    nmea::Info::Fix(ok)
+                        if l.source() == Source::Zda || self.last_nav_status.is_none_or(|t| now - t >= PASSIVE_TP_WINDOW) =>
+                    {
+                        l.on_fix(ok)
+                    }
                     _ => {}
                 },
                 _ => {}
             }
         }
-        self.rx_frame(kind, msg, tim_tp, now, port, out);
+        self.rx_frame(kind, msg, tim_tp, zda, now, port, out);
     }
 
     /// Called on VER, or after giving up on it.
@@ -445,12 +460,14 @@ impl Session {
 
     fn fallback(&mut self, message: String, now: Ns, out: &mut Output) {
         self.set_source(Source::Zda);
-        self.rx = Rx::Fallback { last_frame: now };
+        self.rx = Rx::Fallback { last_label: now, last_tp: None };
         self.status("nmea_fallback", Some(message), out);
     }
 
     fn configure(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
-        let Some(ver) = &self.receiver else { return };
+        let Some(ver) = &self.receiver else {
+            return self.fail("receiver not identified", now, port, out);
+        };
         let target = self.cfg.baud;
         let steps = if ver.uses_valset() {
             let p = self.polled_port.as_ref().map_or(1, |p| p[0]);
@@ -468,23 +485,25 @@ impl Session {
             s.push(Step { frame: ubx::cfg_prt(self.polled_port.as_deref(), target), ack: None });
             s
         };
-        self.rx = Rx::Configure { steps, since: now, tries: 0 };
+        self.rx = Rx::Configure { steps, since: now, tries: 0, sends: 0, stale: 0 };
         self.status("configuring", None, out);
         self.send_step(now, port);
     }
 
     /// The baud change step has no ACK; go straight to Switch.
     fn send_step(&mut self, now: Ns, port: &mut dyn Port) {
-        if let Rx::Configure { steps, since, .. } = &mut self.rx {
+        if let Rx::Configure { steps, since, sends, .. } = &mut self.rx {
             port.write(&steps[0].frame);
             *since = now;
+            *sends += 1;
             if steps[0].ack.is_none() {
                 self.rx = Rx::Switch { since: now };
             }
         }
     }
 
-    fn rx_frame(&mut self, kind: Kind, msg: Option<(ubx::Id, &[u8])>, tim_tp: bool, now: Ns, port: &mut dyn Port, out: &mut Output) {
+    #[allow(clippy::too_many_arguments)]
+    fn rx_frame(&mut self, kind: Kind, msg: Option<(ubx::Id, &[u8])>, tim_tp: bool, zda: bool, now: Ns, port: &mut dyn Port, out: &mut Output) {
         match &mut self.rx {
             Rx::Idle | Rx::Switch { .. } | Rx::Version { .. } | Rx::OtaStart { .. } | Rx::OtaSend { .. } | Rx::OtaDone { .. } => {}
             Rx::Probe { since, .. } => {
@@ -497,6 +516,9 @@ impl Session {
             Rx::Identify { .. } => {
                 if let Some((ubx::MON_VER, p)) = msg {
                     self.receiver = Version::parse(p);
+                    if self.receiver.is_none() {
+                        return self.fail("unreadable UBX-MON-VER reply", now, port, out);
+                    }
                     self.polled_port = None;
                     port.write(&ubx::frame(ubx::CFG_PRT, &[]));
                     self.rx = Rx::PortPoll { since: now, tries: 1 };
@@ -511,10 +533,15 @@ impl Session {
                 Some((ubx::ACK_NAK, [0x06, 0x00])) => self.configure(now, port, out),
                 _ => {}
             },
-            Rx::Configure { steps, tries, .. } => match msg {
+            Rx::Configure { steps, tries, sends, stale, .. } => match msg {
                 Some((ubx::ACK_ACK, p)) if steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
+                    if *stale > 0 {
+                        // Late ACK for a retry of the previous step.
+                        *stale -= 1;
+                        return;
+                    }
                     steps.remove(0);
-                    *tries = 0;
+                    (*tries, *stale, *sends) = (0, *sends - 1, 0);
                     self.send_step(now, port);
                 }
                 Some((ubx::ACK_NAK, p)) if steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
@@ -539,7 +566,17 @@ impl Session {
                     self.fail("receiver sends NMEA again (reset?)", now, port, out);
                 }
             }
-            Rx::Fallback { last_frame } => *last_frame = now,
+            Rx::Fallback { last_label, last_tp } => {
+                // A setup that failed late may leave the receiver UBX-only: use its TIM-TP.
+                if tim_tp {
+                    *last_tp = Some(now);
+                }
+                if tim_tp || zda {
+                    *last_label = now;
+                }
+                let s = if last_tp.is_some_and(|t| now - t < PASSIVE_TP_WINDOW) { Source::TimTp } else { Source::Zda };
+                self.set_source(s);
+            }
             Rx::Passive { last_tp } => {
                 if tim_tp {
                     *last_tp = Some(now);
@@ -630,12 +667,13 @@ impl Session {
                 }
             }
         }
-        if let Rx::Fallback { last_frame } = self.rx {
-            if now - last_frame >= FRAME_TIMEOUT {
+        if let Rx::Fallback { last_label, .. } = self.rx {
+            // Nothing usable for a while: set the receiver up again.
+            if now - last_label >= FRAME_TIMEOUT {
                 self.failures = 0;
                 self.receiver = None;
                 let state = self.state;
-                self.status(state, Some("receiver stopped sending".into()), out);
+                self.status(state, Some("no ZDA or TIM-TP from the receiver".into()), out);
                 self.start_probe(now, port, out);
             }
         }
@@ -667,6 +705,15 @@ mod tests {
         /// Image bytes still expected, and those received.
         ota_left: usize,
         ota_image: Vec<u8>,
+        /// false: output only, ignores polls and config.
+        answers: bool,
+        /// Delay (ms) the ACK of the first CFG-MSG for this message.
+        slow_cfg_msg: Option<(ubx::Id, i64)>,
+        delay_next_ack_ms: i64,
+        delayed: Vec<(i64, Vec<u8>)>,
+        /// Drop the first CFG-MSG for this message.
+        lose_cfg_msg: Option<ubx::Id>,
+        now_ms: i64,
     }
 
     impl Fake {
@@ -684,6 +731,12 @@ mod tests {
                 elf: "00".repeat(32),
                 ota_left: 0,
                 ota_image: vec![],
+                answers: true,
+                slow_cfg_msg: None,
+                delay_next_ack_ms: 0,
+                delayed: vec![],
+                lose_cfg_msg: None,
+                now_ms: 0,
             }
         }
 
@@ -694,7 +747,11 @@ mod tests {
         }
 
         fn ack(&mut self, id: ubx::Id, ok: bool) {
-            self.gps(&ubx::frame(if ok { ubx::ACK_ACK } else { ubx::ACK_NAK }, &[id.0, id.1]));
+            let f = ubx::frame(if ok { ubx::ACK_ACK } else { ubx::ACK_NAK }, &[id.0, id.1]);
+            match std::mem::take(&mut self.delay_next_ack_ms) {
+                0 => self.gps(&f),
+                d => self.delayed.push((self.now_ms + d, f)),
+            }
         }
 
         fn on_ubx(&mut self, id: ubx::Id, p: &[u8]) {
@@ -728,6 +785,14 @@ mod tests {
                     self.nmea_out = p[14] & 2 != 0;
                 }
                 ubx::CFG_MSG if !self.gen9 => {
+                    if self.lose_cfg_msg == Some((p[0], p[1])) {
+                        self.lose_cfg_msg = None;
+                        return;
+                    }
+                    if let Some((_, d)) = self.slow_cfg_msg.filter(|(m, _)| *m == (p[0], p[1])) {
+                        self.slow_cfg_msg = None;
+                        self.delay_next_ack_ms = d;
+                    }
                     if p[2] > 0 {
                         self.enabled.insert((p[0], p[1]));
                     } else {
@@ -766,6 +831,10 @@ mod tests {
 
         /// UBX before each pulse, then the pulse, NMEA after it, and a SOF tag every 100 ms.
         fn emit(&mut self, ms: i64) {
+            self.now_ms = ms;
+            for (_, f) in self.delayed.extract_if(.., |(due, _)| *due <= ms).collect::<Vec<_>>() {
+                self.gps(&f);
+            }
             let (s, r) = (ms.div_euclid(1000), ms.rem_euclid(1000));
             if r == 700 && self.ublox && self.ubx_out {
                 let gps = UTC0_S + s + 1 - 315_964_800 + LEAP;
@@ -835,7 +904,7 @@ mod tests {
                         self.ota_left = fl[3].parse().unwrap();
                         self.to_host.extend(nmea::command("OTA,READY"));
                     }
-                } else if k == Kind::Ubx && self.ublox && self.host_baud == self.rx_baud {
+                } else if k == Kind::Ubx && self.ublox && self.answers && self.host_baud == self.rx_baud {
                     let (id, p) = ubx::split(&f);
                     self.on_ubx(id, p);
                 }
@@ -934,6 +1003,32 @@ mod tests {
         r.for_secs(30);
         assert_eq!(r.session.state(), "nmea_fallback", "{:?}", r.states());
         r.check_tags(Source::Zda);
+    }
+
+    #[test]
+    fn late_ack_of_a_retried_step_does_not_skip_the_next() {
+        let mut f = Fake::new(9600, false, true);
+        // TIM-TP's ACK comes late and NAV-TIMEGPS is lost: the late ACK must not count for it.
+        f.slow_cfg_msg = Some((ubx::TIM_TP, 1500));
+        f.lose_cfg_msg = Some(ubx::NAV_TIMEGPS);
+        let mut r = Run::new(f);
+        r.for_secs(25);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert_eq!(r.fake.enabled.len(), 3);
+        r.check_tags(Source::TimTp);
+    }
+
+    #[test]
+    fn fallback_follows_tim_tp_of_a_ubx_only_receiver() {
+        // Set up earlier (UBX only, TIM-TP on) but no longer answering polls.
+        let mut f = Fake::new(38_400, false, true);
+        f.nmea_out = false;
+        f.enabled = ubx::ENABLED.into_iter().collect();
+        f.answers = false;
+        let mut r = Run::new(f);
+        r.for_secs(25);
+        assert_eq!(r.session.state(), "nmea_fallback", "{:?}", r.states());
+        r.check_tags(Source::TimTp);
     }
 
     #[test]

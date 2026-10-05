@@ -108,6 +108,23 @@ fn link_name(p: &Path) -> Option<String> {
     fs::read_link(p).ok()?.file_name()?.to_str().map(String::from)
 }
 
+/// Cheaper than canonicalize: these links are relative and point straight into /sys/devices.
+fn resolve(entry: &Path) -> Option<PathBuf> {
+    let Ok(target) = fs::read_link(entry) else { return fs::canonicalize(entry).ok() };
+    let mut out = entry.parent()?.to_path_buf();
+    for c in target.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::RootDir => out = PathBuf::from("/"),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
 }
@@ -148,7 +165,11 @@ fn sim_controller() -> Controller {
 pub fn controllers(simulate: bool) -> Result<Vec<Controller>> {
     let mut map: BTreeMap<String, Controller> = BTreeMap::new();
     for entry in fs::read_dir(USB_DEVICES).with_context(|| format!("reading {USB_DEVICES}"))? {
-        let Ok(real) = fs::canonicalize(entry?.path()) else { continue };
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("usb") {
+            continue;
+        }
+        let Some(real) = resolve(&entry.path()) else { continue };
         if !is_root_hub(&real) {
             continue;
         }
@@ -194,7 +215,7 @@ pub fn devices(simulate: bool) -> Result<Vec<UsbDevice>> {
         if port.contains(':') || port.starts_with("usb") {
             continue;
         }
-        let Ok(real) = fs::canonicalize(entry.path()) else { continue };
+        let Some(real) = resolve(&entry.path()) else { continue };
         let Some(ctrl) = controller_path_of(&real) else { continue };
         let num = |f: &str| read_trim(&real.join(f)).and_then(|s| s.parse().ok()).unwrap_or(0);
         out.push(UsbDevice {
@@ -326,7 +347,7 @@ pub fn mmio_region(c: &Controller, overrides: &[MmioOverride]) -> Result<MmioReg
 }
 
 fn be_cells(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|c| u32::from_be_bytes(c.try_into().unwrap())).collect()
+    bytes.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c)).collect()
 }
 
 /// Keeps the low 64 bits.
@@ -413,6 +434,14 @@ fn from_iomem(id: &str) -> Result<Option<(u64, u64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_sysfs_links_like_canonicalize() {
+        let Ok(rd) = fs::read_dir(USB_DEVICES) else { return };
+        for e in rd.flatten() {
+            assert_eq!(resolve(&e.path()), fs::canonicalize(e.path()).ok(), "{:?}", e.path());
+        }
+    }
 
     #[test]
     fn override_parsing() {

@@ -90,6 +90,10 @@ pub struct Xhci {
 
 impl Xhci {
     pub fn new(regs: Mmio, edges: u32) -> Result<Self> {
+        // read32 panics out of bounds, so reject a short window here.
+        if regs.len() < 0x20 {
+            bail!("xHCI register window of {:#x} bytes is too short", regs.len());
+        }
         let cap = regs.read32(0);
         let caplen = (cap & 0xff) as usize;
         let version = cap >> 16;
@@ -97,8 +101,8 @@ impl Xhci {
             bail!("registers do not look like xHCI (CAPLENGTH {caplen:#x}, HCIVERSION {version:#x})");
         }
         let rtsoff = (regs.read32(0x18) & !0x1f) as usize;
-        if rtsoff + 4 > regs.len() {
-            bail!("xHCI runtime registers at {rtsoff:#x} lie outside the mapped {:#x} bytes", regs.len());
+        if rtsoff + 4 > regs.len() || caplen + 8 > regs.len() {
+            bail!("xHCI registers at {rtsoff:#x}/{caplen:#x} lie outside the mapped {:#x} bytes", regs.len());
         }
         Ok(Self { usbsts: caplen + 4, mfindex: rtsoff, regs, edges })
     }
@@ -175,6 +179,9 @@ impl Dwc2 {
     const BURST: usize = 8;
 
     pub fn new(regs: Mmio) -> Result<Self> {
+        if regs.len() < HPRT0 + 4 {
+            bail!("DWC2 register window of {:#x} bytes is too short (needs {:#x})", regs.len(), HPRT0 + 4);
+        }
         let id = regs.read32(GSNPSID);
         if !matches!(id >> 16, 0x4f54 | 0x5531 | 0x5532) {
             bail!("registers do not look like DWC2 (GSNPSID {id:#010x})");

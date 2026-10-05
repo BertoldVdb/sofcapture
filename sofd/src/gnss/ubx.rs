@@ -76,7 +76,8 @@ impl TimTp {
         let sub = ((self.tow_sub_ms as u64 * 1_000_000) >> 32) as Ns;
         let t = (GPS_EPOCH_UNIX_S + self.week as i64 * WEEK_S) * 1_000_000_000 + self.tow_ms as Ns * 1_000_000 + sub;
         if self.flags & 1 != 0 {
-            return Ok(t);
+            // Wrong until the receiver knows UTC (bit 1), up to 12.5 min after a cold start.
+            return if self.flags & 2 != 0 { Ok(t) } else { Err("no_utc") };
         }
         // refInfo.timeRefGnss (protocol 18+): 0 = GPS; older receivers send 0.
         if self.ref_info & 0x0F != 0 {
@@ -217,8 +218,9 @@ mod tests {
         assert_eq!(tp.utc_ns(Some(18)), Ok(gps - 18_000_000_000));
         assert_eq!(tp.utc_ns(None), Err("no_leap_seconds"));
         assert_eq!(tp.qerr(), Some(-1500));
-        let utc_based = TimTp { flags: 1, ..tp };
-        assert_eq!(utc_based.utc_ns(None), Ok(gps));
+        // UTC time base: only once the receiver knows UTC (flags bit 1).
+        assert_eq!(TimTp { flags: 3, ..tp }.utc_ns(None), Ok(gps));
+        assert_eq!(TimTp { flags: 1, ..tp }.utc_ns(Some(18)), Err("no_utc"));
         assert_eq!(TimTp { ref_info: 3, ..tp }.utc_ns(Some(18)), Err("tp_time_base"));
     }
 

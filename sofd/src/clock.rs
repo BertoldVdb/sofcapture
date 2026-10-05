@@ -46,9 +46,14 @@ pub struct RealtimeSync {
     pub kernel_synced: bool,
     /// Kernel frequency correction.
     pub freq_ppm: f64,
+    /// Realtime rate vs. the raw clock (freq + tick); phase slews add up to `MAX_PHASE_SLEW_PPM`.
+    pub slew_ppm: f64,
     pub est_error_ns: i64,
     pub max_error_ns: i64,
 }
+
+/// Fastest phase slew of the kernel PLL and adjtime().
+pub const MAX_PHASE_SLEW_PPM: f64 = 500.0;
 
 pub fn realtime_sync() -> Option<RealtimeSync> {
     // SAFETY: timex is plain data; modes = 0 makes adjtimex read-only.
@@ -60,6 +65,8 @@ pub fn realtime_sync() -> Option<RealtimeSync> {
     Some(RealtimeSync {
         kernel_synced: state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0,
         freq_ppm: tx.freq as f64 / 65536.0,
+        // tick is µs per 10 ms tick, nominally 10000.
+        slew_ppm: tx.freq as f64 / 65536.0 + (tx.tick as f64 - 10_000.0) * 100.0,
         est_error_ns: tx.esterror as i64 * 1000,
         max_error_ns: tx.maxerror as i64 * 1000,
     })

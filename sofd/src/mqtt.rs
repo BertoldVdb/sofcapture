@@ -1,12 +1,12 @@
 //! MQTT 5 client. Topics, all below the prefix:
 //!
-//! - `status` (retained; the will sets it offline)
-//! - `controllers/<id>/info|model` (retained), `.../sample`, `.../event`
-//! - `controllers/<id>/want/<client>` (retained, written by clients): sample this controller
-//! - `controllers/<id>/ref/<client>` (written by clients): SOF tags of an external GNSS reference
-//! - `gnss/<serial>/status` (retained), `.../pps`, `.../event`, `.../nmea/<address>`,
-//!   `.../ubx/<class>/<id>`, `.../rtcm3/<type>` (raw frames), `.../tx` (client → receiver)
-//! - `cmd/<name>` (request/response through the MQTT 5 response topic)
+//! - `status` (retained, set offline by the will)
+//! - `controllers/<id>/info`, `model` (retained), `sample`, `event`
+//! - `controllers/<id>/want/<client>` (retained, from clients): sampling request
+//! - `controllers/<id>/ref/<client>` (from clients): SOF tags from an external GNSS reference
+//! - `gnss/<serial>/status` (retained), `pps`, `event`, raw frames `nmea/<address>`,
+//!   `ubx/<class>/<id>`, `rtcm3/<type>`, and `tx` (from clients, sent to the receiver)
+//! - `cmd/<name>`: replies go to the MQTT 5 response topic, or `reply_to` in the body
 
 use crate::config;
 use crate::daemon::Msg;
@@ -28,24 +28,67 @@ const KEEP_ALIVE: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Publishes are dropped when this queue is full.
 const QUEUE: usize = 4096;
+/// Also sent to the broker, so it drops bigger messages instead of us disconnecting.
+const MAX_PACKET: u32 = 256 * 1024;
+const SUBSCRIPTIONS: [&str; 4] = ["controllers/+/want/+", "controllers/+/ref/+", "gnss/+/tx", "cmd/+"];
 
 /// Received from MQTT.
 #[derive(Debug, PartialEq)]
 pub enum In {
     /// Republish retained state.
     Connected,
-    /// A sampling request; `rate_hz` None = the request was withdrawn.
-    Want { controller: String, client: String, rate_hz: Option<Option<f64>> },
+    /// `rate_hz` None: request withdrawn. `ttl_s`: lapses unless renewed.
+    Want { controller: String, client: String, rate_hz: Option<Option<f64>>, ttl_s: Option<f64> },
     Tx { serial: String, data: Vec<u8> },
     /// `t_rx`: arrival time, CLOCK_MONOTONIC_RAW.
     Ref { controller: String, client: String, payload: Vec<u8>, t_rx: crate::clock::Ns },
-    Cmd { name: String, payload: Vec<u8>, reply_to: Option<(String, Option<Bytes>)> },
+    /// `payload` has the reply fields removed.
+    Cmd { name: String, payload: Vec<u8>, reply: Reply },
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Reply {
+    /// `reply_to` from the body, else the MQTT 5 response topic.
+    pub topic: Option<String>,
+    /// Sent back as a property.
+    pub correlation_data: Option<Bytes>,
+    /// Echoed in the reply body.
+    pub correlation: Option<Value>,
+}
+
+pub const MAX_TTL_S: f64 = 86_400.0;
+
+/// Non-JSON bodies pass through unchanged.
+fn command_request(prefix: &str, topic: &str, payload: &[u8], props: Option<&PublishProperties>) -> (Vec<u8>, Reply) {
+    let mut reply = Reply {
+        topic: props.and_then(|pr| pr.response_topic.clone()),
+        correlation_data: props.and_then(|pr| pr.correlation_data.clone()),
+        correlation: None,
+    };
+    let mut request = payload.to_vec();
+    if let Ok(Value::Object(mut body)) = serde_json::from_slice::<Value>(payload) {
+        match body.remove("reply_to") {
+            None => {}
+            Some(Value::String(t)) if !t.is_empty() && !t.contains(['+', '#']) => reply.topic = Some(t),
+            Some(v) => warn!("mqtt: {topic}: reply_to {v} is not a topic name"),
+        }
+        reply.correlation = body.remove("correlation");
+        request = Value::Object(body).to_string().into_bytes();
+    }
+    // A reply inside our own tree could act as a request.
+    if reply.topic.as_ref().is_some_and(|t| t == prefix || t.starts_with(&format!("{prefix}/"))) {
+        warn!("mqtt: {topic}: not replying inside {prefix}/");
+        reply.topic = None;
+    }
+    (request, reply)
 }
 
 pub struct Mqtt {
     client: Client,
     prefix: String,
     stop: Arc<AtomicBool>,
+    /// While down, publishes are dropped: queued samples would block the resubscribe.
+    connected: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -67,6 +110,7 @@ impl Mqtt {
         let mut o = MqttOptions::new(id, &cfg.host, cfg.port);
         o.set_keep_alive(KEEP_ALIVE);
         o.set_clean_start(true);
+        o.set_max_packet_size(Some(MAX_PACKET));
         o.set_last_will(LastWill::new(format!("{prefix}/status"), json!({"state": "offline"}).to_string(), QoS::AtLeastOnce, true, None));
         let password = match (&cfg.password, &cfg.password_file) {
             (_, Some(f)) => Some(
@@ -82,14 +126,24 @@ impl Mqtt {
         }
         let (client, mut conn) = Client::new(o, QUEUE);
         let stop = Arc::new(AtomicBool::new(false));
-        let (c, s, p) = (client.clone(), stop.clone(), prefix.clone());
+        let connected = Arc::new(AtomicBool::new(false));
+        let (c, s, p, up) = (client.clone(), stop.clone(), prefix.clone(), connected.clone());
         let broker = format!("{}:{}", cfg.host, cfg.port);
         let thread = std::thread::Builder::new()
             .name("mqtt".into())
             .spawn(move || {
                 let mut last_error: Option<String> = None;
+                // Retried when the queue was full.
+                let mut pending: Vec<&str> = vec![];
                 // Keep going until shutdown()'s disconnect has been sent.
                 loop {
+                    pending.retain(|t| match c.try_subscribe(format!("{p}/{t}"), QoS::AtLeastOnce) {
+                        Ok(()) => false,
+                        Err(e) => {
+                            debug!("mqtt: subscribing {t}: {e}; retrying");
+                            true
+                        }
+                    });
                     let ev = match conn.recv_timeout(Duration::from_millis(500)) {
                         Ok(ev) => ev,
                         Err(RecvTimeoutError::Timeout) => continue,
@@ -99,11 +153,8 @@ impl Mqtt {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
                             info!("mqtt: connected to {broker}, prefix {p}");
                             last_error = None;
-                            for t in ["controllers/+/want/+", "controllers/+/ref/+", "gnss/+/tx", "cmd/+"] {
-                                if let Err(e) = c.try_subscribe(format!("{p}/{t}"), QoS::AtLeastOnce) {
-                                    warn!("mqtt: subscribing {t}: {e}");
-                                }
-                            }
+                            up.store(true, Ordering::Relaxed);
+                            pending = SUBSCRIPTIONS.to_vec();
                             if out.send(Msg::Mqtt(In::Connected)).is_err() {
                                 break;
                             }
@@ -118,6 +169,7 @@ impl Mqtt {
                         Ok(Event::Outgoing(Outgoing::Disconnect)) if s.load(Ordering::Relaxed) => break,
                         Ok(_) => {}
                         Err(e) => {
+                            up.store(false, Ordering::Relaxed);
                             if s.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -132,11 +184,22 @@ impl Mqtt {
                 }
             })
             .context("starting mqtt thread")?;
-        Ok(Self { client, prefix, stop, thread: Some(thread) })
+        Ok(Self { client, prefix, stop, connected, thread: Some(thread) })
     }
 
-    /// Queues a publish below the prefix; dropped (with a debug log) when the queue is full.
+    fn up(&self, topic: &str) -> bool {
+        let up = self.connected.load(Ordering::Relaxed);
+        if !up {
+            debug!("mqtt: not connected, dropped {topic}");
+        }
+        up
+    }
+
+    /// Dropped while disconnected or when the queue is full.
     pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, retain: bool) {
+        if !self.up(topic) {
+            return;
+        }
         let qos = if retain { QoS::AtLeastOnce } else { QoS::AtMostOnce };
         if let Err(e) = self.client.try_publish(format!("{}/{topic}", self.prefix), qos, retain, payload) {
             debug!("mqtt: dropped {topic}: {e}");
@@ -148,12 +211,18 @@ impl Mqtt {
     }
 
     pub fn publish_event(&self, topic: &str, v: &Value) {
+        if !self.up(topic) {
+            return;
+        }
         if let Err(e) = self.client.try_publish(format!("{}/{topic}", self.prefix), QoS::AtLeastOnce, false, v.to_string()) {
             debug!("mqtt: dropped {topic}: {e}");
         }
     }
 
     pub fn reply(&self, topic: &str, correlation: Option<Bytes>, v: &Value) {
+        if !self.up(topic) {
+            return;
+        }
         let props = PublishProperties { correlation_data: correlation, ..Default::default() };
         if let Err(e) = self.client.try_publish_with_properties(topic, QoS::AtLeastOnce, false, v.to_string(), props) {
             debug!("mqtt: dropped reply to {topic}: {e}");
@@ -181,16 +250,41 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
         ["controllers", ctrl, "want", client] => {
-            let rate_hz = if p.payload.is_empty() {
-                None
+            let (rate_hz, ttl_s) = if p.payload.is_empty() {
+                (None, None)
             } else {
-                let v: Value = serde_json::from_slice(&p.payload).unwrap_or_else(|e| {
-                    warn!("mqtt: {topic}: {e}; using the default rate");
-                    Value::Null
-                });
-                Some(v.get("rate_hz").and_then(Value::as_f64))
+                // Ignore bad requests: "off" or {"rate_hz":0} must not start sampling.
+                let req = match serde_json::from_slice::<Value>(&p.payload) {
+                    Ok(Value::Object(o)) => o,
+                    Ok(_) | Err(_) => {
+                        warn!("mqtt: {topic}: not a JSON object; request ignored");
+                        return None;
+                    }
+                };
+                let rate = match req.get("rate_hz") {
+                    None | Some(Value::Null) => None,
+                    Some(r) => match r.as_f64() {
+                        Some(r) if r > 0.0 && r.is_finite() => Some(r),
+                        _ => {
+                            warn!("mqtt: {topic}: rate_hz {r} is not a positive number; request ignored");
+                            return None;
+                        }
+                    },
+                };
+                let ttl_s = match req.get("ttl_s") {
+                    None => None,
+                    Some(t) => match t.as_f64() {
+                        Some(t) if t > 0.0 && t <= MAX_TTL_S => Some(t),
+                        // Not "no TTL": that would keep a dead client's request forever.
+                        _ => {
+                            warn!("mqtt: {topic}: ttl_s {t} is not in (0, {MAX_TTL_S}] s; request ignored");
+                            return None;
+                        }
+                    },
+                };
+                (Some(rate), ttl_s)
             };
-            Some(In::Want { controller: ctrl.to_string(), client: client.to_string(), rate_hz })
+            Some(In::Want { controller: ctrl.to_string(), client: client.to_string(), rate_hz, ttl_s })
         }
         ["controllers", ctrl, "ref", client] if !p.payload.is_empty() => Some(In::Ref {
             controller: ctrl.to_string(),
@@ -200,9 +294,8 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
         }),
         ["gnss", serial, "tx"] if !p.payload.is_empty() => Some(In::Tx { serial: serial.to_string(), data: p.payload.to_vec() }),
         ["cmd", name] => {
-            let props = p.properties.as_ref();
-            let reply_to = props.and_then(|pr| pr.response_topic.clone()).map(|t| (t, props.and_then(|pr| pr.correlation_data.clone())));
-            Some(In::Cmd { name: name.to_string(), payload: p.payload.to_vec(), reply_to })
+            let (payload, reply) = command_request(prefix, topic, &p.payload, p.properties.as_ref());
+            Some(In::Cmd { name: name.to_string(), payload, reply })
         }
         _ => None,
     }
@@ -233,15 +326,56 @@ mod tests {
     #[test]
     fn incoming_topics() {
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/0000:00:14.0/want/app1", br#"{"rate_hz":20}"#));
-        assert_eq!(w, Some(In::Want { controller: "0000:00:14.0".into(), client: "app1".into(), rate_hz: Some(Some(20.0)) }));
+        assert_eq!(w, Some(In::Want { controller: "0000:00:14.0".into(), client: "app1".into(), rate_hz: Some(Some(20.0)), ttl_s: None }));
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", b""));
-        assert_eq!(w, Some(In::Want { controller: "c".into(), client: "app1".into(), rate_hz: None }));
+        assert_eq!(w, Some(In::Want { controller: "c".into(), client: "app1".into(), rate_hz: None, ttl_s: None }));
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", b"{}"));
         assert!(matches!(w, Some(In::Want { rate_hz: Some(None), .. })));
+        let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", br#"{"rate_hz":20,"ttl_s":10}"#));
+        assert!(matches!(w, Some(In::Want { rate_hz: Some(Some(r)), ttl_s: Some(t), .. }) if r == 20.0 && t == 10.0));
+        for bad in [r#"{"ttl_s":0}"#, r#"{"ttl_s":-1}"#, r#"{"ttl_s":"10"}"#, r#"{"ttl_s":1e9}"#, "off", "null", "[1]", r#"{"rate_hz":0}"#, r#"{"rate_hz":"20"}"#] {
+            assert_eq!(parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", bad.as_bytes())), None, "{bad}");
+        }
         assert_eq!(parse("sofd/pc", &publish("sofd/pc/gnss/E07/tx", b"\xb5b")), Some(In::Tx { serial: "E07".into(), data: b"\xb5b".to_vec() }));
         assert_eq!(parse("sofd/pc", &publish("sofd/pcx/gnss/E07/tx", b"x")), None);
         let r = parse("sofd/pc", &publish("sofd/pc/controllers/c/ref/app1", b"{}"));
         assert!(matches!(r, Some(In::Ref { controller, client, .. }) if controller == "c" && client == "app1"));
+    }
+
+    #[test]
+    fn command_replies() {
+        // MQTT 3.1.1 style: everything in the body.
+        let c = parse("sofd/pc", &publish("sofd/pc/cmd/lookup", br#"{"port":"1-2","reply_to":"ci/42","correlation":{"job":7}}"#));
+        let Some(In::Cmd { name, payload, reply }) = c else { panic!("{c:?}") };
+        assert_eq!(name, "lookup");
+        assert_eq!(serde_json::from_slice::<Value>(&payload).unwrap(), json!({"port": "1-2"}));
+        assert_eq!(reply, Reply { topic: Some("ci/42".into()), correlation_data: None, correlation: Some(json!({"job": 7})) });
+
+        // MQTT 5 properties; the body's reply_to wins over the response topic.
+        let props = PublishProperties {
+            response_topic: Some("me/reply".into()),
+            correlation_data: Some(Bytes::from_static(b"x")),
+            ..Default::default()
+        };
+        let mut p = publish("sofd/pc/cmd/list", b"");
+        p.properties = Some(props.clone());
+        let Some(In::Cmd { payload, reply, .. }) = parse("sofd/pc", &p) else { panic!() };
+        assert!(payload.is_empty());
+        assert_eq!(reply, Reply { topic: Some("me/reply".into()), correlation_data: Some(Bytes::from_static(b"x")), correlation: None });
+        let mut p = publish("sofd/pc/cmd/list", br#"{"reply_to":"ci/1"}"#);
+        p.properties = Some(props);
+        let Some(In::Cmd { reply, .. }) = parse("sofd/pc", &p) else { panic!() };
+        assert_eq!(reply.topic.as_deref(), Some("ci/1"));
+
+        // Wildcards, empty or non-string topics are not reply topics.
+        for bad in [r#"{"reply_to":"ci/#"}"#, r#"{"reply_to":"ci/+/x"}"#, r#"{"reply_to":""}"#, r#"{"reply_to":5}"#, r#"{"reply_to":"sofd/pc/gnss/E07/tx"}"#] {
+            let Some(In::Cmd { reply, payload, .. }) = parse("sofd/pc", &publish("sofd/pc/cmd/list", bad.as_bytes())) else { panic!() };
+            assert_eq!(reply.topic, None, "{bad}");
+            assert_eq!(payload, b"{}");
+        }
+        // Not JSON: passed on for the command to reject.
+        let Some(In::Cmd { payload, .. }) = parse("sofd/pc", &publish("sofd/pc/cmd/lookup", b"nope")) else { panic!() };
+        assert_eq!(payload, b"nope");
     }
 
     #[test]

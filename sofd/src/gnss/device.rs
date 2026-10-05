@@ -117,9 +117,22 @@ impl Tty {
 
     fn try_set_baud(&mut self, baud: u32) -> io::Result<()> {
         let fd = self.fd.as_raw_fd();
+        // Let bytes queued at the old baud drain; tcdrain could block forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let mut queued: libc::c_int = 0;
+            // SAFETY: TIOCOUTQ writes one int.
+            check(unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) })?;
+            if queued == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "device does not take bytes (baud change)"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // SAFETY: termios is plain data; the calls only access it and fd.
         unsafe {
-            check(libc::tcdrain(fd))?;
             let mut t: libc::termios = std::mem::zeroed();
             check(libc::tcgetattr(fd, &mut t))?;
             check(libc::cfsetspeed(&mut t, speed(baud)?))?;
@@ -195,7 +208,9 @@ pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Resu
     let (tx, rx) = mpsc::channel();
     let (s, h, o, i) = (stop.clone(), hub.clone(), out.clone(), info.clone());
     let thread = std::thread::Builder::new().name(format!("gnss-{}", info.serial)).spawn(move || {
-        let reason = run(tty, &i, id, cfg, &feed, &rx, &o, &s);
+        // Clean up even on panic, or the board is never reopened.
+        let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(tty, &i, id, cfg, &feed, &rx, &o, &s)))
+            .unwrap_or_else(|_| Some("board session panicked".into()));
         let mut hub = h.lock().unwrap();
         if hub.get(&i.controller).is_some_and(|f| Arc::ptr_eq(f, &feed)) {
             hub.remove(&i.controller);

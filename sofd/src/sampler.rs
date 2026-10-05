@@ -11,9 +11,10 @@ use crate::model::{self, Fit, Model};
 use log::{debug, warn};
 use serde::Serialize;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 pub const MIN_RATE_HZ: f64 = 0.1;
@@ -24,19 +25,32 @@ const ERROR_BACKOFF_NS: Ns = 1_000_000_000;
 /// Retry delay after a stalled sample.
 const RETRY_NS: Ns = 5_000_000;
 const MAX_RETRIES: u32 = 3;
-/// CLOCK_REALTIME moving against CLOCK_MONOTONIC_RAW by more than this
-/// (1 ms plus 10% of elapsed time; slewing tops out near 8%) is a step.
-const REALTIME_STEP_NS: Ns = 1_000_000;
+/// Allowed CLOCK_REALTIME jump beyond what the kernel's slew explains.
+const REALTIME_STEP_NS: Ns = 20_000;
+/// Without adjtimex: 1 ms plus 10% of elapsed time (slewing tops out near 8%).
+const REALTIME_STEP_BLIND_NS: Ns = 1_000_000;
 const REALTIME_MAX_SLEW: f64 = 0.1;
+/// Drift allowed over long gaps before a sample counts as a counter jump.
+const JUMP_DRIFT_PPM: f64 = 5.0;
+/// Wrapping below this means the count is not the bus frame number (EHCI, generic path).
+const FULL_FRAME_RANGE: u32 = 1024;
 /// Pass GNSS time on only from a fresh, filled fit: never extrapolate through an outage.
 const GNSS_MIN_POINTS: usize = 5;
 const GNSS_MAX_AGE_NS: Ns = 5_000_000_000;
 
 static LAST_EPOCH: AtomicU64 = AtomicU64::new(0);
+static EPOCH_FILE: OnceLock<PathBuf> = OnceLock::new();
+static EPOCH_FILE_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// A new epoch: at least the current Unix time in milliseconds, so epochs
-/// stay unique across sofd restarts (unless the clock went back), and
-/// increasing within one.
+/// Keeps epochs increasing across restarts, even if the clock comes up behind (no RTC).
+pub fn persist_epochs(path: PathBuf) {
+    if let Some(last) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+        LAST_EPOCH.fetch_max(last, Ordering::Relaxed);
+    }
+    let _ = EPOCH_FILE.set(path);
+}
+
+/// Unix time in ms, but always above the last epoch.
 fn new_epoch() -> u64 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let mut epoch = 0;
@@ -44,6 +58,15 @@ fn new_epoch() -> u64 {
         epoch = (last + 1).max(now);
         Some(epoch)
     });
+    if let Some(p) = EPOCH_FILE.get() {
+        let tmp = p.with_extension("tmp");
+        let r = std::fs::write(&tmp, format!("{epoch}\n")).and_then(|()| std::fs::rename(&tmp, p));
+        if let Err(e) = r {
+            if !EPOCH_FILE_FAILED.swap(true, Ordering::Relaxed) {
+                warn!("storing the epoch in {}: {e}; epochs may repeat after a restart with the clock set back", p.display());
+            }
+        }
+    }
     epoch
 }
 
@@ -62,8 +85,8 @@ struct SampleEvent<'a> {
     /// Unwrapped frame counter, in units of `unit_ns`.
     counter: i64,
     unit_ns: u32,
-    /// 11-bit USB frame number as seen on the bus (matches a device's SOF frame number).
-    bus_frame: u32,
+    /// 11-bit bus frame number, as a device sees it in SOF; null if unknown.
+    bus_frame: Option<u32>,
     /// Microframe within `bus_frame` (high-speed only).
     #[serde(skip_serializing_if = "Option::is_none")]
     microframe: Option<u32>,
@@ -102,7 +125,7 @@ struct GnssRef<'a> {
 /// A 1 ms frame boundary, where full-speed devices see SOF.
 #[derive(Serialize)]
 struct FrameStart {
-    bus_frame: u32,
+    bus_frame: Option<u32>,
     counter: i64,
     t_raw_ns: Option<Ns>,
     t_realtime_ns: Option<Ns>,
@@ -139,6 +162,11 @@ impl Sampler {
 
     pub fn set_rate(&self, rate_hz: f64) {
         self.period_ns.store(period_for(rate_hz), Ordering::Relaxed);
+    }
+
+    /// True if the thread died on its own (panic).
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
 }
 
@@ -199,8 +227,12 @@ fn run(
     let mut ref_state: Option<&'static str> = None;
     // When the newest GNSS tag was received (raw clock).
     let mut last_tag_rx: Option<Ns> = None;
-    // (t_raw, realtime - raw) of the previous sample, for step detection.
-    let mut prev_rt_off: Option<(Ns, Ns)> = None;
+    // (t_raw, realtime - raw, slew ppm) of the previous sample, for step detection.
+    let mut prev_rt_off: Option<(Ns, Ns, Option<f64>)> = None;
+    // Frame tags from before this belong to the old counter.
+    let mut epoch_start: Option<Ns> = None;
+    // For guessing an unknown wrap point.
+    let mut max_raw = 0u32;
     let mut prev: Option<(i64, Ns)> = None;
     let mut prev_raw = 0u32;
     let counter_bits = backend.counter_bits();
@@ -262,11 +294,12 @@ fn run(
                     last_error = Some(msg);
                 }
                 // The counter may have restarted underneath us.
-                (prev, fit, epoch) = (None, None, new_epoch());
+                (prev, fit, epoch, epoch_start) = (None, None, new_epoch(), None);
                 model.clear();
                 model_rt.clear();
                 model_gnss.clear();
                 join.reset();
+                discard_tags(&feed);
                 next = clock::mono() + period.max(ERROR_BACKOFF_NS);
                 wake = next;
                 continue;
@@ -282,11 +315,12 @@ fn run(
             if unit != 0 {
                 epoch = new_epoch();
             }
-            (unit, prev, fit) = (s.unit_ns, None, None);
+            (unit, prev, fit, epoch_start) = (s.unit_ns, None, None, None);
             model.clear();
             model_rt.clear();
             model_gnss.clear();
             join.reset();
+            discard_tags(&feed);
         }
 
         let period_est = fit.as_ref().map_or(unit as f64, |f| f.period_ns);
@@ -294,7 +328,10 @@ fn run(
         // Far off the model means the counter jumped (reset, resume).
         // With an unknown wrap point, compare raw counts over gaps too short to wrap.
         let jumped = match (&fit, counter_bits, prev) {
-            (Some(f), Some(_), _) => (s.t_ns - f.predict(counter)).abs() > unit as Ns / 4,
+            (Some(f), Some(_), Some((_, pt))) => {
+                let tol = (unit as f64 / 4.0).max((s.t_ns - pt) as f64 * JUMP_DRIFT_PPM * 1e-6);
+                (s.t_ns - f.predict(counter)).abs() as f64 > tol
+            }
             (_, None, Some((pc, _))) => {
                 let (dc, draw) = (counter - pc, s.counter as i64 - prev_raw as i64);
                 dc < 512 && draw >= 0 && draw != dc
@@ -303,21 +340,35 @@ fn run(
         };
         if jumped {
             warn!("{id}: frame counter discontinuity, starting new epoch");
-            epoch = new_epoch();
+            (epoch, epoch_start) = (new_epoch(), None);
             model.clear();
             model_rt.clear();
             model_gnss.clear();
             join.reset();
+            discard_tags(&feed);
             counter = s.counter as i64;
         }
+        let epoch_start = *epoch_start.get_or_insert(s.t_ns);
+        max_raw = max_raw.max(s.counter);
         prev = Some((counter, s.t_ns));
         prev_raw = s.counter;
         model.push(counter, s.t_ns, s.unc_ns);
         fit = model.fit(unit as f64);
 
-        if let Some((pt, poff)) = prev_rt_off {
-            let step = real_off - poff;
-            if step.abs() > REALTIME_STEP_NS + ((s.t_ns - pt) as f64 * REALTIME_MAX_SLEW) as Ns {
+        let sync = clock::realtime_sync();
+        let slew = sync.as_ref().map(|s| s.slew_ppm);
+        if let Some((pt, poff, pslew)) = prev_rt_off {
+            let (step, dt) = (real_off - poff, (s.t_ns - pt) as f64);
+            // The slew rate may have changed meanwhile, so allow either.
+            let stepped = match (pslew, slew) {
+                (Some(a), Some(b)) => {
+                    let margin = REALTIME_STEP_NS as f64 + dt * clock::MAX_PHASE_SLEW_PPM * 1e-6;
+                    let (lo, hi) = (a.min(b) * 1e-6 * dt - margin, a.max(b) * 1e-6 * dt + margin);
+                    !(lo..=hi).contains(&(step as f64))
+                }
+                _ => step.abs() > REALTIME_STEP_BLIND_NS + (dt * REALTIME_MAX_SLEW) as Ns,
+            };
+            if stepped {
                 warn!("{id}: CLOCK_REALTIME stepped by {step} ns, restarting realtime fit");
                 model_rt.clear();
                 let ev = json!({"event": "realtime_step", "controller": id, "step_ns": step});
@@ -326,7 +377,7 @@ fn run(
                 }
             }
         }
-        prev_rt_off = Some((s.t_ns, real_off));
+        prev_rt_off = Some((s.t_ns, real_off, slew));
         model_rt.push(counter, s.t_ns + real_off, s.unc_ns);
         let fit_rt = model_rt.fit(unit as f64);
 
@@ -336,7 +387,7 @@ fn run(
         let frame_counter = if hs { counter - counter.rem_euclid(8) } else { counter };
         let t_raw_fs = fit.as_ref().map(|f| f.predict(frame_counter));
         let t_rt_fs = fit_rt.as_ref().map(|f| f.predict(frame_counter));
-        let bus_frame = if hs { raw >> 3 } else { raw } & 0x7ff;
+        let bus_frame = (counter_bits.is_some() || max_raw >= FULL_FRAME_RANGE).then_some(if hs { raw >> 3 } else { raw } & 0x7ff);
 
         // GNSS reference: match SOF tags to our frames by bus frame number.
         let attached = hub.lock().unwrap().get(id).cloned();
@@ -352,14 +403,20 @@ fn run(
         if let (Some(fd), Some(f)) = (&feed, &fit) {
             let per_frame: i64 = if hs { 8 } else { 1 };
             let frame_now = counter.div_euclid(per_frame);
-            let bus_of = |h: i64| (bus_frame as i64 + h - frame_now).rem_euclid(2048) as u32;
             for tag in fd.drain() {
                 let matched = match tag.at {
-                    At::Frame { frame, microframe } => {
-                        let at_rx = f.counter_ref as f64 + (tag.t_rx - f.t_ref_ns) as f64 / f.period_ns;
-                        let micro = if hs { i64::from(microframe) } else { 0 };
-                        join.host_frame(frame, at_rx / per_frame as f64, bus_of).map(|h| h * per_frame + micro).ok_or("no_match")
-                    }
+                    // Its frame may lie up to max_lag frames before arrival.
+                    At::Frame { .. } if tag.t_rx - fd.max_lag * 1_000_000 < epoch_start => Err("epoch"),
+                    At::Frame { microframe, .. } if microframe != 0 && !hs => Err("microframe"),
+                    At::Frame { frame, microframe } => match bus_frame {
+                        None => Err("no_bus_frame"),
+                        Some(bf) => {
+                            let bus_of = |h: i64| (bf as i64 + h - frame_now).rem_euclid(2048) as u32;
+                            let at_rx = f.counter_ref as f64 + (tag.t_rx - f.t_ref_ns) as f64 / f.period_ns;
+                            let micro = i64::from(microframe);
+                            join.host_frame(frame, at_rx / per_frame as f64, bus_of).map(|h| h * per_frame + micro).ok_or("no_match")
+                        }
+                    },
                     At::Counter { epoch: e, counter: c } => if e == epoch { Ok(c) } else { Err("epoch") },
                 };
                 last_ok = matched.is_ok();
@@ -384,15 +441,13 @@ fn run(
                 }
             }
         }
-        let fit_gnss = model_gnss.fit(unit as f64);
+        // Publish only while valid, or clients would extrapolate a stale fit.
+        let gnss_valid = last_ok && last_tag_rx.is_some_and(|t| s.t_ns - t < GNSS_MAX_AGE_NS);
+        let fit_gnss = model_gnss.fit(unit as f64).filter(|f| gnss_valid && f.n >= GNSS_MIN_POINTS);
         let t_gnss_fs = fit_gnss.as_ref().map(|f| f.predict(frame_counter));
-        let gnss_valid = fit_gnss.as_ref().is_some_and(|f| f.n >= GNSS_MIN_POINTS)
-            && last_ok
-            && last_tag_rx.is_some_and(|t| s.t_ns - t < GNSS_MAX_AGE_NS);
         let t_realtime = s.t_ns + real_off;
         let chrony_point = fit_gnss
             .as_ref()
-            .filter(|_| gnss_valid)
             .map(|f| chrony::Point { t_realtime_ns: t_realtime, t_gnss_ns: f.predict(counter) });
         let gnss = feed.as_ref().map(|fd| GnssRef {
             board: &fd.serial,
@@ -425,7 +480,7 @@ fn run(
             realtime_minus_raw_ns: real_off,
             model_raw: fit.as_ref(),
             model_realtime: fit_rt.as_ref(),
-            realtime_sync: clock::realtime_sync(),
+            realtime_sync: sync,
             frame_start,
             model_gnss: fit_gnss.as_ref(),
             gnss,
@@ -440,6 +495,13 @@ fn run(
         if out.send(Msg::Sample(Box::new(sample))).is_err() {
             return;
         }
+    }
+}
+
+/// Queued tags belong to the old epoch's counter.
+fn discard_tags(feed: &Option<Arc<Feed>>) {
+    if let Some(fd) = feed {
+        fd.drain();
     }
 }
 

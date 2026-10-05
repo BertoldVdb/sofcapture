@@ -1,7 +1,5 @@
-//! Splits the byte stream of a sofgps device into whole NMEA, UBX and RTCM3
-//! frames, with the same rules as the firmware's FrameParser: NMEA needs a
-//! valid `*hh` checksum, UBX frames are at most 2048 bytes, and bytes that
-//! belong to no valid frame are dropped.
+//! Splits a sofgps byte stream into NMEA, UBX and RTCM3 frames, using the same
+//! rules as the firmware's FrameParser. Invalid bytes are dropped.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -12,7 +10,7 @@ pub enum Kind {
 
 const MAX_NMEA: usize = 256;
 /// Whole frame, header and checksum included.
-pub const MAX_UBX: usize = 2048;
+pub const MAX_UBX: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {

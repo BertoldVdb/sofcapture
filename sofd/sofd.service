@@ -1,0 +1,24 @@
+# systemd unit for sofd. Install:
+#   sudo install -m 755 sofd /usr/local/bin/sofd
+#   sudo install -D -m 644 sofd.example.hujson /etc/sofd/sofd.hujson   # then edit
+#   sudo install -m 644 sofd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sofd
+[Unit]
+Description=sofd: USB start-of-frame timing (MQTT, chrony)
+# Not required: sofd reconnects on its own.
+After=network.target mosquitto.service chrony.service
+Wants=network.target
+
+[Service]
+# Runs as root for register access, power settings and real-time priority.
+ExecStart=/usr/local/bin/sofd run --config /etc/sofd/sofd.hujson
+Environment=RUST_LOG=info
+# Keeps the last counter epoch, which must increase across restarts.
+StateDirectory=sofd
+Restart=on-failure
+RestartSec=5
+# SIGTERM: sofd restores power settings and marks itself offline.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

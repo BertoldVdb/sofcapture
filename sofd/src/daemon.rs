@@ -4,7 +4,7 @@ use crate::backend;
 use crate::chrony::{self, Chrony, Sent};
 use crate::clock::{self, Ns};
 use crate::config;
-use crate::discovery::{self, BackendKind, DeviceQuery, MmioOverride, UsbDevice};
+use crate::discovery::{self, BackendKind, Controller, DeviceQuery, MmioOverride, UsbDevice};
 use crate::gnss::device::{self, Board, BoardInfo};
 use crate::gnss::firmware::Image;
 use crate::gnss::framer::Kind;
@@ -14,6 +14,7 @@ use crate::gnss::{session, Feed, Hub};
 use crate::mqtt::{self, Mqtt};
 use crate::power;
 use crate::sampler::{Sampler, SamplerConfig, MAX_RATE_HZ, MIN_RATE_HZ};
+use crate::uevent;
 use anyhow::{anyhow, bail, Context, Result};
 use log::{info, warn};
 use serde_json::{json, Map, Value};
@@ -22,14 +23,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const BOARD_MANUFACTURER: &str = "sofgps";
 const SCAN_EVERY: Duration = Duration::from_secs(1);
+/// Rescan even without uevents, in case one was missed.
+const FULL_RESCAN: Duration = Duration::from_secs(60);
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
-/// A controller that could not be opened is tried again after this long.
+/// Doubles while the same error repeats.
 const SAMPLER_RETRY: Duration = Duration::from_secs(10);
+const SAMPLER_RETRY_MAX: Duration = Duration::from_secs(300);
+/// After a reconnect, a retained request that isn't redelivered within this lapses.
+const RECONFIRM: Duration = Duration::from_secs(10);
+const RUNNING_STATES: [&str; 3] = ["ubx", "passive", "nmea_fallback"];
 /// Wait for a firmware file to stop changing before loading it.
 const IMAGE_SETTLE: Duration = Duration::from_secs(2);
 /// Failed updates to one image before giving up on a board.
@@ -102,6 +109,23 @@ impl Drop for PmGuard {
     }
 }
 
+struct Want {
+    rate_hz: f64,
+    /// Monotonic, and Unix ms for `info`.
+    expires: Option<(Instant, u64)>,
+    mqtt: bool,
+}
+
+fn expiry(after: Duration) -> (Instant, u64) {
+    (Instant::now() + after, (SystemTime::now() + after).duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+}
+
+struct StartFailed {
+    message: String,
+    retry_at: Instant,
+    delay: Duration,
+}
+
 struct Running {
     // Field order matters: stop the sampler before restoring runtime PM.
     sampler: Sampler,
@@ -129,6 +153,8 @@ struct ExtRef {
     client: String,
     feed: Arc<Feed>,
     last: Instant,
+    /// A client whose tags never match must not hold the controller forever.
+    rejected_since: Option<Instant>,
     chrony_busy: bool,
 }
 
@@ -139,16 +165,25 @@ struct ImageSlot {
     changed: Option<(Option<SystemTime>, Instant)>,
 }
 
+struct Discovered {
+    devices: Vec<UsbDevice>,
+    controllers: Vec<Controller>,
+    at: Instant,
+}
+
 pub struct Daemon {
     opts: Options,
+    /// None: rescan every time.
+    usb_watch: Option<Arc<uevent::Watch>>,
+    discovered: Option<Discovered>,
     gnss: config::Gnss,
     tx: Sender<Msg>,
     samplers: BTreeMap<String, Running>,
     /// Held while anything is sampled.
     power: Option<power::Held>,
-    /// controller -> client -> rate
-    wants: BTreeMap<String, BTreeMap<String, f64>>,
-    start_failed: BTreeMap<String, (String, Instant)>,
+    /// controller -> client -> request
+    wants: BTreeMap<String, BTreeMap<String, Want>>,
+    start_failed: BTreeMap<String, StartFailed>,
     slots: BTreeMap<String, Slot>,
     hub: Hub,
     /// controller -> the external reference feeding it
@@ -161,6 +196,8 @@ pub struct Daemon {
     mqtt: Option<Mqtt>,
     chrony: Chrony,
     stdout: bool,
+    /// Stdout broke (e.g. closed pipe): stop.
+    stdout_failed: std::cell::Cell<bool>,
     /// Last published `controllers/<id>/info`.
     infos: BTreeMap<String, Value>,
     pub sample_limit: Option<u64>,
@@ -173,8 +210,11 @@ fn backoff(b: Duration) -> Duration {
 
 impl Daemon {
     pub fn new(opts: Options, gnss: config::Gnss, tx: Sender<Msg>, mqtt: Option<Mqtt>, stdout: bool) -> Self {
+        let usb_watch = uevent::watch().map_err(|e| warn!("{e:#}; scanning USB every second")).ok();
         Self {
             opts,
+            usb_watch,
+            discovered: None,
             gnss,
             tx,
             samplers: BTreeMap::new(),
@@ -190,6 +230,7 @@ impl Daemon {
             mqtt,
             chrony: Chrony::new(),
             stdout,
+            stdout_failed: std::cell::Cell::new(false),
             infos: BTreeMap::new(),
             sample_limit: None,
             samples: 0,
@@ -197,12 +238,34 @@ impl Daemon {
     }
 
     pub fn want(&mut self, controller: &str, client: &str, rate_hz: f64) {
-        self.wants.entry(controller.into()).or_default().insert(client.into(), rate_hz);
+        self.wants.entry(controller.into()).or_default().insert(client.into(), Want { rate_hz, expires: None, mqtt: false });
+    }
+
+    fn drop_want(&mut self, controller: &str, client: &str) {
+        if let Some(w) = self.wants.get_mut(controller) {
+            w.remove(client);
+            if w.is_empty() {
+                self.wants.remove(controller);
+            }
+        }
+    }
+
+    fn expire_wants(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(String, String)> = self
+            .wants
+            .iter()
+            .flat_map(|(c, w)| w.iter().filter(|(_, w)| w.expires.is_some_and(|(t, _)| t <= now)).map(|(cl, _)| (c.clone(), cl.clone())))
+            .collect();
+        for (c, cl) in &expired {
+            info!("{c}: {cl}'s request expired (not renewed within its ttl_s)");
+            self.drop_want(c, cl);
+        }
     }
 
     pub fn run(mut self, rx: &Receiver<Msg>, stop: &AtomicBool) {
         let mut next_scan = Instant::now();
-        while !stop.load(Ordering::Relaxed) && self.sample_limit.is_none_or(|l| self.samples < l) {
+        while !stop.load(Ordering::Relaxed) && !self.stdout_failed.get() && self.sample_limit.is_none_or(|l| self.samples < l) {
             let now = Instant::now();
             if now >= next_scan {
                 self.scan();
@@ -226,11 +289,23 @@ impl Daemon {
         if b + s > 0 {
             info!("stopping {b} board(s), {s} sampler(s)");
         }
+        let boards: Vec<String> = self.slots.iter().filter(|(_, s)| s.board.is_some()).map(|(k, _)| k.clone()).collect();
         for slot in self.slots.values_mut() {
             slot.board = None;
         }
+        let sampled: Vec<String> = self.samplers.keys().cloned().collect();
         self.samplers.clear();
         self.power = None;
+        // Clear retained state so it doesn't look like we're still running.
+        for serial in boards {
+            self.set_status(&serial, json!({"state": "stopped"}));
+        }
+        if let Some(m) = &self.mqtt {
+            for c in sampled {
+                m.publish(&format!("controllers/{c}/model"), Vec::new(), true);
+            }
+        }
+        self.publish_infos();
         if let Some(m) = self.mqtt.take() {
             m.shutdown();
         }
@@ -239,8 +314,9 @@ impl Daemon {
     // ---- output helpers ----
 
     fn print(&self, v: &Value) {
-        if self.stdout {
-            println!("{v}");
+        use std::io::Write;
+        if self.stdout && !self.stdout_failed.get() && writeln!(std::io::stdout().lock(), "{v}").is_err() {
+            self.stdout_failed.set(true);
         }
     }
 
@@ -279,7 +355,7 @@ impl Daemon {
     fn handle(&mut self, m: Msg) {
         match m {
             Msg::Sample(s) => self.on_sample(*s),
-            Msg::Controller { controller, event } => self.controller_event(&controller, &event),
+            Msg::Controller { controller, event } => self.on_controller_event(&controller, &event),
             Msg::Board { serial, id, out } => {
                 // Drop late messages from a replaced session.
                 if self.slots.get(&serial).and_then(|s| s.board.as_ref()).is_some_and(|b| b.id == id) {
@@ -290,7 +366,33 @@ impl Daemon {
         }
     }
 
+    fn on_controller_event(&mut self, controller: &str, ev: &Value) {
+        match ev["event"].as_str() {
+            // The counter may have restarted: clear the model until the next sample.
+            Some("error") if self.samplers.contains_key(controller) => {
+                if let Some(m) = &self.mqtt {
+                    m.publish(&format!("controllers/{controller}/model"), Vec::new(), true);
+                }
+            }
+            Some(e @ ("ref_accepted" | "ref_rejected")) => {
+                if let Some(r) = self.refs.get_mut(controller).filter(|r| ev["client"].as_str() == Some(r.client.as_str())) {
+                    if e == "ref_accepted" {
+                        r.rejected_since = None;
+                    } else {
+                        r.rejected_since.get_or_insert_with(Instant::now);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.controller_event(controller, ev);
+    }
+
     fn on_sample(&mut self, s: SampleOut) {
+        // Sampler already stopped and its model cleared: keep it cleared.
+        if !self.samplers.contains_key(&s.controller) {
+            return;
+        }
         self.samples += 1;
         if let Some(m) = &self.mqtt {
             let c = &s.controller;
@@ -345,6 +447,12 @@ impl Daemon {
                     ev["port"] = json!(b.info.port);
                 }
                 self.on_status(serial, &ev);
+                if RUNNING_STATES.contains(&ev["state"].as_str().unwrap_or("")) {
+                    // Healthy again: reset the backoff.
+                    if let Some(sl) = self.slots.get_mut(serial) {
+                        sl.backoff = Duration::ZERO;
+                    }
+                }
                 let mut printed = ev.clone();
                 printed["event"] = json!("gnss_status");
                 printed["board"] = json!(serial);
@@ -413,27 +521,41 @@ impl Daemon {
                         m.publish_json(&format!("gnss/{serial}/status"), &slot.status, true);
                     }
                 }
+                // Clear stale retained models of controllers we don't sample.
+                if let (Some(m), Some(d)) = (&self.mqtt, &self.discovered) {
+                    for c in d.controllers.iter().filter(|c| !self.samplers.contains_key(&c.id)) {
+                        m.publish(&format!("controllers/{}/model", c.id), Vec::new(), true);
+                    }
+                }
+                // Retained requests get redelivered; one withdrawn while we were away won't.
+                for w in self.wants.values_mut().flat_map(|w| w.values_mut()).filter(|w| w.mqtt && w.expires.is_none()) {
+                    w.expires = Some(expiry(RECONFIRM));
+                }
                 self.infos.clear();
                 self.publish_infos();
             }
-            mqtt::In::Want { controller, client, rate_hz } => {
+            mqtt::In::Want { controller, client, rate_hz, ttl_s } => {
                 match rate_hz {
                     Some(r) => {
                         let rate = r.unwrap_or(self.opts.default_rate_hz).clamp(MIN_RATE_HZ, MAX_RATE_HZ);
-                        info!("{controller}: {client} wants {rate} Hz");
-                        self.want(&controller, &client, rate);
+                        let expires = ttl_s.map(|t| expiry(Duration::from_secs_f64(t)));
+                        let w = self.wants.entry(controller.clone()).or_default();
+                        // Renewals: no log line and no immediate retry of a failed controller.
+                        let new = w.get(&client).is_none_or(|o| o.rate_hz != rate || o.expires.is_some() != ttl_s.is_some());
+                        if new {
+                            match ttl_s {
+                                Some(t) => info!("{controller}: {client} wants {rate} Hz (ttl {t} s)"),
+                                None => info!("{controller}: {client} wants {rate} Hz"),
+                            }
+                            self.start_failed.remove(&controller);
+                        }
+                        w.insert(client.clone(), Want { rate_hz: rate, expires, mqtt: true });
                     }
                     None => {
                         info!("{controller}: {client} no longer wants samples");
-                        if let Some(w) = self.wants.get_mut(&controller) {
-                            w.remove(&client);
-                            if w.is_empty() {
-                                self.wants.remove(&controller);
-                            }
-                        }
+                        self.drop_want(&controller, &client);
                     }
                 }
-                self.start_failed.remove(&controller);
                 self.reconcile();
                 self.publish_infos();
             }
@@ -442,9 +564,9 @@ impl Daemon {
                 Some(b) => b.send(data),
                 None => warn!("{serial}: tx for a board that is not attached"),
             },
-            mqtt::In::Cmd { name, payload, reply_to } => {
+            mqtt::In::Cmd { name, payload, reply: to } => {
                 let result = self.command(&name, &payload);
-                let reply = match result {
+                let mut reply = match result {
                     Ok(Value::Object(mut o)) => {
                         o.insert("ok".into(), json!(true));
                         Value::Object(o)
@@ -452,9 +574,12 @@ impl Daemon {
                     Ok(v) => json!({"ok": true, "result": v}),
                     Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
                 };
-                match (reply_to, &self.mqtt) {
-                    (Some((topic, corr)), Some(m)) => m.reply(&topic, corr, &reply),
-                    _ => warn!("cmd/{name} without a response topic"),
+                if let Some(c) = to.correlation {
+                    reply["correlation"] = c;
+                }
+                match (to.topic, &self.mqtt) {
+                    (Some(topic), Some(m)) => m.reply(&topic, to.correlation_data, &reply),
+                    _ => warn!("cmd/{name} without a reply topic (reply_to or MQTT 5 response topic)"),
                 }
             }
         }
@@ -479,13 +604,20 @@ impl Daemon {
                 let f = Arc::new(Feed::external(client));
                 self.hub.lock().unwrap().insert(controller.into(), f.clone());
                 info!("{controller}: MQTT client {client} is the GNSS reference");
-                self.refs.insert(controller.into(), ExtRef { client: client.into(), feed: f.clone(), last: Instant::now(), chrony_busy: false });
+                self.refs.insert(
+                    controller.into(),
+                    ExtRef { client: client.into(), feed: f.clone(), last: Instant::now(), rejected_since: None, chrony_busy: false },
+                );
                 f
             }
         };
         self.ref_told.remove(&(controller.to_string(), client.to_string()));
         for t in tags {
-            feed.push(Tag { at: t.at, utc_ns: t.t_gnss_ns - ext.sof_delay_ns, unc_ns: t.unc_ns, t_rx, source: Source::External });
+            let Some(utc_ns) = t.t_gnss_ns.checked_sub(ext.sof_delay_ns) else {
+                let msg = "t_gnss_ns - sof_delay_ns overflows";
+                return self.ref_problem(controller, client, json!({"event": "ref_rejected", "reason": "invalid", "message": msg}));
+            };
+            feed.push(Tag { at: t.at, utc_ns, unc_ns: t.unc_ns, t_rx, source: Source::External });
         }
         if let Some(r) = self.refs.get_mut(controller) {
             r.last = Instant::now();
@@ -495,7 +627,8 @@ impl Daemon {
     /// Sent once until it changes.
     fn ref_problem(&mut self, controller: &str, client: &str, mut ev: Value) {
         let key = (controller.to_string(), client.to_string());
-        let what = format!("{}/{}", ev["event"], ev["reason"]);
+        // Compare the whole event: a ref_busy with a new owner is news too.
+        let what = ev.to_string();
         if self.ref_told.get(&key) == Some(&what) {
             return;
         }
@@ -514,7 +647,8 @@ impl Daemon {
                 .iter()
                 .filter_map(|(c, r)| match hub.get(c) {
                     Some(f) if Arc::ptr_eq(f, &r.feed) => {
-                        (r.last.elapsed() > Duration::from_secs(LOST_AFTER_S)).then(|| (c.clone(), None))
+                        let lost = Duration::from_secs(LOST_AFTER_S);
+                        (r.last.elapsed() > lost || r.rejected_since.is_some_and(|t| t.elapsed() > lost)).then(|| (c.clone(), None))
                     }
                     other => Some((c.clone(), other.map(|f| f.serial.clone()))),
                 })
@@ -530,9 +664,10 @@ impl Daemon {
                         hub.remove(&c);
                     }
                     drop(hub);
-                    info!("{c}: GNSS reference {} lost (no tags for {LOST_AFTER_S} s)", r.client);
+                    let reason = if r.last.elapsed() > Duration::from_secs(LOST_AFTER_S) { "silent" } else { "rejected" };
+                    info!("{c}: GNSS reference {} lost ({reason} for {LOST_AFTER_S} s)", r.client);
                     self.ref_told.remove(&(c.clone(), r.client.clone()));
-                    self.controller_event(&c, &json!({"event": "ref_lost", "controller": c, "client": r.client}));
+                    self.controller_event(&c, &json!({"event": "ref_lost", "controller": c, "client": r.client, "reason": reason}));
                 }
                 Some(owner) => self.ref_problem(&c, &r.client, json!({"event": "ref_busy", "owner": owner})),
             }
@@ -551,7 +686,10 @@ impl Daemon {
     }
 
     pub fn list(&self) -> Result<Value> {
-        let mut v = list(self.opts.simulate)?;
+        let mut v = match &self.discovered {
+            Some(d) => list_of(&d.devices, &d.controllers),
+            None => list(self.opts.simulate)?,
+        };
         for c in v["controllers"].as_array_mut().into_iter().flatten() {
             let id = c["id"].as_str().unwrap_or("").to_string();
             c["rate_hz"] = json!(self.samplers.get(&id).map(|r| r.rate_hz));
@@ -562,19 +700,47 @@ impl Daemon {
 
     // ---- periodic work ----
 
-    fn scan(&mut self) {
-        let devices = match discovery::devices(self.opts.simulate) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("listing USB devices: {e:#}");
-                return;
-            }
+    fn discover(&mut self) -> Result<()> {
+        let changed = match &self.usb_watch {
+            Some(w) if w.alive.load(Ordering::Relaxed) => w.changed.swap(false, Ordering::Relaxed),
+            _ => true,
         };
+        if changed || self.discovered.as_ref().is_none_or(|d| d.at.elapsed() >= FULL_RESCAN) {
+            let devices = discovery::devices(self.opts.simulate).context("listing USB devices")?;
+            let controllers = discovery::controllers(self.opts.simulate).context("listing USB controllers")?;
+            self.discovered = Some(Discovered { devices, controllers, at: Instant::now() });
+        }
+        Ok(())
+    }
+
+    fn scan(&mut self) {
+        if let Err(e) = self.discover() {
+            warn!("{e:#}");
+            return;
+        }
+        let devices = self.discovered.as_ref().map(|d| d.devices.clone()).unwrap_or_default();
         self.check_images();
         self.scan_boards(&devices);
         self.check_refs();
+        self.expire_wants();
+        self.check_samplers();
         self.reconcile();
         self.publish_infos();
+    }
+
+    /// A sampler thread that ended on its own panicked; retry it later.
+    fn check_samplers(&mut self) {
+        let dead: Vec<String> = self.samplers.iter().filter(|(_, r)| r.sampler.is_finished()).map(|(c, _)| c.clone()).collect();
+        for c in dead {
+            self.samplers.remove(&c);
+            let msg = "sampler thread ended".to_string();
+            warn!("{c}: {msg}; retrying in {} s", SAMPLER_RETRY.as_secs());
+            if let Some(m) = &self.mqtt {
+                m.publish(&format!("controllers/{c}/model"), Vec::new(), true);
+            }
+            self.controller_event(&c, &json!({"event": "error", "controller": c, "message": msg}));
+            self.start_failed.insert(c, StartFailed { message: msg, retry_at: Instant::now() + SAMPLER_RETRY, delay: SAMPLER_RETRY });
+        }
     }
 
     fn scan_boards(&mut self, devices: &[UsbDevice]) {
@@ -653,7 +819,6 @@ impl Daemon {
         match result {
             Ok(board) => {
                 slot.board = Some(board);
-                slot.update_given_up = false;
                 let st = json!({"state": "opening", "controller": info.controller, "tty": info.tty, "port": info.port});
                 self.set_status(&serial, st);
             }
@@ -701,6 +866,10 @@ impl Daemon {
         }
         for p in changed {
             self.images.remove(&p);
+            // A new image gets fresh tries and a fresh warning.
+            for s in self.slots.values_mut().filter(|s| s.cfg.firmware.as_deref() == Some(p.as_path())) {
+                s.update_given_up = false;
+            }
             let Some(img) = self.image(&p) else { continue };
             let restart: Vec<String> = self
                 .slots
@@ -724,7 +893,7 @@ impl Daemon {
     fn reconcile(&mut self) {
         let mut desired: BTreeMap<String, f64> = BTreeMap::new();
         for (c, w) in &self.wants {
-            if let Some(r) = w.values().copied().reduce(f64::max) {
+            if let Some(r) = w.values().map(|w| w.rate_hz).reduce(f64::max) {
                 desired.insert(c.clone(), r);
             }
         }
@@ -746,7 +915,7 @@ impl Daemon {
             self.power = power::Held::apply(&self.opts.power);
         }
         let now = Instant::now();
-        self.start_failed.retain(|c, (_, t)| desired.contains_key(c) && now < *t + SAMPLER_RETRY);
+        self.start_failed.retain(|c, _| desired.contains_key(c));
         for (c, rate) in desired {
             if let Some(r) = self.samplers.get_mut(&c) {
                 if r.rate_hz != rate {
@@ -756,23 +925,29 @@ impl Daemon {
                 }
                 continue;
             }
-            if self.start_failed.contains_key(&c) {
+            if self.start_failed.get(&c).is_some_and(|f| now < f.retry_at) {
                 continue;
             }
             match self.start_sampler(&c, rate) {
                 Ok(r) => {
                     info!("{c}: sampling at {rate} Hz");
+                    self.start_failed.remove(&c);
                     self.samplers.insert(c, r);
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    warn!("{c}: {msg}");
+                    // Same error: back off, or a missing controller is retried every 10 s forever.
+                    let delay = match self.start_failed.get(&c) {
+                        Some(f) if f.message == msg => (f.delay * 2).min(SAMPLER_RETRY_MAX),
+                        _ => SAMPLER_RETRY,
+                    };
+                    warn!("{c}: {msg}; retrying in {} s", delay.as_secs());
                     let ev = json!({"event": "error", "controller": c, "message": msg});
                     if let Some(m) = &self.mqtt {
                         m.publish_event(&format!("controllers/{c}/event"), &ev);
                     }
                     self.print(&ev);
-                    self.start_failed.insert(c, (msg, now));
+                    self.start_failed.insert(c, StartFailed { message: msg, retry_at: now + delay, delay });
                 }
             }
         }
@@ -783,8 +958,9 @@ impl Daemon {
         if self.opts.force_generic.iter().any(|g| g == id) {
             ctrl.backend = Some(BackendKind::KernelFrameNumber);
         }
-        let backend = backend::open(&ctrl, &self.opts.overrides, 2, self.opts.irq_off_max_ns)?;
+        // A suspended controller reads all-ones and its counter stops.
         let pm = PmGuard::hold(&ctrl);
+        let backend = backend::open(&ctrl, &self.opts.overrides, 2, self.opts.irq_off_max_ns)?;
         let sampler = Sampler::spawn(id.to_string(), backend, rate, self.opts.sampler.clone(), self.tx.clone(), self.hub.clone())
             .context("starting sampler thread")?;
         Ok(Running { sampler, rate_hz: rate, _pm: pm })
@@ -799,7 +975,16 @@ impl Daemon {
         for c in v["controllers"].as_array().into_iter().flatten() {
             let id = c["id"].as_str().unwrap_or("").to_string();
             let mut info = c.clone();
-            info["wanted_by"] = json!(self.wants.get(&id).map(|w| w.keys().collect::<Vec<_>>()).unwrap_or_default());
+            let wants = self.wants.get(&id);
+            info["wanted_by"] = json!(wants.map(|w| w.keys().collect::<Vec<_>>()).unwrap_or_default());
+            info["wants"] = wants
+                .map(|w| {
+                    w.iter()
+                        .map(|(cl, w)| (cl.clone(), json!({"rate_hz": w.rate_hz, "expires_ms": w.expires.map(|(_, ms)| ms)})))
+                        .collect::<serde_json::Map<_, _>>()
+                })
+                .unwrap_or_default()
+                .into();
             if self.infos.get(&id) != Some(&info) {
                 self.mqtt.as_ref().unwrap().publish_json(&format!("controllers/{id}/info"), &info, true);
                 self.infos.insert(id.clone(), info);
@@ -832,16 +1017,19 @@ fn frame_json(serial: &str, kind: Kind, f: &[u8]) -> Value {
 }
 
 pub fn list(simulate: bool) -> Result<Value> {
-    let devices = discovery::devices(simulate)?;
-    let ctrls: Vec<Value> = discovery::controllers(simulate)?
-        .into_iter()
+    Ok(list_of(&discovery::devices(simulate)?, &discovery::controllers(simulate)?))
+}
+
+fn list_of(devices: &[UsbDevice], controllers: &[Controller]) -> Value {
+    let ctrls: Vec<Value> = controllers
+        .iter()
         .map(|c| {
-            let mut v = serde_json::to_value(&c).unwrap();
+            let mut v = serde_json::to_value(c).unwrap();
             v["devices"] = json!(devices.iter().filter(|d| d.controller == c.id).collect::<Vec<_>>());
             v
         })
         .collect();
-    Ok(json!({ "controllers": ctrls }))
+    json!({ "controllers": ctrls })
 }
 
 pub fn lookup(q: &DeviceQuery, simulate: bool) -> Result<Value> {
