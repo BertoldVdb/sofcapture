@@ -85,7 +85,7 @@ pub struct External {
     pub sof_delay_ns: i64,
 }
 
-/// Which sofgps boards sofd uses.
+/// Which sofgnss boards sofd uses.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Attach {
     #[default]

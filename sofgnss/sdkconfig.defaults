@@ -1,0 +1,41 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# XIAO ESP32-S3: 8 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# A/B app slots for OTA. The host must confirm a new image or the next reset
+# rolls back.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# OTA images must be signed with the same key as the running app. The
+# bootloader doesn't check, so flashing over serial still works. The key is
+# not in git; see README "Signing key".
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="keys/sofgnss_signing_key.pem"
+
+# No Wi-Fi or Bluetooth.
+CONFIG_APP_NO_BLOBS=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+
+# sleep_us() wakes the SOF spin task from the esp_timer ISR
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
+
+# A stuck task reboots the device. 10 s leaves room for the OTA flash erase.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# Log on UART0 at XIAO D0 (TX) / D1 (RX): USB is the CDC device and the TX/RX
+# pins carry the GPS.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=1
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=2
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

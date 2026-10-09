@@ -1,4 +1,4 @@
-//! sofgps boards: USB GPS bridges that timestamp PPS and SOF on one counter,
+//! sofgnss boards: USB GPS bridges that timestamp PPS and SOF on one counter,
 //! giving their controller's frame times in GNSS UTC.
 
 pub mod device;

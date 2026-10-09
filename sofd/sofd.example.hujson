@@ -24,8 +24,8 @@
     "defaults": {
       "baud": 38400,
       "initial_baud": 9600,              // receiver's power-on baud, e.g. 38400 for u-blox M10/F9
-      // "chrony": "/run/chrony.sofgps.sock",       // use {serial} for one socket per board
-      // "firmware": "/var/lib/sofd/sofgps.bin",
+      // "chrony": "/run/chrony.sofgnss.sock",       // use {serial} for one socket per board
+      // "firmware": "/var/lib/sofd/sofgnss.bin",
     },
     "boards": {
       // "E072A1F9D198": { "sof_delay_ns": 0 },

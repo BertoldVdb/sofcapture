@@ -1,4 +1,4 @@
-//! The NMEA sentences sofd reads (ZDA, RMC, GGA) and sofgps `$PVDB,SOFPPS`.
+//! The NMEA sentences sofd reads (ZDA, RMC, GGA) and sofgnss `$PVDB,SOFPPS`.
 
 use crate::clock::Ns;
 

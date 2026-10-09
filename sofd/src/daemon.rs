@@ -1,4 +1,4 @@
-//! Main loop: runs sofgps boards, samples controllers, and publishes to MQTT, chrony and stdout.
+//! Main loop: runs sofgnss boards, samples controllers, and publishes to MQTT, chrony and stdout.
 
 use crate::backend;
 use crate::chrony::{self, Chrony, Sent};
@@ -25,7 +25,16 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const BOARD_MANUFACTURER: &str = "sofgps";
+// 20a0:4288 is shared with other devices, so the strings must match too.
+pub const BOARD_VID_PID: (&str, &str) = ("20a0", "4288");
+pub const BOARD_MANUFACTURER: &str = "BertoldVdb";
+pub const BOARD_PRODUCT: &str = "GNSS/SOF/PPS Bridge";
+
+pub fn is_board(d: &UsbDevice) -> bool {
+    (d.vid.as_str(), d.pid.as_str()) == BOARD_VID_PID
+        && d.manufacturer.as_deref() == Some(BOARD_MANUFACTURER)
+        && d.product.as_deref() == Some(BOARD_PRODUCT)
+}
 const SCAN_EVERY: Duration = Duration::from_secs(1);
 /// Rescan even without uevents, in case one was missed.
 const FULL_RESCAN: Duration = Duration::from_secs(60);
@@ -748,7 +757,8 @@ impl Daemon {
     fn scan_boards(&mut self, devices: &[UsbDevice]) {
         let found: BTreeMap<String, BoardInfo> = devices
             .iter()
-            .filter(|d| d.manufacturer.as_deref() == Some(BOARD_MANUFACTURER))
+            // Explicitly named devices are used whatever their descriptors.
+            .filter(|d| !matches!(self.gnss.attach, config::Attach::All) || is_board(d))
             .filter_map(|d| {
                 let serial = d.serial.clone()?;
                 let info = BoardInfo { serial: serial.clone(), tty: d.tty.clone()?, controller: d.controller.clone(), port: d.port.clone() };
@@ -1050,15 +1060,19 @@ pub fn lookup(q: &DeviceQuery, simulate: bool) -> Result<Value> {
     }))
 }
 
-/// `spec` is a tty, or "auto" for the board on `controller`.
+/// `spec` is a tty (used as is), or "auto" for the board on `controller`.
 pub fn board_serial(spec: &str, controller: &str, simulate: bool) -> Result<String> {
     let dev = if spec == "auto" {
         discovery::devices(simulate)?
             .into_iter()
-            .find(|d| d.controller == controller && d.manufacturer.as_deref() == Some(BOARD_MANUFACTURER))
-            .ok_or_else(|| anyhow!("no sofgps board on {controller}"))?
+            .find(|d| d.controller == controller && is_board(d))
+            .ok_or_else(|| anyhow!("no sofgnss board on {controller}"))?
     } else {
-        discovery::device_of_tty(spec, simulate)?
+        let d = discovery::device_of_tty(spec, simulate)?;
+        if !is_board(&d) {
+            bail!("{spec} is not a sofgnss board ({}:{} {:?} {:?})", d.vid, d.pid, d.manufacturer, d.product);
+        }
+        d
     };
     dev.serial.ok_or_else(|| anyhow!("USB device {} has no serial number", dev.port))
 }

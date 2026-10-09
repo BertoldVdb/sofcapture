@@ -53,7 +53,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run as a service: use sofgps boards, serve MQTT and chrony as configured
+    /// Run as a service: use sofgnss boards, serve MQTT and chrony as configured
     Run {
         /// Configuration file (HuJSON); the default path may be absent
         #[arg(long)]
@@ -84,7 +84,7 @@ enum Cmd {
         /// Stop after this many samples
         #[arg(long)]
         count: Option<u64>,
-        /// Use a sofgps board as GNSS reference: its tty, or "auto" for the
+        /// Use a sofgnss board as GNSS reference: its tty, or "auto" for the
         /// board on this controller
         #[arg(long, value_name = "TTY|auto")]
         gnss: Option<String>,

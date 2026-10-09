@@ -1,4 +1,4 @@
-//! Splits a sofgps byte stream into NMEA, UBX and RTCM3 frames, using the same
+//! Splits a sofgnss byte stream into NMEA, UBX and RTCM3 frames, using the same
 //! rules as the firmware's FrameParser. Invalid bytes are dropped.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

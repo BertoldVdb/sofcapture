@@ -1,4 +1,4 @@
-//! sofgps firmware image (ESP-IDF app `.bin`) for OTA updates.
+//! sofgnss firmware image (ESP-IDF app `.bin`) for OTA updates.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -8,7 +8,7 @@ use std::time::SystemTime;
 /// After esp_image_header_t and the first segment header.
 const APP_DESC_OFFSET: usize = 32;
 const APP_DESC_MAGIC: u32 = 0xABCD_5432;
-const PROJECT: &str = "sofgps";
+const PROJECT: &str = "sofgnss";
 
 #[derive(Debug)]
 pub struct Image {
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn real_build_if_present() {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sofgps/build/sofgps.bin");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sofgnss/build/sofgnss.bin");
         if p.exists() {
             let i = Image::load(&p).unwrap();
             assert_eq!(i.elf_sha256.len(), 64);

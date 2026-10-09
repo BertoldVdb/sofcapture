@@ -1,4 +1,4 @@
-//! The tty of a sofgps board and the thread that runs its session.
+//! The tty of a sofgnss board and the thread that runs its session.
 
 use super::session::{Config, Output, Port, Session};
 use super::{Feed, Hub};

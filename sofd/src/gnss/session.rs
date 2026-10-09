@@ -1,4 +1,4 @@
-//! State machine for one sofgps device, without I/O: handshake, firmware update, receiver setup,
+//! State machine for one sofgnss device, without I/O: handshake, firmware update, receiver setup,
 //! then labelling pulses from TIM-TP, or from NMEA ZDA if the receiver doesn't answer UBX.
 
 use super::firmware::Image;
@@ -253,7 +253,7 @@ impl Session {
             }
             if !self.warned && now - self.started >= HANDSHAKE_WARN {
                 self.warned = true;
-                self.status("handshake", Some("no reply from the sofgps device".into()), out);
+                self.status("handshake", Some("no reply from the sofgnss device".into()), out);
             }
             return;
         }
@@ -722,7 +722,7 @@ mod tests {
     const UTC0_S: i64 = 1_790_000_000;
     const LEAP: i64 = 18;
 
-    /// A sofgps device plus receiver. GPS data only gets through when both use the same baud.
+    /// A sofgnss device plus receiver. GPS data only gets through when both use the same baud.
     struct Fake {
         host_baud: u32,
         rx_baud: u32,

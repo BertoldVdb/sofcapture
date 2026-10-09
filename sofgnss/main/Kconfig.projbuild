@@ -1,0 +1,111 @@
+menu "sofgnss application"
+
+    config SOFGNSS_SOF_DIVIDER
+        int "Default SOF divider (tag one frame in every N)"
+        range 1 1000000
+        default 100
+        help
+            100 gives ten tagged SOFs per second. Can be changed at runtime with
+            $PVDB,SOFPPS,DIV,<n>*hh.
+
+    config SOFGNSS_SOF_DEBUG
+        bool "Emit SOF spin diagnostics (SOFDBG sentences)"
+        default n
+        help
+            Adds a $PVDB,SOFPPS,SOFDBG sentence with CPU cycle timings from the
+            spin loop after every SOF sentence. For debugging jitter.
+
+    config SOFGNSS_SOF_DITHER
+        bool "Dither which frame in each window is tagged"
+        default y
+        help
+            Tag a pseudo-random frame in the first half of each window of N
+            frames instead of always the first. This stops the capture rounding
+            error from forming a slow sawtooth that a short fit can't average
+            out.
+
+    config SOFGNSS_SOF_LEAD_US
+        int "Wake the SOF spin this many microseconds before the predicted SOF"
+        range 50 900
+        default 200
+
+    config SOFGNSS_PPS_DCD
+        bool "Mirror PPS on the CDC carrier-detect (DCD) line"
+        default y
+        help
+            For LinuxPPS: "ldattach PPS /dev/ttyACMx" turns the DCD changes into
+            /dev/ppsN. Only about 1 ms accurate; the exact time is in the PPS
+            sentence.
+
+    config SOFGNSS_DCD_PULSE_MS
+        int "Length of the DCD pulse per PPS (ms)"
+        range 10 500
+        default 100
+        depends on SOFGNSS_PPS_DCD
+
+    config SOFGNSS_HOST_WDT
+        bool "Restart when the host has sent nothing for 60 s"
+        default y
+        help
+            If the host sends no data for 60 s, the device restarts and
+            re-enumerates. Control requests such as baud changes don't count.
+            Host software should send $PVDB,SOFPPS,PING*hh at least once a minute.
+
+    config SOFGNSS_CAL
+        bool "Calibration burst output for an SDR"
+        default y
+        help
+            Noise or 2/20/40 MHz square-wave bursts (6.55 ms, one per PPS) on
+            SOFGNSS_CAL_GPIO for calibrating an SDR. Turn on at runtime with
+            $PVDB,SOFPPS,CAL,<NOISE|SQ2|SQ20|SQ40|OFF>*hh. Each burst start is
+            timestamped and reported in a CAL sentence.
+
+    config SOFGNSS_INFO_INTERVAL_S
+        int "Seconds between $PVDB,SOFPPS,INFO sentences (0 disables)"
+        default 1
+
+    config SOFGNSS_REQUIRE_DTR
+        bool "Only send to the host while it asserts DTR"
+        default y
+        help
+            Linux raises DTR when the port is opened and drops it on close.
+            While DTR is low, messages are discarded, so a fresh open starts
+            with live data. This also avoids sending data before the host has
+            set up the port, which a new Linux tty would echo back. Disable for
+            host software that never asserts DTR.
+
+    config SOFGNSS_OUTBOX_BYTES
+        int "GPS->host message queue size (bytes)"
+        default 12288
+        help
+            When full, the oldest whole messages are dropped.
+
+    config SOFGNSS_FRAME_TIMEOUT_MS
+        int "Drop a partial GPS frame after this many ms without data"
+        range 20 5000
+        default 200
+        help
+            Otherwise a corrupted UBX/RTCM length could make the parser wait for
+            kilobytes and swallow the messages that follow.
+
+    config SOFGNSS_FRAME_SLACK_MS
+        int "Slack on a GPS frame's arrival time (ms)"
+        range 20 2000
+        default 100
+        help
+            A partial frame is dropped if it isn't complete within 1.25 times
+            its expected wire time plus this slack. This catches false frame
+            starts with a large length, and frames that trickle in too slowly to
+            hit the idle timeout.
+
+    config SOFGNSS_PARSER_BYTES
+        int "Largest GPS frame accepted (bytes)"
+        range 1029 65535
+        default 4096
+        help
+            Largest UBX frame passed to the host; larger ones are skipped and
+            counted in parse_errors. The minimum is the largest RTCM3 frame.
+            Must be below SOFGNSS_OUTBOX_BYTES. The default fits a UBX-RXM-RAWX
+            with 127 measurements.
+
+endmenu
