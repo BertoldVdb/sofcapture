@@ -37,6 +37,12 @@ const FULL_FRAME_RANGE: u32 = 1024;
 /// Pass GNSS time on only from a fresh, filled fit: never extrapolate through an outage.
 const GNSS_MIN_POINTS: usize = 5;
 const GNSS_MAX_AGE_NS: Ns = 5_000_000_000;
+/// A tag matched to the wrong wrap is off by 2.048 s; tag noise is ~50 ns.
+const GNSS_MAX_DEV_NS: Ns = 500_000;
+/// Off tags in a row, received over at least this long, before the fit restarts:
+/// then the reference itself jumped. A burst of late tags arrives at once.
+const GNSS_RESTART_AFTER: u32 = 5;
+const GNSS_RESTART_AFTER_NS: Ns = 3_000_000_000;
 
 static LAST_EPOCH: AtomicU64 = AtomicU64::new(0);
 static EPOCH_FILE: OnceLock<PathBuf> = OnceLock::new();
@@ -218,6 +224,7 @@ fn run(
     let mut model_rt = Model::new(cfg.window);
     let mut model_gnss = Model::new(cfg.window);
     let mut join = Join::default();
+    let mut gate = Gate::default();
     let mut feed: Option<Arc<Feed>> = None;
     let mut gnss_source: Option<Source> = None;
     // Newest GNSS tag gave sofd's counter directly.
@@ -395,6 +402,7 @@ fn run(
             feed = attached;
             model_gnss.clear();
             join = Join::new(feed.as_ref().map_or(0, |f| f.max_lag));
+            gate = Gate::default();
             gnss_source = None;
             last_tag_rx = None;
             ref_state = None;
@@ -403,7 +411,11 @@ fn run(
         if let (Some(fd), Some(f)) = (&feed, &fit) {
             let per_frame: i64 = if hs { 8 } else { 1 };
             let frame_now = counter.div_euclid(per_frame);
-            for tag in fd.drain() {
+            let tags = fd.drain();
+            if !tags.is_empty() {
+                gate.fit = model_gnss.fit(unit as f64);
+            }
+            for tag in tags {
                 let matched = match tag.at {
                     // Its frame may lie up to max_lag frames before arrival.
                     At::Frame { .. } if tag.t_rx - fd.max_lag * 1_000_000 < epoch_start => Err("epoch"),
@@ -419,6 +431,14 @@ fn run(
                     },
                     At::Counter { epoch: e, counter: c } => if e == epoch { Ok(c) } else { Err("epoch") },
                 };
+                let matched = matched.and_then(|c| match gate.check(&mut model_gnss, c, tag.utc_ns, tag.t_rx) {
+                    Verdict::Keep => Ok(c),
+                    Verdict::Off => Err("inconsistent"),
+                    Verdict::Restart => {
+                        warn!("{id}: GNSS tags disagree with the fit, restarting it");
+                        Ok(c)
+                    }
+                });
                 last_ok = matched.is_ok();
                 if let Ok(c) = matched {
                     model_gnss.push(c, tag.utc_ns, tag.unc_ns);
@@ -498,6 +518,41 @@ fn run(
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Keep,
+    Off,
+    /// The fit was cleared; keep the tag as its first point.
+    Restart,
+}
+
+/// Keeps GNSS tags that disagree with the fit out of it.
+#[derive(Default)]
+struct Gate {
+    fit: Option<Fit>,
+    misses: u32,
+    first_miss_rx: Ns,
+}
+
+impl Gate {
+    fn check(&mut self, model: &mut Model, counter: i64, utc_ns: Ns, t_rx: Ns) -> Verdict {
+        if !self.fit.as_ref().is_some_and(|f| (utc_ns - f.predict(counter)).abs() > GNSS_MAX_DEV_NS) {
+            self.misses = 0;
+            return Verdict::Keep;
+        }
+        if self.misses == 0 {
+            self.first_miss_rx = t_rx;
+        }
+        self.misses += 1;
+        if self.misses < GNSS_RESTART_AFTER || t_rx - self.first_miss_rx < GNSS_RESTART_AFTER_NS {
+            return Verdict::Off;
+        }
+        model.clear();
+        *self = Self::default();
+        Verdict::Restart
+    }
+}
+
 /// Queued tags belong to the old epoch's counter.
 fn discard_tags(feed: &Option<Arc<Feed>>) {
     if let Some(fd) = feed {
@@ -508,6 +563,30 @@ fn discard_tags(feed: &Option<Arc<Feed>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_rejects_wrong_wraps_and_restarts() {
+        let mut m = Model::new(64);
+        let utc = |c: i64| 1_791_151_735_000_000_000 + c * 1_000_000;
+        for c in 0..10 {
+            m.push(c * 100, utc(c * 100), 50);
+        }
+        let mut g = Gate { fit: m.fit(1e6), ..Default::default() };
+        assert_eq!(g.check(&mut m, 1000, utc(1000) + 40, 0), Verdict::Keep);
+        // A burst of late tags, matched one wrap too late, all received at once.
+        for _ in 0..20 {
+            assert_eq!(g.check(&mut m, 1100 + 2048, utc(1100), 0), Verdict::Off);
+        }
+        assert_eq!(g.check(&mut m, 1100, utc(1100), 0), Verdict::Keep, "a good tag resets the count");
+        // The reference jumped: off for 3 s.
+        let jumped = utc(1200) + 5_000_000_000;
+        for i in 0..GNSS_RESTART_AFTER {
+            assert_eq!(g.check(&mut m, 1200, jumped, i as Ns * 100_000_000), Verdict::Off);
+        }
+        assert_eq!(g.check(&mut m, 1200, jumped, GNSS_RESTART_AFTER_NS), Verdict::Restart);
+        assert!(m.fit(1e6).is_none());
+        assert_eq!(g.check(&mut m, 1300, utc(1300), GNSS_RESTART_AFTER_NS), Verdict::Keep, "no fit, nothing to compare");
+    }
 
     #[test]
     fn epochs_follow_unix_ms_and_increase() {
