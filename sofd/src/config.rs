@@ -52,6 +52,8 @@ pub struct Sampler {
     pub cpu: Option<usize>,
     /// Rate for boards' controllers and for requests that give none.
     pub default_rate_hz: f64,
+    /// How often `model` is published, unless a client asks for more.
+    pub model_hz: f64,
     /// Cap CPU wake-up latency while sampling (/dev/cpu_dma_latency).
     pub max_cpu_latency_us: Option<u32>,
     /// While sampling, use this cpufreq governor (on `cpu` if set, else all CPUs).
@@ -60,7 +62,7 @@ pub struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 50.0, max_cpu_latency_us: None, cpu_governor: None }
+        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 50.0, model_hz: 1.0, max_cpu_latency_us: None, cpu_governor: None }
     }
 }
 
@@ -197,6 +199,9 @@ impl Config {
         if !(lo..=hi).contains(&s.default_rate_hz) {
             anyhow::bail!("sampler.default_rate_hz must be within {lo}..={hi}");
         }
+        if !(lo..=hi).contains(&s.model_hz) {
+            anyhow::bail!("sampler.model_hz must be within {lo}..={hi}");
+        }
         if !(3..=100_000).contains(&s.window) {
             anyhow::bail!("sampler.window must be within 3..=100000");
         }
@@ -311,6 +316,7 @@ mod tests {
         for bad in [
             r#"{"sampler":{"default_rate_hz":0}}"#,
             r#"{"sampler":{"default_rate_hz":5000}}"#,
+            r#"{"sampler":{"model_hz":0}}"#,
             r#"{"sampler":{"window":2}}"#,
             r#"{"sampler":{"cpu":5000}}"#,
             r#"{"sampler":{"rt_prio":0}}"#,

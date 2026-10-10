@@ -37,8 +37,8 @@ const SUBSCRIPTIONS: [&str; 4] = ["controllers/+/want/+", "controllers/+/ref/+",
 pub enum In {
     /// Republish retained state.
     Connected,
-    /// `rate_hz` None: request withdrawn. `ttl_s`: lapses unless renewed.
-    Want { controller: String, client: String, rate_hz: Option<Option<f64>>, ttl_s: Option<f64> },
+    /// `req` None: request withdrawn.
+    Want { controller: String, client: String, req: Option<WantReq> },
     Tx { serial: String, data: Vec<u8> },
     /// `t_rx`: arrival time, CLOCK_MONOTONIC_RAW.
     Ref { controller: String, client: String, payload: Vec<u8>, t_rx: crate::clock::Ns },
@@ -57,6 +57,30 @@ pub struct Reply {
 }
 
 pub const MAX_TTL_S: f64 = 86_400.0;
+
+/// A client's `want` request.
+#[derive(Debug, Default, PartialEq)]
+pub struct WantReq {
+    /// None: the default rate.
+    pub rate_hz: Option<f64>,
+    /// How often to publish `model`; None: the configured rate.
+    pub model_hz: Option<f64>,
+    /// Publish every sample on `sample`.
+    pub samples: bool,
+    /// Lapses unless renewed.
+    pub ttl_s: Option<f64>,
+}
+
+/// None and null are absent; anything but a positive number is an error.
+fn positive(req: &serde_json::Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_f64() {
+            Some(r) if r > 0.0 && r.is_finite() => Ok(Some(r)),
+            _ => Err(format!("{key} {v} is not a positive number")),
+        },
+    }
+}
 
 /// Non-JSON bodies pass through unchanged.
 fn command_request(prefix: &str, topic: &str, payload: &[u8], props: Option<&PublishProperties>) -> (Vec<u8>, Reply) {
@@ -250,8 +274,8 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
         ["controllers", ctrl, "want", client] => {
-            let (rate_hz, ttl_s) = if p.payload.is_empty() {
-                (None, None)
+            let req = if p.payload.is_empty() {
+                None
             } else {
                 // Ignore bad requests: "off" or {"rate_hz":0} must not start sampling.
                 let req = match serde_json::from_slice::<Value>(&p.payload) {
@@ -261,15 +285,20 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
                         return None;
                     }
                 };
-                let rate = match req.get("rate_hz") {
-                    None | Some(Value::Null) => None,
-                    Some(r) => match r.as_f64() {
-                        Some(r) if r > 0.0 && r.is_finite() => Some(r),
-                        _ => {
-                            warn!("mqtt: {topic}: rate_hz {r} is not a positive number; request ignored");
-                            return None;
-                        }
-                    },
+                let (rate_hz, model_hz) = match (positive(&req, "rate_hz"), positive(&req, "model_hz")) {
+                    (Ok(r), Ok(m)) => (r, m),
+                    (Err(e), _) | (_, Err(e)) => {
+                        warn!("mqtt: {topic}: {e}; request ignored");
+                        return None;
+                    }
+                };
+                let samples = match req.get("samples") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(v) => {
+                        warn!("mqtt: {topic}: samples {v} is not true or false; request ignored");
+                        return None;
+                    }
                 };
                 let ttl_s = match req.get("ttl_s") {
                     None => None,
@@ -282,9 +311,9 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
                         }
                     },
                 };
-                (Some(rate), ttl_s)
+                Some(WantReq { rate_hz, model_hz, samples, ttl_s })
             };
-            Some(In::Want { controller: ctrl.to_string(), client: client.to_string(), rate_hz, ttl_s })
+            Some(In::Want { controller: ctrl.to_string(), client: client.to_string(), req })
         }
         ["controllers", ctrl, "ref", client] if !p.payload.is_empty() => Some(In::Ref {
             controller: ctrl.to_string(),
@@ -326,14 +355,17 @@ mod tests {
     #[test]
     fn incoming_topics() {
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/0000:00:14.0/want/app1", br#"{"rate_hz":20}"#));
-        assert_eq!(w, Some(In::Want { controller: "0000:00:14.0".into(), client: "app1".into(), rate_hz: Some(Some(20.0)), ttl_s: None }));
+        let req = |r: Option<f64>| Some(WantReq { rate_hz: r, ..Default::default() });
+        assert_eq!(w, Some(In::Want { controller: "0000:00:14.0".into(), client: "app1".into(), req: req(Some(20.0)) }));
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", b""));
-        assert_eq!(w, Some(In::Want { controller: "c".into(), client: "app1".into(), rate_hz: None, ttl_s: None }));
+        assert_eq!(w, Some(In::Want { controller: "c".into(), client: "app1".into(), req: None }));
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", b"{}"));
-        assert!(matches!(w, Some(In::Want { rate_hz: Some(None), .. })));
+        assert!(matches!(w, Some(In::Want { req: Some(WantReq { rate_hz: None, model_hz: None, samples: false, ttl_s: None }), .. })));
         let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", br#"{"rate_hz":20,"ttl_s":10}"#));
-        assert!(matches!(w, Some(In::Want { rate_hz: Some(Some(r)), ttl_s: Some(t), .. }) if r == 20.0 && t == 10.0));
-        for bad in [r#"{"ttl_s":0}"#, r#"{"ttl_s":-1}"#, r#"{"ttl_s":"10"}"#, r#"{"ttl_s":1e9}"#, "off", "null", "[1]", r#"{"rate_hz":0}"#, r#"{"rate_hz":"20"}"#] {
+        assert!(matches!(w, Some(In::Want { req: Some(WantReq { rate_hz: Some(r), ttl_s: Some(t), .. }), .. }) if r == 20.0 && t == 10.0));
+        let w = parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", br#"{"model_hz":5,"samples":true}"#));
+        assert!(matches!(w, Some(In::Want { req: Some(WantReq { rate_hz: None, model_hz: Some(m), samples: true, .. }), .. }) if m == 5.0));
+        for bad in [r#"{"ttl_s":0}"#, r#"{"ttl_s":-1}"#, r#"{"ttl_s":"10"}"#, r#"{"ttl_s":1e9}"#, "off", "null", "[1]", r#"{"rate_hz":0}"#, r#"{"rate_hz":"20"}"#, r#"{"model_hz":0}"#, r#"{"samples":1}"#] {
             assert_eq!(parse("sofd/pc", &publish("sofd/pc/controllers/c/want/app1", bad.as_bytes())), None, "{bad}");
         }
         assert_eq!(parse("sofd/pc", &publish("sofd/pc/gnss/E07/tx", b"\xb5b")), Some(In::Tx { serial: "E07".into(), data: b"\xb5b".to_vec() }));

@@ -88,6 +88,8 @@ pub struct Options {
     pub irq_off_max_ns: u32,
     pub sampler: SamplerConfig,
     pub default_rate_hz: f64,
+    /// `model` publish rate unless a client asks for more.
+    pub model_hz: f64,
     pub power: power::Settings,
 }
 
@@ -122,6 +124,8 @@ impl Drop for PmGuard {
 
 struct Want {
     rate_hz: f64,
+    model_hz: Option<f64>,
+    samples: bool,
     /// Monotonic, and Unix ms for `info`.
     expires: Option<(Instant, u64)>,
     mqtt: bool,
@@ -211,8 +215,28 @@ pub struct Daemon {
     stdout_failed: std::cell::Cell<bool>,
     /// Last published `controllers/<id>/info`.
     infos: BTreeMap<String, Value>,
+    /// When each controller's `model` was last published, and its state then.
+    model_pub: BTreeMap<String, (Instant, ModelState)>,
     pub sample_limit: Option<u64>,
     samples: u64,
+}
+
+/// Changes that clients should see at once rather than at the next `model_hz` tick.
+#[derive(Debug, PartialEq)]
+struct ModelState {
+    epoch: Value,
+    fits: [bool; 3],
+    reference: Value,
+}
+
+impl ModelState {
+    fn of(sample: &Value) -> Self {
+        Self {
+            epoch: sample["epoch"].clone(),
+            fits: ["model_raw", "model_realtime", "model_gnss"].map(|k| !sample[k].is_null()),
+            reference: sample["gnss"]["board"].clone(),
+        }
+    }
 }
 
 fn backoff(b: Duration) -> Duration {
@@ -243,13 +267,21 @@ impl Daemon {
             stdout,
             stdout_failed: std::cell::Cell::new(false),
             infos: BTreeMap::new(),
+            model_pub: BTreeMap::new(),
             sample_limit: None,
             samples: 0,
         }
     }
 
     pub fn want(&mut self, controller: &str, client: &str, rate_hz: f64) {
-        self.wants.entry(controller.into()).or_default().insert(client.into(), Want { rate_hz, expires: None, mqtt: false });
+        let w = Want { rate_hz, model_hz: None, samples: false, expires: None, mqtt: false };
+        self.wants.entry(controller.into()).or_default().insert(client.into(), w);
+    }
+
+    /// `model` publish rate: the configured one, or more if a client asks.
+    fn model_hz(&self, controller: &str) -> f64 {
+        let asked = self.wants.get(controller).into_iter().flat_map(|w| w.values()).filter_map(|w| w.model_hz);
+        asked.fold(self.opts.model_hz, f64::max)
     }
 
     fn drop_want(&mut self, controller: &str, client: &str) {
@@ -407,12 +439,24 @@ impl Daemon {
         self.samples += 1;
         if let Some(m) = &self.mqtt {
             let c = &s.controller;
-            m.publish_json(&format!("controllers/{c}/sample"), &s.event, false);
-            let mut model = Map::new();
-            for k in ["epoch", "unit_ns", "counter", "model_raw", "model_realtime", "model_gnss", "gnss", "frame_start"] {
-                model.insert(k.into(), s.event[k].clone());
+            let wants = self.wants.get(c);
+            if wants.is_some_and(|w| w.values().any(|w| w.samples)) {
+                m.publish_json(&format!("controllers/{c}/sample"), &s.event, false);
             }
-            m.publish_json(&format!("controllers/{c}/model"), &Value::Object(model), true);
+            let rate = self.samplers.get(c).map_or(1.0, |r| r.rate_hz);
+            // Half a sample early, or the interval would grow by up to one sample each time.
+            let interval = Duration::from_secs_f64((1.0 / self.model_hz(c) - 0.5 / rate).max(0.0));
+            let state = ModelState::of(&s.event);
+            let now = Instant::now();
+            let due = self.model_pub.get(c).is_none_or(|(t, st)| *st != state || now.duration_since(*t) >= interval);
+            if due {
+                let mut model = Map::new();
+                for k in ["epoch", "unit_ns", "counter", "model_raw", "model_realtime", "model_gnss", "gnss", "frame_start"] {
+                    model.insert(k.into(), s.event[k].clone());
+                }
+                m.publish_json(&format!("controllers/{c}/model"), &Value::Object(model), true);
+                self.model_pub.insert(c.clone(), (now, state));
+            }
         }
         self.print(&s.event);
         let (Some(name), Some(p)) = (s.board, s.chrony) else { return };
@@ -545,10 +589,10 @@ impl Daemon {
                 self.infos.clear();
                 self.publish_infos();
             }
-            mqtt::In::Want { controller, client, rate_hz, ttl_s } => {
-                match rate_hz {
-                    Some(r) => {
-                        let rate = r.unwrap_or(self.opts.default_rate_hz).clamp(MIN_RATE_HZ, MAX_RATE_HZ);
+            mqtt::In::Want { controller, client, req } => {
+                match req {
+                    Some(mqtt::WantReq { rate_hz, model_hz, samples, ttl_s }) => {
+                        let rate = rate_hz.unwrap_or(self.opts.default_rate_hz).clamp(MIN_RATE_HZ, MAX_RATE_HZ);
                         let expires = ttl_s.map(|t| expiry(Duration::from_secs_f64(t)));
                         let w = self.wants.entry(controller.clone()).or_default();
                         // Renewals: no log line and no immediate retry of a failed controller.
@@ -560,7 +604,7 @@ impl Daemon {
                             }
                             self.start_failed.remove(&controller);
                         }
-                        w.insert(client.clone(), Want { rate_hz: rate, expires, mqtt: true });
+                        w.insert(client.clone(), Want { rate_hz: rate, model_hz, samples, expires, mqtt: true });
                     }
                     None => {
                         info!("{controller}: {client} no longer wants samples");
@@ -704,6 +748,7 @@ impl Daemon {
         for c in v["controllers"].as_array_mut().into_iter().flatten() {
             let id = c["id"].as_str().unwrap_or("").to_string();
             c["rate_hz"] = json!(self.samplers.get(&id).map(|r| r.rate_hz));
+            c["model_hz"] = json!(self.samplers.get(&id).map(|r| self.model_hz(&id).min(r.rate_hz)));
         }
         v["boards"] = json!(self.slots.iter().map(|(s, sl)| { let mut st = sl.status.clone(); st["board"] = json!(s); st }).collect::<Vec<_>>());
         Ok(v)
@@ -916,6 +961,7 @@ impl Daemon {
         let stop: Vec<String> = self.samplers.keys().filter(|c| !desired.contains_key(*c)).cloned().collect();
         for c in stop {
             self.samplers.remove(&c);
+            self.model_pub.remove(&c);
             info!("{c}: stopped");
             if let Some(m) = &self.mqtt {
                 m.publish(&format!("controllers/{c}/model"), Vec::new(), true);
@@ -992,7 +1038,11 @@ impl Daemon {
             info["wants"] = wants
                 .map(|w| {
                     w.iter()
-                        .map(|(cl, w)| (cl.clone(), json!({"rate_hz": w.rate_hz, "expires_ms": w.expires.map(|(_, ms)| ms)})))
+                        .map(|(cl, w)| {
+                            let req = json!({"rate_hz": w.rate_hz, "model_hz": w.model_hz, "samples": w.samples,
+                                             "expires_ms": w.expires.map(|(_, ms)| ms)});
+                            (cl.clone(), req)
+                        })
                         .collect::<serde_json::Map<_, _>>()
                 })
                 .unwrap_or_default()

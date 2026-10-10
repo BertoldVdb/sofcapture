@@ -131,6 +131,7 @@ fn main() -> Result<()> {
         irq_off_max_ns: cli.irq_off_max_us * 1000,
         sampler: SamplerConfig { window: cfg.sampler.window, rt_prio: cfg.sampler.rt_prio, cpu: cfg.sampler.cpu },
         default_rate_hz: cfg.sampler.default_rate_hz,
+        model_hz: cfg.sampler.model_hz,
         power: power::Settings {
             max_cpu_latency_us: cfg.sampler.max_cpu_latency_us,
             cpu_governor: cfg.sampler.cpu_governor.clone(),
