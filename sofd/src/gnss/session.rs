@@ -18,6 +18,7 @@ const HANDSHAKE_WARN: Ns = 5_000 * MS;
 const SETTLE: Ns = 250 * MS;
 /// The device only forwards valid frames, so a wrong baud is just silence.
 const PROBE_WAIT: Ns = 1_500 * MS;
+const SEARCH_BAUDS: [u32; 9] = [9600, 38_400, 115_200, 4800, 19_200, 57_600, 230_400, 460_800, 921_600];
 const POLL_WAIT: Ns = 1_000 * MS;
 const POLL_TRIES: u32 = 3;
 const ACK_TRIES: u32 = 3;
@@ -447,11 +448,14 @@ impl Session {
         self.status("probing", msg, out);
     }
 
-    /// Target baud first: the receiver may already be set up.
+    /// Target baud first: the receiver may already be set up. Then its
+    /// power-on baud, then the other standard rates.
     fn bauds(&self) -> Vec<u32> {
         let mut b = vec![self.cfg.baud];
-        if self.cfg.initial_baud != self.cfg.baud {
-            b.push(self.cfg.initial_baud);
+        for r in [self.cfg.initial_baud].into_iter().chain(SEARCH_BAUDS) {
+            if !b.contains(&r) {
+                b.push(r);
+            }
         }
         b
     }
@@ -643,7 +647,7 @@ impl Session {
                     self.enter_probe(next, now, port);
                     if next == 0 {
                         let list: Vec<String> = bauds.iter().map(u32::to_string).collect();
-                        self.status("probing", Some(format!("no receiver data at {} baud", list.join(" or "))), out);
+                        self.status("probing", Some(format!("no receiver data at {} baud", list.join(", "))), out);
                     }
                 }
             }
@@ -1041,6 +1045,15 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_receiver_at_an_unconfigured_baud() {
+        let mut r = Run::new(Fake::new(115_200, false, true));
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert_eq!(r.fake.rx_baud, 38_400);
+        r.check_tags(Source::TimTp);
+    }
+
+    #[test]
     fn nmea_only_receiver_falls_back_to_zda() {
         let mut r = Run::with(Config { initial_baud: 4800, ..Config::default() }, Fake::new(4800, false, false));
         r.for_secs(30);
@@ -1104,11 +1117,12 @@ mod tests {
     }
 
     #[test]
-    fn receiver_at_unexpected_baud_is_not_found() {
-        let mut r = Run::new(Fake::new(115_200, false, true));
-        r.for_secs(10);
+    fn receiver_at_a_nonstandard_baud_is_not_found() {
+        let mut r = Run::new(Fake::new(1200, false, true));
+        r.for_secs(20);
         assert_eq!(r.session.state(), "probing");
-        assert!(r.out.events.iter().any(|e| e["message"] == "no receiver data at 38400 or 9600 baud"));
+        let msg = "no receiver data at 38400, 9600, 115200, 4800, 19200, 57600, 230400, 460800, 921600 baud";
+        assert!(r.out.events.iter().any(|e| e["message"] == msg));
     }
 
     #[test]
