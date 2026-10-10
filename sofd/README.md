@@ -164,7 +164,7 @@ Board options:
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1–1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
 | `sof_delay_ns` | 0 | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
-| `firmware` | none | The sofgnss image (`build/sofgnss.bin`) the board should run. Boards running another image are updated. `null` in `boards` turns updates off for one board. |
+| `firmware` | none | The sofgnss image (`sofgnss/esp32s3/build/sofgnss.bin`) the board should run. Boards running another image are updated. `null` in `boards` turns updates off for one board. |
 
 A controller sampled for a board runs at `sampler.default_rate_hz` (50). That
 is also the rate of the samples sent to chrony, and of MQTT requests that do
@@ -216,7 +216,7 @@ frames from these topics.
 | `controllers/<id>/info` | yes | The controller and its devices, `rate_hz` and `model_hz` (null when not sampled), `wanted_by`, and `wants` with each client's `rate_hz`, `model_hz`, `samples` and `expires_ms`. |
 | `controllers/<id>/model` | yes | The latest fits (`epoch`, `unit_ns`, `counter`, `model_*`, `gnss`, `frame_start`). Published at `model_hz` (1 Hz by default), and straight away on a new epoch, when a fit appears or disappears, or when the GNSS reference changes. Emptied when sampling stops, on a controller error until the next sample, and when sofd stops. |
 | `controllers/<id>/sample` | | Every sample, but only while some client's request has `"samples":true`. |
-| `controllers/<id>/event` | | `error`, `recovered` and `realtime_step`, plus `ref_*` and `chrony_busy` for MQTT references. |
+| `controllers/<id>/event` | | `error`, `recovered` and `realtime_step`, `reference` (the board that is now the GNSS reference, `null` for none), plus `ref_*` and `chrony_busy` for MQTT references. |
 | `controllers/<id>/want/<client>` | yes, by clients | `{"rate_hz":20}`, or `{}` for the default rate. `"model_hz":5` publishes `model` more often and `"samples":true` publishes `sample`. An empty payload withdraws the request. With `"ttl_s":10` the request lapses unless it is renewed, and it is not retained. Anything else is ignored, such as a payload that is not an object, a rate ≤ 0 or a `samples` that is not a boolean. |
 | `controllers/<id>/ref/<client>` | by clients | SOF tags of an MQTT GNSS reference (below). |
 | `gnss/<serial>/status` | yes | Board state (below). |
@@ -310,10 +310,18 @@ a GNSS outage they are null rather than extrapolated.
 ## GNSS reference (sofgnss)
 
 A [sofgnss](../sofgnss) board timestamps the GPS PPS and the USB SOFs it
-receives on one 80 MHz counter. It becomes the GNSS reference of the
-controller it is plugged into. That controller's samples then gain
-`model_gnss` (the counter against GNSS UTC, whose `ppm` is the controller's
-true frequency error), `frame_start.t_gnss_ns` and `gnss`.
+receives on one counter. Once its receiver works, it becomes the GNSS
+reference of the controller it is plugged into. That controller's samples then
+gain `model_gnss` (the counter against GNSS UTC, whose `ppm` is the
+controller's true frequency error), `frame_start.t_gnss_ns` and `gnss`.
+
+Every board found is opened and kept alive, but each controller has one
+reference. With several boards on a controller, the first whose receiver
+works (state `ubx`, `nmea_fallback` or `passive`) gets the role and keeps it
+while its receiver keeps working. Then another working board takes over. A
+board without a receiver, still searching for one, never holds the role, so it
+can't keep a working board or an MQTT reference off the controller. Changes
+are logged and sent as a `reference` event.
 
 ### Finding boards
 
@@ -496,7 +504,8 @@ must arrive within about 1.9 s. Or it can carry sofd's own epoch and counter,
 which works with any latency.
 
 sofd only accepts clients listed in `gnss.external`, and only that table can
-send them to chrony. A board on the controller takes precedence. A reference
+send them to chrony. A board on the controller whose receiver works takes
+precedence. A reference
 that sends nothing for 10 s, or whose tags have all been rejected for 10 s, is
 dropped. Tag times must lie between 2000 and 2100, and `unc_ns` between 1 ns
 and 1 s. Samples then carry `gnss.board` `mqtt:<client>` and `source`

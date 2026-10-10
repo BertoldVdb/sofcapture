@@ -4,7 +4,7 @@ use super::session::{Config, Output, Port, Session};
 use super::{Feed, Hub};
 use crate::clock;
 use crate::daemon::{BoardOut, Msg};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use log::info;
 use std::ffi::CString;
 use std::io;
@@ -171,6 +171,9 @@ pub struct Board {
     pub info: BoardInfo,
     /// Unique per session, so late messages from an old one can be ignored.
     pub id: u64,
+    /// Its SOF tags. The daemon puts it in the hub while the board is its
+    /// controller's GNSS reference.
+    pub feed: Arc<Feed>,
     stop: Arc<AtomicBool>,
     tx: Sender<Vec<u8>>,
     thread: Option<JoinHandle<()>>,
@@ -192,29 +195,21 @@ impl Drop for Board {
     }
 }
 
-/// SOF tags go to the controller's feed in `hub`, everything else to `out`.
+/// SOF tags go to `Board::feed`, everything else to `out`. The session takes
+/// its feed out of `hub` when it ends.
 pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Result<Board> {
     let tty = Tty::open(&info.tty, cfg.initial_baud).with_context(|| format!("opening {}", info.tty))?;
     let feed = Arc::new(Feed::new(info.serial.clone()));
-    {
-        let mut h = hub.lock().unwrap();
-        match h.get(&info.controller) {
-            Some(f) if f.client.is_some() => info!("{}: board {} replaces GNSS reference {}", info.controller, info.serial, f.serial),
-            Some(f) => bail!("controller {} already has board {} attached", info.controller, f.serial),
-            None => {}
-        }
-        h.insert(info.controller.clone(), feed.clone());
-    }
     let stop = Arc::new(AtomicBool::new(false));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
-    let (s, h, o, i) = (stop.clone(), hub.clone(), out.clone(), info.clone());
+    let (s, h, o, i, fd) = (stop.clone(), hub.clone(), out.clone(), info.clone(), feed.clone());
     let thread = std::thread::Builder::new().name(format!("gnss-{}", info.serial)).spawn(move || {
         // Clean up even on panic, or the board is never reopened.
-        let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(tty, &i, id, cfg, &feed, &rx, &o, &s)))
+        let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(tty, &i, id, cfg, &fd, &rx, &o, &s)))
             .unwrap_or_else(|_| Some("board session panicked".into()));
         let mut hub = h.lock().unwrap();
-        if hub.get(&i.controller).is_some_and(|f| Arc::ptr_eq(f, &feed)) {
+        if hub.get(&i.controller).is_some_and(|f| Arc::ptr_eq(f, &fd)) {
             hub.remove(&i.controller);
         }
         drop(hub);
@@ -222,15 +217,9 @@ pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Resu
             let _ = o.send(Msg::Board { serial: i.serial.clone(), id, out: BoardOut::Ended(r) });
         }
     });
-    let thread = match thread {
-        Ok(t) => t,
-        Err(e) => {
-            hub.lock().unwrap().remove(&info.controller);
-            return Err(e).context("starting board thread");
-        }
-    };
-    info!("{}: board on {} ({}), GNSS reference of {}", info.serial, info.tty, info.port, info.controller);
-    Ok(Board { info, id, stop, tx, thread: Some(thread) })
+    let thread = thread.context("starting board thread")?;
+    info!("{}: board on {} ({}), controller {}", info.serial, info.tty, info.port, info.controller);
+    Ok(Board { info, id, feed, stop, tx, thread: Some(thread) })
 }
 
 /// Runs the session until stopped (None) or the device fails (Some(reason)).

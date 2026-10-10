@@ -513,6 +513,7 @@ impl Daemon {
                 printed["board"] = json!(serial);
                 self.print(&printed);
                 self.set_status(serial, ev);
+                self.assign_feeds();
             }
             BoardOut::Pps(mut ev) => {
                 ev["board"] = json!(serial);
@@ -541,8 +542,55 @@ impl Daemon {
                 self.chrony.release(serial);
                 self.board_event(serial, json!({"event": "detached", "reason": reason}));
                 self.set_status(serial, json!({"state": "detached", "message": reason}));
+                self.assign_feeds();
                 self.reconcile();
             }
+        }
+    }
+
+    /// Picks the board that feeds each controller's GNSS reference: one whose
+    /// receiver works, keeping the current one while it does. Boards without a
+    /// working receiver stay open but feed nothing, so they block neither a
+    /// board with GNSS on the same controller nor an MQTT reference.
+    fn assign_feeds(&mut self) {
+        let mut ready: BTreeMap<String, Vec<Arc<Feed>>> = BTreeMap::new();
+        for slot in self.slots.values() {
+            if let Some(b) = slot.board.as_ref().filter(|_| RUNNING_STATES.contains(&slot.state.as_str())) {
+                ready.entry(b.info.controller.clone()).or_default().push(b.feed.clone());
+            }
+        }
+        let mut changes: Vec<(String, Option<String>, Option<String>)> = vec![];
+        {
+            let mut hub = self.hub.lock().unwrap();
+            let stale: Vec<String> = hub
+                .iter()
+                .filter(|(c, f)| f.client.is_none() && !ready.get(*c).is_some_and(|r| r.iter().any(|rf| Arc::ptr_eq(rf, f))))
+                .map(|(c, _)| c.clone())
+                .collect();
+            for c in stale {
+                let old = hub.remove(&c).map(|f| f.serial.clone());
+                changes.push((c, None, old));
+            }
+            for (c, feeds) in ready {
+                if hub.get(&c).is_some_and(|f| f.client.is_none()) {
+                    continue;
+                }
+                let old = hub.insert(c.clone(), feeds[0].clone()).map(|f| f.serial.clone());
+                changes.push((c, Some(feeds[0].serial.clone()), old));
+            }
+        }
+        for (c, new, old) in changes {
+            if let Some(o) = old.as_ref().filter(|o| !o.starts_with(external::NAME_PREFIX)) {
+                // Let the next reference feed the chrony socket.
+                self.chrony.release(o);
+            }
+            match (&new, &old) {
+                (Some(n), Some(o)) => info!("{c}: board {n} replaces {o} as the GNSS reference"),
+                (Some(n), None) => info!("{c}: board {n} is the GNSS reference"),
+                (None, Some(o)) => info!("{c}: board {o} is no longer the GNSS reference"),
+                (None, None) => continue,
+            }
+            self.controller_event(&c, &json!({"event": "reference", "controller": c, "board": new}));
         }
     }
 
@@ -822,6 +870,7 @@ impl Daemon {
             info!("{serial}: unplugged");
             self.set_status(&serial, json!({"state": "absent"}));
         }
+
         for (serial, info) in found {
             let slot = self.slots.entry(serial.clone()).or_insert_with(|| Slot {
                 board: None,
@@ -844,6 +893,7 @@ impl Daemon {
                 self.open_board(info);
             }
         }
+        self.assign_feeds();
     }
 
     fn open_board(&mut self, info: BoardInfo) {

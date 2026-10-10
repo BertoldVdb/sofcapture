@@ -397,7 +397,7 @@ Some guidelines:
   fit holds the last `sampler.window` (64) tags. GNSS time is only used and
   sent to chrony with at least 5 tags and the newest received under 5 s ago.
 - There is one reference per controller, and a sofgnss board on the
-  controller takes precedence. Otherwise the first allowed client to send
+  controller whose receiver works takes precedence. Otherwise the first allowed client to send
   valid tags owns the controller until it has sent nothing, or only rejected
   tags, for 10 s. Other clients get `ref_busy`.
 - Only send tags you trust. sofd doesn't check GNSS lock for external
