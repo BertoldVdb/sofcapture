@@ -1,4 +1,4 @@
-// ESP32-S3 task wiring. The actual logic lives in components/core.
+// ESP32-S3 task wiring. The actual logic lives in core/.
 #include <cstdlib>
 #include <cstring>
 
@@ -90,6 +90,7 @@ struct TimingEvent {
   char tag[pvdb::kMaxTag + 1];
   CalMode cal_mode;
   bool cal_synced;  // burst was started by a PPS
+  uint32_t cal_length;  // ticks, 0 if not measured
 };
 
 QueueHandle_t s_timing_q;
@@ -134,10 +135,12 @@ bool IRAM_ATTR on_pps_isr(uint32_t tick, void*) {
   return woken == pdTRUE;
 }
 
-bool IRAM_ATTR on_cal_isr(uint32_t tick, void*) {
+// At the end of a burst, with its start tick.
+bool IRAM_ATTR on_cal_isr(uint32_t tick, uint32_t length, void*) {
   TimingEvent ev = make_event(EvKind::Cal, tick, s_cal_n_now);
   ev.cal_mode = s_cal_mode_now;
   ev.cal_synced = s_cal_synced_now;
+  ev.cal_length = length;
   BaseType_t woken = pdFALSE;
   xQueueSendFromISR(s_timing_q, &ev, &woken);
   return woken == pdTRUE;
@@ -174,7 +177,7 @@ void cal_task(void*) {
     s_cal_n_now = n++;
     last_burst = now;
     if (want == CalMode::Square40) {
-      hal::cal_burst_square40(kCalBurstUs);
+      hal::cal_burst_square40(cal_burst_us(hal::cal_chip_rate()));
     } else {
       hal::cal_burst();
     }
@@ -553,7 +556,7 @@ void timing_task(void*) {
           break;
         case EvKind::Cal:
           reporter.on_cal(ev.tick, cal_mode_name(ev.cal_mode), ev.cal_synced,
-                          static_cast<uint32_t>(ev.frame));
+                          static_cast<uint32_t>(ev.frame), hal::cal_chip_rate(), ev.cal_length);
           break;
         case EvKind::Error:
           send_error(ev.tick);

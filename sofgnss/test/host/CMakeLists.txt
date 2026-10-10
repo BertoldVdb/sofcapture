@@ -1,12 +1,12 @@
 # Host build of the portable core plus its tests.
-#   cmake -S test/host -B build-host && cmake --build build-host && build-host/sofgnss_tests
+#   cmake -S test/host -B test/host/build && cmake --build test/host/build && test/host/build/sofgnss_tests
 cmake_minimum_required(VERSION 3.16)
 project(sofgnss_tests CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../components/core)
+set(CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../core)
 
 add_executable(sofgnss_tests
     ${CORE}/src/frame_parser.cpp

@@ -7,7 +7,8 @@
 //   $PVDB,SOFPPS,USB,<mounted>,<suspended>,<dtr>,<line_coding_events>,<line_state_events>,<baud>*hh
 //   $PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending_verify>,<elf_sha256>,<reset_reason>*hh
 //   $PVDB,SOFPPS,OTA,<READY|ACK,<bytes>|OK>*hh
-//   $PVDB,SOFPPS,CAL,<tick>,<NOISE|SQ2|SQ20|SQ40>,<pps_synced>,<n>*hh   burst start
+//   $PVDB,SOFPPS,CAL,<tick>,<NOISE|SQ2|SQ20|SQ40>,<pps_synced>,<n>,<chip_rate>,<length>*hh
+//     burst start tick, and its measured length in ticks (0: not measured)
 // Host -> device (checksum required; commands are not forwarded to the GPS)
 //   $PVDB,SOFPPS,DIV,<n>*hh      tag one frame in every n (see sof_schedule.h)
 //   $PVDB,SOFPPS,INFO[,<tag>]*hh request INFO; the tag is echoed back in it
@@ -63,7 +64,7 @@ struct UsbInfo {
 };
 size_t format_usb(char* out, size_t cap, const UsbInfo& u);
 size_t format_cal(char* out, size_t cap, uint64_t tick, const char* mode, bool pps_synced,
-                  uint32_t n);
+                  uint32_t n, uint32_t chip_rate, uint32_t length);
 size_t format_ver(char* out, size_t cap, const char* version, const char* idf,
                   const char* partition, bool pending_verify, const char* elf_sha256,
                   const char* reset_reason);

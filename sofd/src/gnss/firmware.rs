@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn real_build_if_present() {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sofgnss/build/sofgnss.bin");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../sofgnss/esp32s3/build/sofgnss.bin");
         if p.exists() {
             let i = Image::load(&p).unwrap();
             assert_eq!(i.elf_sha256.len(), 64);

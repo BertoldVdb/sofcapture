@@ -1,9 +1,12 @@
 // Calibration bursts. SPI2 sends the pattern at 40 Mbit/s, clocked from APB like
 // the capture timer. Its chip select is looped back to capture channel 1, so
-// each burst start is timestamped in hardware.
+// each burst's start and end are timestamped in hardware: the SPI drives chip
+// select low before the first bit and high right after the last one. A gap in
+// the stream makes the burst longer.
 //
 // SQ40 uses LEDC instead. The chip-select pad then becomes a plain GPIO that
-// we pull low right as LEDC starts, so the capture still marks the start.
+// we pull low right as LEDC starts, so the capture still marks the start. Its
+// end is set by software, so its length isn't reported.
 #include <cstring>
 
 #include "driver/gpio.h"
@@ -32,6 +35,7 @@
 namespace {
 
 const char* TAG = "cal";
+constexpr uint32_t kChipRate = 40000000;
 
 constexpr ledc_mode_t kLedcMode = LEDC_LOW_SPEED_MODE;
 constexpr ledc_channel_t kLedcChannel = LEDC_CHANNEL_0;
@@ -43,6 +47,9 @@ portMUX_TYPE s_start_mux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t* s_buf;
 sofgnss::hal::CalCallback s_cb;
 void* s_cb_ctx;
+uint32_t s_start_tick;
+bool s_have_start;
+volatile bool s_sq40;  // burst in flight is SQ40: no length
 
 // A timer wakes us this long before a SQ40 burst ends; we busy-wait the rest.
 constexpr uint32_t kSq40SpinUs = 100;
@@ -80,7 +87,15 @@ void wait_until(int64_t stop_at_us) {
 
 bool IRAM_ATTR on_cal_capture(mcpwm_cap_channel_handle_t, const mcpwm_capture_event_data_t* e,
                               void*) {
-  return s_cb ? s_cb(e->cap_value, s_cb_ctx) : false;
+  if (e->cap_edge == MCPWM_CAP_EDGE_NEG) {
+    s_start_tick = e->cap_value;
+    s_have_start = true;
+    return false;
+  }
+  if (!s_have_start) return false;
+  s_have_start = false;
+  uint32_t length = s_sq40 ? 0 : e->cap_value - s_start_tick;
+  return s_cb ? s_cb(s_start_tick, length, s_cb_ctx) : false;
 }
 
 void route_spi() {
@@ -144,7 +159,7 @@ bool cal_init(CalCallback cb, void* ctx) {
   spi_device_interface_config_t dev = {};
   dev.mode = 0;
   dev.clock_source = SPI_CLK_SRC_APB;
-  dev.clock_speed_hz = kCalChipRate;
+  dev.clock_speed_hz = kChipRate;
   dev.spics_io_num = CONFIG_SOFGNSS_CAL_CS_GPIO;
   dev.queue_size = 1;
   dev.flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_NO_DUMMY;
@@ -152,8 +167,8 @@ bool cal_init(CalCallback cb, void* ctx) {
 
   int khz = 0;
   spi_device_get_actual_freq(s_dev, &khz);
-  if (khz * 1000 != static_cast<int>(kCalChipRate)) {
-    ESP_LOGE(TAG, "SPI runs at %d kHz, not %lu", khz, (unsigned long)(kCalChipRate / 1000));
+  if (khz * 1000 != static_cast<int>(kChipRate)) {
+    ESP_LOGE(TAG, "SPI runs at %d kHz, not %lu", khz, (unsigned long)(kChipRate / 1000));
     return false;
   }
 
@@ -181,6 +196,8 @@ bool cal_init(CalCallback cb, void* ctx) {
   return true;
 }
 
+uint32_t cal_chip_rate() { return kChipRate; }
+
 void cal_set_pattern(const uint8_t* data) {
   if (s_buf) memcpy(s_buf, data, kCalBytes);
 }
@@ -189,6 +206,7 @@ bool cal_burst_square40(uint32_t duration_us) {
   if (!s_dev || !s_ledc_ok) return false;
   // Hold the SPI bus while the pads are re-routed.
   if (spi_device_acquire_bus(s_dev, portMAX_DELAY) != ESP_OK) return false;
+  s_sq40 = true;
   gpio_ll_set_level(&GPIO, CONFIG_SOFGNSS_CAL_CS_GPIO, 1);
   esp_rom_gpio_connect_out_signal(CONFIG_SOFGNSS_CAL_CS_GPIO, SIG_GPIO_OUT_IDX, false, false);
   esp_rom_gpio_connect_out_signal(CONFIG_SOFGNSS_CAL_GPIO,
@@ -205,6 +223,7 @@ bool cal_burst_square40(uint32_t duration_us) {
 
 bool cal_burst() {
   if (!s_dev) return false;
+  s_sq40 = false;
   spi_transaction_t t = {};
   t.length = kCalBits;
   t.tx_buffer = s_buf;

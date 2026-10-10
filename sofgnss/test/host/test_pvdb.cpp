@@ -36,6 +36,15 @@ TEST(pvdb_format_pps_and_sof) {
   CHECK(pvdb::verify(s, n));
 }
 
+TEST(pvdb_format_cal) {
+  char s[pvdb::kMaxSentence];
+  size_t n =
+      pvdb::format_cal(s, sizeof s, 18446744073709551615ull, "NOISE", true, 7, 72000000, 524309);
+  CHECK(std::string(s, n) ==
+        with_checksum("PVDB,SOFPPS,CAL,18446744073709551615,NOISE,1,7,72000000,524309"));
+  CHECK(pvdb::verify(s, n));
+}
+
 TEST(pvdb_format_info_and_err) {
   char s[pvdb::kMaxSentence];
   pvdb::Info info{80000000, 100, 1, 2, 3, 4, 5, nullptr, 0};

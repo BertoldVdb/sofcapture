@@ -11,6 +11,21 @@ namespace {
 constexpr char kPrefix[] = "$PVDB,SOFPPS,";
 constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
 
+// newlib-nano's printf has no 64-bit conversions.
+struct U64 {
+  char buf[21];
+  const char* str;
+  explicit U64(uint64_t v) {
+    char* p = buf + sizeof buf - 1;
+    *p = '\0';
+    do {
+      *--p = static_cast<char>('0' + v % 10);
+      v /= 10;
+    } while (v);
+    str = p;
+  }
+};
+
 int hex_value(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -38,13 +53,13 @@ size_t format(char* out, size_t cap, const char* body) {
 
 size_t format_pps(char* out, size_t cap, uint64_t tick, uint32_t rx_idle_ms) {
   char body[64];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,PPS,%" PRIu64 ",%" PRIu32, tick, rx_idle_ms);
+  snprintf(body, sizeof body, "PVDB,SOFPPS,PPS,%s,%" PRIu32, U64(tick).str, rx_idle_ms);
   return format(out, cap, body);
 }
 
 size_t format_sof(char* out, size_t cap, uint64_t tick, uint64_t frame) {
   char body[96];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,SOF,%" PRIu64 ",%" PRIu64, tick, frame);
+  snprintf(body, sizeof body, "PVDB,SOFPPS,SOF,%s,%s", U64(tick).str, U64(frame).str);
   return format(out, cap, body);
 }
 
@@ -83,10 +98,10 @@ size_t format_usb(char* out, size_t cap, const UsbInfo& u) {
 }
 
 size_t format_cal(char* out, size_t cap, uint64_t tick, const char* mode, bool pps_synced,
-                  uint32_t n) {
-  char body[96];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,CAL,%" PRIu64 ",%s,%d,%" PRIu32, tick, mode,
-           pps_synced, n);
+                  uint32_t n, uint32_t chip_rate, uint32_t length) {
+  char body[112];
+  snprintf(body, sizeof body, "PVDB,SOFPPS,CAL,%s,%s,%d,%" PRIu32 ",%" PRIu32 ",%" PRIu32,
+           U64(tick).str, mode, pps_synced, n, chip_rate, length);
   return format(out, cap, body);
 }
 

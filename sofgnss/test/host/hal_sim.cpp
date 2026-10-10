@@ -37,6 +37,7 @@ uint32_t tick_now() { return static_cast<uint32_t>(sim::state().now); }
 void pps_capture_start(PpsCallback, void*) {}
 void pps_inject() {}
 bool cal_init(CalCallback, void*) { return true; }
+uint32_t cal_chip_rate() { return 40000000; }
 void cal_set_pattern(const uint8_t*) {}
 bool cal_burst() { return true; }
 bool cal_burst_square40(uint32_t) { return true; }

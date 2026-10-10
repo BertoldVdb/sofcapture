@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Update a running sofgnss over its CDC port.
 
-    tools/ota.py [--port /dev/ttyACM0] [image.bin]     (default build/sofgnss.bin)
+    tools/ota.py [--port /dev/ttyACM0] [image.bin]     (default esp32s3/build/sofgnss.bin)
 
 Sends the image (protocol in README), waits for the restart, then sends VER,
 which confirms the new image so the next reset doesn't roll back.
@@ -166,7 +166,7 @@ def ver_fields(ver):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?", default=os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build", "sofgnss.bin"))
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "esp32s3", "build", "sofgnss.bin"))
     ap.add_argument("--port", default=None)
     ap.add_argument("--force", action="store_true", help="update even if the device runs this image")
     args = ap.parse_args()

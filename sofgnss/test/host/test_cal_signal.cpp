@@ -60,5 +60,6 @@ TEST(cal_mode_names) {
   CHECK(strcmp(cal_mode_name(CalMode::Square20), "SQ20") == 0);
   CHECK(strcmp(cal_mode_name(CalMode::Square40), "SQ40") == 0);
   CHECK(strcmp(cal_mode_name(CalMode::Off), "OFF") == 0);
-  CHECK_EQ(kCalBurstUs, 6553u);
+  CHECK_EQ(cal_burst_us(40000000), 6553u);
+  CHECK_EQ(cal_burst_us(72000000), 3640u);
 }

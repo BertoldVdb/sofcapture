@@ -20,6 +20,10 @@ Frequencies and rates are nominal; errors are reported in ppm.
 Model: the SDR's true sample rate is fs*(1+es) and its true LO fc*(1+es).
 The device's counter runs at tick_hz*(1+ed); ed comes from the PPS sentences
 in the log when present (GPS time), else 0 (device time).
+
+Board rates come from the log: tick_hz from INFO, the chip rate from CAL.
+Without them the ESP32-S3 values apply (80 MHz, 40 Mchip/s); --tick-hz and
+--chip-rate override.
 """
 import argparse
 import json
@@ -32,11 +36,21 @@ import time
 import numpy as np
 from scipy.signal import czt
 
-TICK_HZ = 80_000_000
-CHIP_RATE = 40_000_000
 CAL_BITS = 1 << 18
-BURST_S = CAL_BITS / CHIP_RATE  # 6.5536 ms
-SQUARE_F0 = {"SQ2": 2e6, "SQ20": 20e6, "SQ40": 40e6}
+SQUARE_MODES = ["SQ2", "SQ20", "SQ40"]
+
+
+def set_board(tick_hz, chip_rate):
+    """Rates of the board that made the log (ESP32-S3: 80 MHz, 40 Mchip/s)."""
+    global TICK_HZ, CHIP_RATE, BURST_S, SQUARE_F0
+    TICK_HZ = tick_hz
+    CHIP_RATE = chip_rate
+    BURST_S = CAL_BITS / chip_rate
+    # SQ20 is chip_rate/2 and SQ2 chip_rate/20. SQ40 (LEDC) exists on the ESP32-S3 only.
+    SQUARE_F0 = {"SQ2": chip_rate / 20, "SQ20": chip_rate / 2, "SQ40": 40e6}
+
+
+set_board(80_000_000, 40_000_000)
 
 
 # ---------------------------------------------------------------- sequences --
@@ -125,9 +139,11 @@ def find_bursts(n, read, fs):
 SENT = re.compile(r"\$PVDB,SOFPPS,([A-Z0-9]+),([^*]*)\*")
 
 
-def read_log(path):
-    """Parse 'unix_time $PVDB,...' lines into (pps, cal) lists."""
+def read_log(path, tick_hz=None, chip_rate=None):
+    """Parse 'unix_time $PVDB,...' lines into (pps, cal) lists. Sets the board
+    rates from INFO and CAL unless given."""
     pps, cal = [], []
+    log_tick_hz = log_chip_rate = None
     with open(path) as f:
         for line in f:
             parts = line.split(None, 1)
@@ -140,10 +156,29 @@ def read_log(path):
             kind, fields = m.group(1), m.group(2).split(",")
             if kind == "PPS":
                 pps.append({"host": host, "tick": int(fields[0])})
+            elif kind == "INFO" and fields[0].isdigit():
+                log_tick_hz = int(fields[0])
             elif kind == "CAL" and len(fields) >= 4:
                 cal.append({"host": host, "tick": int(fields[0]), "mode": fields[1],
-                            "synced": fields[2] == "1", "n": int(fields[3])})
+                            "synced": fields[2] == "1", "n": int(fields[3]),
+                            "length": int(fields[5]) if len(fields) >= 6 and fields[5].isdigit() else 0})
+                if len(fields) >= 5 and fields[4].isdigit():
+                    log_chip_rate = int(fields[4])
+    set_board(tick_hz or log_tick_hz or 80_000_000, chip_rate or log_chip_rate or 40_000_000)
     return pps, cal
+
+
+def drop_stretched(cal):
+    """Drop bursts measured longer than the others: the SPI stream stalled.
+    A length of 0 means the board didn't measure it."""
+    lens = [c["length"] for c in cal if c["length"]]
+    if not lens:
+        return cal
+    limit = int(np.median(lens)) + 1
+    bad = [c["n"] for c in cal if c["length"] > limit]
+    if bad:
+        print(f"skipping stretched bursts n={bad}")
+    return [c for c in cal if c["length"] <= limit]
 
 
 def device_clock(pps):
@@ -163,10 +198,12 @@ def device_clock(pps):
 
 def cmd_tone(a):
     n, read = open_iq(a.iq, a.format)
-    f0 = SQUARE_F0[a.mode]
     ed = 0.0
     if a.log:
-        ed, _ = device_clock(read_log(a.log)[0])
+        ed, _ = device_clock(read_log(a.log, a.tick_hz, a.chip_rate)[0])
+    else:
+        set_board(a.tick_hz or 80_000_000, a.chip_rate or 40_000_000)
+    f0 = SQUARE_F0[a.mode]
     starts, dyn = find_bursts(n, read, a.fs)
     if not starts:
         sys.exit(f"no bursts found (dynamic range {dyn:.1f} dB)")
@@ -282,8 +319,8 @@ def correlate_burst(read, s0, ref_spec, nfft, fs, margin, coarse=False):
 
 def cmd_noise(a):
     n, read = open_iq(a.iq, a.format)
-    pps, cal = read_log(a.log)
-    cal = [c for c in cal if c["mode"] == "NOISE"]
+    pps, cal = read_log(a.log, a.tick_hz, a.chip_rate)
+    cal = drop_stretched([c for c in cal if c["mode"] == "NOISE"])
     if not cal:
         sys.exit("no NOISE CAL sentences in the log")
     ed, tick_hz = device_clock(pps)
@@ -440,8 +477,9 @@ def cmd_log(a):
 
 # ----------------------------------------------------------------- selftest --
 
-def synth(path_iq, path_log, mode, fs, fc, es, ed, seconds, snr_db, rng):
-    """Synthetic recording and log with known clock errors."""
+def synth(path_iq, path_log, mode, fs, fc, es, ed, seconds, snr_db, rng, stretched=()):
+    """Synthetic recording and log with known clock errors. Bursts in
+    `stretched` get a length that says the stream stalled."""
     tick_hz = TICK_HZ * (1 + ed)
     n = int(seconds * fs)
     x = np.zeros(n, np.complex128)
@@ -459,7 +497,8 @@ def synth(path_iq, path_log, mode, fs, fc, es, ed, seconds, snr_db, rng):
         t_true = cal_tick / tick_hz
         pos = t_true * fs * (1 + es)
         lines.append(f"{iq_start + pps_tick / tick_hz + 0.002:.6f} $PVDB,SOFPPS,PPS,{pps_tick}*00")
-        lines.append(f"{iq_start + t_true + 0.009:.6f} $PVDB,SOFPPS,CAL,{cal_tick},{mode},1,{i}*00")
+        length = CAL_BITS * TICK_HZ // CHIP_RATE + 15 + (9 if i in stretched else 0)
+        lines.append(f"{iq_start + t_true + 0.009:.6f} $PVDB,SOFPPS,CAL,{cal_tick},{mode},1,{i},{CHIP_RATE},{length}*00")
         k0 = int(math.floor(pos))
         frac = pos - k0
         if mode == "NOISE":
@@ -488,6 +527,7 @@ def synth(path_iq, path_log, mode, fs, fc, es, ed, seconds, snr_db, rng):
     q[1::2] = np.round(x.imag / peak * 30000)
     q.tofile(path_iq)
     with open(path_log, "w") as f:
+        f.write(f"{iq_start:.6f} $PVDB,SOFPPS,INFO,{TICK_HZ},100,0,0,0,0,0,,0*00\n")
         f.write("\n".join(lines) + "\n")
     return iq_start
 
@@ -503,7 +543,8 @@ def cmd_selftest(a):
     fs, fc = 2.048e6, 162.3e6
     iq, log = os.path.join(d, "sq2.cs16"), os.path.join(d, "sq2.log")
     synth(iq, log, "SQ2", fs, fc, es, ed, 6, 10, rng)
-    ns = argparse.Namespace(iq=iq, format="cs16", fs=fs, fc=fc, mode="SQ2", log=log, ppm_range=100, json=False)
+    ns = argparse.Namespace(iq=iq, format="cs16", fs=fs, fc=fc, mode="SQ2", log=log, ppm_range=100, json=False,
+                            tick_hz=None, chip_rate=None)
     print("== tone, SQ2 at 162.3 MHz")
     r = cmd_tone(ns)
     err = r["sdr_ppm"] - es * 1e6
@@ -515,8 +556,21 @@ def cmd_selftest(a):
     iq, log = os.path.join(d, "noise.cs16"), os.path.join(d, "noise.log")
     iq_start = synth(iq, log, "NOISE", fs, fc, es, ed, 8, -5, rng)
     ns = argparse.Namespace(iq=iq, format="cs16", fs=fs, fc=fc, log=log, ppm=None, ppm_range=40,
-                            iq_start=iq_start, first_n=None, min_quality=8, json=False)
+                            iq_start=iq_start, first_n=None, min_quality=8, json=False,
+                            tick_hz=None, chip_rate=None)
     print("== noise, 160.0 MHz (on the null), SNR -5 dB per sample")
+    r = cmd_noise(ns)
+    err = r["sdr_ppm"] - es * 1e6
+    print(f"   error {err:+.5f} ppm")
+    ok &= abs(err) < 0.005 and r["resid_rms_ns"] < 5 and abs(r["device_ppm"] - ed * 1e6) < 0.01
+
+    # Noise from the STM32G4: 144 MHz ticks, 72 Mchip/s, rates read from the log.
+    set_board(144_000_000, 72_000_000)
+    iq, log = os.path.join(d, "noise72.cs16"), os.path.join(d, "noise72.log")
+    iq_start = synth(iq, log, "NOISE", fs, fc, es, ed, 8, -5, rng, stretched=(3,))
+    set_board(80_000_000, 40_000_000)
+    ns.iq, ns.log, ns.iq_start = iq, log, iq_start
+    print("== noise, STM32G4 rates, 160.0 MHz, SNR -5 dB per sample")
     r = cmd_noise(ns)
     err = r["sdr_ppm"] - es * 1e6
     print(f"   error {err:+.5f} ppm")
@@ -543,11 +597,13 @@ def main():
         p.add_argument("--fs", type=float, required=True, help="nominal sample rate, Hz")
         p.add_argument("--fc", type=float, required=True, help="nominal centre frequency, Hz")
         p.add_argument("--ppm-range", type=float, default=100, help="SDR error search range, ppm")
+        p.add_argument("--tick-hz", type=float, help="device counter rate (default: from the log)")
+        p.add_argument("--chip-rate", type=float, help="burst chip rate (default: from the log)")
         p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("tone", help="SDR frequency error from a square-wave recording")
     common(p)
-    p.add_argument("--mode", required=True, choices=list(SQUARE_F0))
+    p.add_argument("--mode", required=True, choices=SQUARE_MODES)
     p.add_argument("--log", help="log with PPS sentences, for the device clock error")
 
     p = sub.add_parser("noise", help="burst timing from a NOISE recording")

@@ -18,7 +18,9 @@ class TimingReporter {
   void on_pps(uint32_t tick, uint32_t rx_idle_ms);
   // Only frames picked by the schedule are reported.
   void on_sof(uint32_t tick, uint64_t frame);
-  void on_cal(uint32_t tick, const char* mode, bool pps_synced, uint32_t n);
+  // length: burst length in ticks, 0 if not measured.
+  void on_cal(uint32_t tick, const char* mode, bool pps_synced, uint32_t n, uint32_t chip_rate,
+              uint32_t length);
   // Call every few seconds so the unwrap never misses a wrap.
   void note_tick(uint32_t tick) { ticks_.update(tick); }
 

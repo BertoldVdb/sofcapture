@@ -32,9 +32,11 @@ using SofCallback = bool (*)(uint32_t tick, uint16_t frame, void* ctx);
 bool sof_capture_start(SofCallback cb, void* ctx);
 
 // ---- Calibration output ------------------------------------------------------
-// The callback gets the tick of each burst start (ISR context).
-using CalCallback = bool (*)(uint32_t tick, void* ctx);
+// Called when a burst has ended, with its start tick and its measured length in
+// ticks, 0 if not measured (ISR context).
+using CalCallback = bool (*)(uint32_t tick, uint32_t length, void* ctx);
 bool cal_init(CalCallback cb, void* ctx);
+uint32_t cal_chip_rate();  // SPI bits per second
 // kCalBytes long. Not during a burst.
 void cal_set_pattern(const uint8_t* data);
 // Blocks until the burst has been sent.

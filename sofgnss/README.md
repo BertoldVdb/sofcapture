@@ -8,8 +8,9 @@ free-running hardware counter. Both timestamps go into the serial stream as
 `$PVDB,SOFPPS,...` sentences, so a host that reads the GPS port sees GPS time,
 PPS and its own USB frame clock side by side.
 
-The firmware runs on the ESP32-S3 (ESP-IDF 5.5, TinyUSB). The
-platform-independent part is written so it can be reused on an STM32.
+The firmware runs on the ESP32-S3 (ESP-IDF 5.5, TinyUSB) and on the
+STM32G474 (bare metal, TinyUSB, see [STM32G474 port](#stm32g474-port)).
+Both share the platform-independent core.
 
 On the host, [sofd](../sofd) uses the board as the GNSS reference for its USB
 controller. The [top-level README](../README.md#setting-up-a-system) explains
@@ -76,14 +77,19 @@ battery-charge indicator and can't be controlled.
 
 ## Building and flashing
 
+The ESP-IDF project is in `esp32s3/`:
+
 ```sh
+cd esp32s3
 . ~/esp/esp-idf/export.sh
 idf.py set-target esp32s3
-idf.py build
-tools/ota.py                    # update a running board, see below
+idf.py build                    # esp32s3/build/sofgnss.bin
+../tools/ota.py                 # update a running board, see below
 idf.py monitor -p /dev/ttyUSBx  # console is on D0/D1, not on USB
 idf.py menuconfig               # "sofgnss board" and "sofgnss application" menus
 ```
+
+The STM32 build is described under [STM32G474 port](#stm32g474-port).
 
 ### Updating a running board
 
@@ -100,7 +106,7 @@ finds the board again by its `/dev/serial/by-id` link (USB serial number), and
 it fails unless the board comes back confirmed on the new image.
 
 ```sh
-idf.py build && tools/ota.py            # ~10 s including the restart
+idf.py build && ../tools/ota.py         # in esp32s3/, ~10 s including the restart
 ```
 
 ### First flash or bricked board
@@ -118,9 +124,10 @@ links no binary blobs (`CONFIG_APP_NO_BLOBS`).
 Application images are signed with RSA-3072 using the Secure Boot V2 scheme,
 but without hardware secure boot. A running board only accepts an update that
 is signed with the same key as the image it runs, and answers `ERR,OTAVERIFY`
-otherwise. The build signs `build/sofgnss.bin` with
-`keys/sofgnss_signing_key.pem`, which is not in git. Create it once, keep a
-backup, and use the same key on every machine that builds updates:
+otherwise. The build signs `esp32s3/build/sofgnss.bin` with
+`keys/sofgnss_signing_key.pem` (in `sofgnss/`, next to `esp32s3/`), which is
+not in git. Create it once, keep a backup, and use the same key on every
+machine that builds updates:
 
 ```sh
 mkdir -p keys && espsecure.py generate_signing_key --version 2 --scheme rsa3072 keys/sofgnss_signing_key.pem
@@ -138,7 +145,7 @@ These test the portable core (parser, queue, unwrap, sentences, and the SOF
 scheduler against a simulated USB bus):
 
 ```sh
-cmake -S test/host -B build-host && cmake --build build-host && build-host/sofgnss_tests
+cmake -S test/host -B test/host/build && cmake --build test/host/build && test/host/build/sofgnss_tests
 ```
 
 ## Protocol
@@ -154,10 +161,10 @@ Device to host:
 | `$PVDB,SOFPPS,PPS,<tick>,<rx_idle_ms>` | PPS edge captured at `<tick>`. `<rx_idle_ms>` is how long the GPS line had been quiet at the edge, at least. It is 0 if GPS bytes were still on their way (see below). |
 | `$PVDB,SOFPPS,SOF,<tick>,<frame>` | SOF of USB frame `<frame>` (64-bit unwrapped) received at `<tick>` |
 | `$PVDB,SOFPPS,INFO,<tick_hz>,<divider>,<pps>,<sof_tags>,<sof_missed>,<dropped>,<parse_errors>,<tag>,<pps_rejected>` | Sent with an empty `<tag>` when the host connects and every `SOFGNSS_INFO_INTERVAL_S` seconds (default 1). A requested INFO echoes the request's tag. `<pps_rejected>` counts PPS edges dropped as glitches since boot. It comes after `<tag>` so older parsers keep working. |
-| `$PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted (`POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT`, ...). The SHA-256 is the value in the `.bin`'s app descriptor at offset 32, so a host can tell whether an update is needed. Sent when the host connects and on request. |
+| `$PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, ESP-IDF version (`stm32g4` on the STM32 port), running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted (`POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT`, ...). The SHA-256 is the value in the `.bin`'s app descriptor at offset 32, so a host can tell whether an update is needed. Sent when the host connects and on request. |
 | `$PVDB,SOFPPS,USB,<mounted>,<suspended>,<dtr>,<lc_events>,<ls_events>,<baud>` | USB control-path diagnostics, sent with every INFO |
 | `$PVDB,SOFPPS,OTA,READY` / `OTA,ACK,<bytes>` / `OTA,OK` | Firmware update progress |
-| `$PVDB,SOFPPS,ERR,<code>` | Reply to a malformed command or a failed update (`BADDIV`, `BADTAG`, `BADCAL`, `UNKNOWN`, `OTAARGS`, `OTABUSY`, `OTABEGIN`, `OTAWRITE`, `OTAVERIFY`, `OTATIMEOUT`, `OTALINK`). `OTABUSY` means an `OTA` command came in while an update was running or waiting for its restart, and that update is left alone. `OTALINK` means the update was aborted because the host went away. That happens when USB is unconfigured, reset or suspended, and with `SOFGNSS_REQUIRE_DTR` also when DTR drops. |
+| `$PVDB,SOFPPS,ERR,<code>` | Reply to a malformed command or a failed update (`BADDIV`, `BADTAG`, `BADCAL`, `NOCAL` (a mode the board can't send: `SQ40` on the STM32), `UNKNOWN`, `OTAARGS`, `OTABUSY`, `OTABEGIN`, `OTAWRITE`, `OTAVERIFY`, `OTATIMEOUT`, `OTALINK`). `OTABUSY` means an `OTA` command came in while an update was running or waiting for its restart, and that update is left alone. `OTALINK` means the update was aborted because the host went away. That happens when USB is unconfigured, reset or suspended, and with `SOFGNSS_REQUIRE_DTR` also when DTR drops. |
 
 Host to device. The host's stream is framed like the receiver's. Only whole,
 checksum-valid NMEA, UBX and RTCM3 frames are forwarded to the GPS. Everything
@@ -274,10 +281,22 @@ such a frequency, and `NOISE` still correlates there (V-shaped spectrum). Each
 burst start is captured on the counter and reported:
 
 ```
-$PVDB,SOFPPS,CAL,<tick>,<mode>,<pps_synced>,<n>*hh
+$PVDB,SOFPPS,CAL,<tick>,<mode>,<pps_synced>,<n>,<chip_rate>,<length>*hh
 ```
 
-The burst starts a few microseconds after the PPS edge. The exact difference
+`<chip_rate>` is the SPI rate in chips per second (40000000 here, 72000000 on
+the STM32). `<length>` is the burst's measured length in ticks, or 0 when it
+wasn't measured. Older firmware leaves both out. The sentence is sent when the
+burst has ended.
+
+Here both chip-select edges are captured in hardware: the SPI pulls it low
+before the first bit and releases it right after the last, so the length is
+exact to a tick. A gapless burst is 2 ticks per chip (524288) plus 3 ticks of
+chip-select setup and hold. Measured: every `NOISE` and `SQ20` burst 524291. A
+stall in the stream would make it longer, so tools drop bursts longer than the
+others. `SQ40` reports 0, because software ends it.
+
+The burst starts about 0.1 ms after the PPS edge (measured 40 to 120 µs). The exact difference
 is in the `PPS` and `CAL` ticks rather than assumed. For `NOISE`, `SQ2` and
 `SQ20` the tick is the SPI chip-select edge, exact to one tick. For `SQ40` it
 is a GPIO edge written together with the LEDC start, within about 50 ns.
@@ -293,6 +312,50 @@ The GPIO is far too strong for the SDR's input, so connect it like this:
 GPIO4 → 1 kΩ → 100 nF → 50 Ω to ground → 30–40 dB of attenuators → coax.
 The noise spectrum has nulls at multiples of 40 MHz, about −16 dB at 2 MHz
 away and −10 dB at 4 MHz. Prefer tunings a few MHz away from them.
+
+### On the STM32G474
+
+The STM32 sends the same patterns over SPI1 at 72 Mchip/s (the 144 MHz bus
+clock divided by 2). 40 Mchip/s isn't reachable while USB shares the PLL. So
+a `NOISE` burst lasts 3.64 ms and its nulls sit at multiples of 72 MHz (144,
+216 MHz), and 160 MHz is clear of them. `SQ20` is a 36 MHz square wave (odd
+harmonics at 36, 108, 180 … MHz) and `SQ2` a 3.6 MHz one (odd harmonics every
+7.2 MHz, for example 154.8 and 162 MHz). `SQ40` answers `ERR,NOCAL`.
+
+| Signal | Pin | Nucleo |
+|---|---|---|
+| Burst output | PA7 (SPI1_MOSI) | D11 |
+| Start marker, low during the burst | PA4 (SPI1_NSS) | A2 |
+| Start capture (TIM2_CH3) | PA9 | D8 |
+
+Wire PA4 to PA9. The marker falls as the SPI starts with its FIFO already
+filled by DMA, and TIM2 captures that edge, so the `CAL` tick is exact to one
+tick. Without the wire the bursts still go out, but no `CAL` sentences come.
+A burst starts from the PPS interrupt, normally about 7 µs after the edge.
+
+DMA feeds the SPI from a 32 KB buffer in CCM SRAM. USB register and packet
+memory accesses are slow and share the peripheral bus with that DMA. While the
+host streamed every SOF they stalled the stream by up to 30 chips per burst.
+So USB waits out each 3.6 ms burst: its interrupt is masked (the host gets
+NAKs) and the main loop does no USB work, DCD changes included. A PPS that
+arrives while USB work is running starts its burst right after that work
+instead, tens of microseconds later.
+
+Each burst's length is measured and sent in `<length>`: from the captured
+start edge to the moment the SPI reports its last bit gone (FIFO empty, not
+busy), read in the burst-end interrupt. A gapless burst is 2 ticks per chip
+(524288) plus a fixed 15 ticks, good to about a tick. A stall makes it longer,
+so a tool should drop bursts longer than the others. The `CAL` sentence is
+therefore sent when the burst has ended. Measured with every SOF streamed to
+the host: 62 of 63 bursts exactly 524303, one 524305. The firmware also logs
+bursts more than 64 ticks too long on the console. Use the same output network
+as above on PA7.
+
+`tools/sdrcal.py` takes the tick rate from INFO and the chip rate from CAL in
+the log, so it handles both boards. It skips NOISE bursts longer than the
+median length plus one tick.
+
+### Analysis
 
 `tools/sdrcal.py` is a reference analysis in Python. It needs system Python
 with numpy, scipy and pyserial, and `--help` lists its options. `log` records
@@ -375,19 +438,81 @@ rather than of an interrupt:
 
 Everything else (TinyUSB, UART, parser, PPS interrupt) runs on core 0.
 
+## STM32G474 port
+
+`stm32g4/` builds the same firmware for the STM32G474, sized for the smallest
+part (G474xB: 128 KB flash, 96 KB of SRAM used). It is a bare-metal main loop, and
+interrupts only take timestamps and move bytes. It speaks the same protocol
+with the same USB descriptors, so sofd treats both boards alike. The USB
+serial number is the 96-bit chip UID (24 hex digits).
+
+The SOF timestamp is taken in hardware. TIM2 is the 32-bit timestamp counter
+at the 144 MHz core clock (6.9 ns, wraps every 30 s). Channel 1 captures
+internal trigger 11, the USB SOF (only TIM2 has it), and channel 2 captures
+PPS from a pin. The TIM2 interrupt reads `USB_FNR` next to each capture and
+drops the pair if another SOF arrived meanwhile (counted in INFO's
+`<sof_missed>`). Every SOF is captured, and the divider and dither then pick
+the tagged frames as on the ESP32-S3.
+
+Pins (NUCLEO-G474RE, set in `stm32g4/include/port.h`). The GPS UART is on
+PB10/PB11, which every G474 package has:
+
+| Signal              | Pin  | Nucleo      | Function    |
+|---------------------|------|-------------|-------------|
+| GPS TX ← board      | PB10 | D6          | USART3_TX   |
+| GPS RX → board      | PB11 | CN10 pin 18 | USART3_RX   |
+| PPS in              | PA1  | A1          | TIM2_CH2    |
+| Status LED          | PA5  | LD2         |             |
+| Debug console TX    | PA2  | ST-LINK VCP | LPUART1, 115200 |
+| USB D− / D+         | PA11 / PA12 | CN10 | USB      |
+
+The core clock comes from HSE through the PLL. At boot the firmware measures
+HSE against HSI16 (HSE/32 into TIM17) and accepts an 8, 12 or 24 MHz external
+clock or crystal. It tries bypass mode first, because a crystal gives no clock
+there while an external clock would also run in crystal mode, only with more
+jitter. A mode that starts but measures wrong is rejected. The console shows
+the measurement and the choice.
+
+USB runs from the same PLL (288 MHz / 6), which is why the core clock is 144
+MHz and not the maximum 170 MHz. With USB on HSI48 the SOF trigger crosses
+clock domains, and TIM2 then saw only 80 to 86 % of the SOFs, plus some
+captures flagged without a new value. On the shared clock it gets all of them.
+Without a usable HSE the core runs from HSI16 (about 1 % off) and USB from
+HSI48 trimmed by the CRS, so SOF captures are unreliable. USB runs from HSI48, trimmed to the host's SOF by the CRS.
+
+```sh
+cmake -S stm32g4 -B stm32g4/build          # fetches TinyUSB and CMSIS
+cmake --build stm32g4/build                # stm32g4/build/sofgnss.bin
+cmake --build stm32g4/build --target flash # over ST-LINK (OpenOCD)
+```
+
+There is no OTA yet (a bootloader will do it later): `OTA` answers
+`ERR,OTABEGIN`, and sofd doesn't send ESP32 images to boards whose VER reports
+`stm32g4`. The calibration output is described under
+[SDR calibration output](#on-the-stm32g474). The independent watchdog (about 4 s) replaces the task watchdog, and VER's reset
+reasons are `POWERON`, `EXT`, `SW`, `PANIC` (a fault handler), `WDT`.
+
 ## Layout
 
 ```
-components/core/         portable, no platform includes (C++17)
-  hal.h                  the interface a port implements
+core/                    portable, no platform includes (C++17), shared by both ports
+  include/sofgnss/hal.h  the interface a port implements
   frame_parser.*         NMEA / UBX / RTCM3 framer
   msg_queue.*            drop-oldest message ring
   unwrap.h               32→64-bit tick and 11→64-bit frame unwrapping
   pvdb.*                 $PVDB sentence formatting, checksum, command recognition
   timing_reporter.*      PPS/SOF events → sentences
+  cal_signal.*           calibration burst patterns
   sof_spin_source.*      predict / sleep / spin SOF tagging (ports without HW SOF capture)
-components/port_esp32s3/ HAL implementation: TinyUSB glue, MCPWM capture, UART, esp_timer
-main/app_main.cpp        task wiring (FreeRTOS)
+esp32s3/                 ESP-IDF project (idf.py)
+  main/app_main.cpp      task wiring (FreeRTOS), Kconfig menus
+  components/port_esp32s3/  HAL: TinyUSB glue, MCPWM capture, UART, OTA, calibration
+stm32g4/                 bare-metal CMake project
+  src/main.cpp           main loop
+  src/*.cpp              HAL: clocks, TIM2 capture, UART, USB, calibration
+  include/               pins and settings (port.h, config.h), TinyUSB config
 test/host/               host build of core with a simulated HAL
+tools/                   ota.py (ESP32 updates), sdrcal.py (calibration analysis)
+keys/                    ESP32 image signing key, not in git
 ```
 

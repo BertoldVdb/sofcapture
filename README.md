@@ -49,7 +49,7 @@ reference over MQTT instead of a board.
 | [`sofd/`](sofd) | Host daemon: controller sampling, fits, board handling, MQTT, chrony, firmware updates | [sofd/README.md](sofd/README.md), [MQTT-GUIDE.md](sofd/MQTT-GUIDE.md) for client programs |
 | [`sofd/kmod/`](sofd/kmod) | `sofclock` kernel module, needed on PCs with locked-down `/dev/mem` and for controllers sofd has no register backend for | [sofd/kmod/README.md](sofd/kmod/README.md) |
 | [`sofref/`](sofref) | Go module for programs that feed sofd a GNSS reference from their own device (PPS + SOF captures → tags over MQTT) | [sofref/README.md](sofref/README.md) |
-| [`sofgnss/`](sofgnss) | GNSS/SOF/PPS bridge firmware for the Seeed XIAO ESP32-S3 (portable core for a planned STM32 version), OTA and SDR calibration tools | [sofgnss/README.md](sofgnss/README.md) |
+| [`sofgnss/`](sofgnss) | GNSS/SOF/PPS bridge firmware for the Seeed XIAO ESP32-S3 and the STM32G474, OTA and SDR calibration tools | [sofgnss/README.md](sofgnss/README.md) |
 
 Tested on a Raspberry Pi CM0 (dwc_otg), a Jetson Orin (tegra-xusb) and a
 Comet Lake PC (xHCI through sofclock), with a u-blox LEA-5T receiver.
@@ -82,15 +82,16 @@ running board only accepts updates signed with the same key:
 
 ```sh
 cd sofgnss
+mkdir -p keys && espsecure.py generate_signing_key --version 2 --scheme rsa3072 keys/sofgnss_signing_key.pem
+cd esp32s3
 . ~/esp/esp-idf/export.sh
 idf.py set-target esp32s3
-mkdir -p keys && espsecure.py generate_signing_key --version 2 --scheme rsa3072 keys/sofgnss_signing_key.pem
 idf.py build
 ```
 
 The first flash needs the ROM bootloader: hold **BOOT**, press **RESET**, run
 `idf.py -p /dev/ttyACM0 flash`, then press **RESET** again. After that, update
-boards over USB with `tools/ota.py`, or let sofd do it (`firmware` option,
+boards over USB with `../tools/ota.py`, or let sofd do it (`firmware` option,
 step 5).
 
 ### 3. Build and install sofd
@@ -164,7 +165,7 @@ A few things about this config:
 - sofd configures the receiver itself, in RAM only. It enables the UBX
   timing messages, turns NMEA off and sets `baud`. Set `"configure": false` to
   use the receiver as it is, at `initial_baud`.
-- Install the `firmware` image by copying `sofgnss/build/sofgnss.bin` to a
+- Install the `firmware` image by copying `sofgnss/esp32s3/build/sofgnss.bin` to a
   temporary file and renaming it into place, rather than writing over it.
   sofd watches the file and updates attached boards when it changes.
 - `sof_delay_ns` is the board's fixed delay from the start of the bus frame to

@@ -23,9 +23,11 @@ void TimingReporter::on_sof(uint32_t tick, uint64_t frame) {
   emit_(s, n, ctx_);
 }
 
-void TimingReporter::on_cal(uint32_t tick, const char* mode, bool pps_synced, uint32_t n) {
+void TimingReporter::on_cal(uint32_t tick, const char* mode, bool pps_synced, uint32_t n,
+                            uint32_t chip_rate, uint32_t length) {
   char s[pvdb::kMaxSentence];
-  size_t len = pvdb::format_cal(s, sizeof s, ticks_.update(tick), mode, pps_synced, n);
+  size_t len =
+      pvdb::format_cal(s, sizeof s, ticks_.update(tick), mode, pps_synced, n, chip_rate, length);
   emit_(s, len, ctx_);
 }
 

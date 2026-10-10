@@ -55,6 +55,7 @@ void timer_init() {
   cal.gpio_num = -1;
   cal.prescale = 1;
   cal.flags.neg_edge = 1;  // chip select goes low when a burst starts
+  cal.flags.pos_edge = 1;  // and high right after its last bit
   ESP_ERROR_CHECK(mcpwm_new_capture_channel(s_timer, &cal, &s_cal));
 
   mcpwm_ll_capture_enable_channel(&MCPWM0, kSoftCaptureChannel, true);
