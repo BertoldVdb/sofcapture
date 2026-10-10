@@ -1,0 +1,6 @@
+// sofd configuration for TestLiveAgainstSofd:
+//   sofd --simulate run --config mqtt/testdata/sofd.hujson
+{
+  "mqtt": { "host": "localhost", "port": 1883, "prefix": "sofd/sofreftest", "client_id": "sofd-sofreftest" },
+  "gnss": { "attach": "none", "external": { "itest": {} } },
+}
