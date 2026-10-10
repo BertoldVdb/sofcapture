@@ -72,7 +72,8 @@ pub enum Pvdb<'a> {
     Pps { tick: u64, rx_idle_ms: u32 },
     Sof { tick: u64, frame: u64 },
     Info { tick_hz: u32, tag: &'a str },
-    Ver { version: &'a str, elf_sha256: &'a str, reset_reason: &'a str },
+    /// `platform`: the ESP-IDF version on ESP32 boards, "stm32g4" on STM32 boards.
+    Ver { version: &'a str, platform: &'a str, elf_sha256: &'a str, reset_reason: &'a str },
     Ota(OtaMsg),
     Err(&'a str),
     Other,
@@ -102,7 +103,9 @@ pub fn pvdb(frame: &[u8]) -> Pvdb<'_> {
             Some(hz) => Pvdb::Info { tick_hz: hz as u32, tag: f.get(10).copied().unwrap_or("") },
             None => Pvdb::Other,
         },
-        Some("VER") if f.len() >= 9 => Pvdb::Ver { version: f[3], elf_sha256: f[7], reset_reason: f[8] },
+        Some("VER") if f.len() >= 9 => {
+            Pvdb::Ver { version: f[3], platform: f[4], elf_sha256: f[7], reset_reason: f[8] }
+        },
         Some("OTA") => match (f.get(3).copied(), n(4)) {
             (Some("READY"), _) => Pvdb::Ota(OtaMsg::Ready),
             (Some("ACK"), Some(b)) => Pvdb::Ota(OtaMsg::Ack(b)),
@@ -146,7 +149,7 @@ mod tests {
         );
         assert_eq!(
             pvdb(&frame("PVDB,SOFPPS,VER,v1,v5.5.1,ota_0,0,abcd,SW")),
-            Pvdb::Ver { version: "v1", elf_sha256: "abcd", reset_reason: "SW" }
+            Pvdb::Ver { version: "v1", platform: "v5.5.1", elf_sha256: "abcd", reset_reason: "SW" }
         );
         assert_eq!(pvdb(&frame("PVDB,SOFPPS,OTA,ACK,32768")), Pvdb::Ota(OtaMsg::Ack(32768)));
         assert_eq!(pvdb(&frame("PVDB,SOFPPS,OTA,OK")), Pvdb::Ota(OtaMsg::Ok));

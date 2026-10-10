@@ -82,6 +82,8 @@ pub struct Output {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceFirmware {
     pub version: String,
+    /// The ESP-IDF version on ESP32 boards, "stm32g4" on STM32 boards.
+    pub platform: String,
     pub elf_sha256: String,
     pub reset_reason: String,
 }
@@ -279,9 +281,10 @@ impl Session {
                 }
             }
             _ if !self.ready => {}
-            Pvdb::Ver { version, elf_sha256, reset_reason } => {
+            Pvdb::Ver { version, platform, elf_sha256, reset_reason } => {
                 self.firmware = Some(DeviceFirmware {
                     version: version.into(),
+                    platform: platform.into(),
                     elf_sha256: elf_sha256.into(),
                     reset_reason: reset_reason.into(),
                 });
@@ -371,7 +374,12 @@ impl Session {
     fn after_version(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
         let running = self.firmware.as_ref().map(|f| f.elf_sha256.clone());
         if let Some(img) = self.cfg.firmware.clone() {
-            if running.as_ref().is_some_and(|r| *r != img.elf_sha256) {
+            // Images are ESP-IDF apps. STM32 boards are flashed over SWD for now.
+            let stm32 = self.firmware.as_ref().filter(|f| f.platform.starts_with("stm32"));
+            if let Some(f) = stm32 {
+                let why = format!("firmware is an ESP32 image, the board is {}", f.platform);
+                self.status("update_failed", Some(why), out);
+            } else if running.as_ref().is_some_and(|r| *r != img.elf_sha256) {
                 port.write(&nmea::command(&format!("OTA,{},{}", img.data.len(), img.sha256)));
                 self.rx = Rx::OtaStart { since: now };
                 let from = self.firmware.as_ref().map_or("?", |f| f.version.as_str()).to_string();
@@ -740,6 +748,7 @@ mod tests {
         to_host: Vec<u8>,
         from_host: Framer,
         elf: String,
+        platform: &'static str,
         /// Image bytes still expected, and those received.
         ota_left: usize,
         ota_image: Vec<u8>,
@@ -769,6 +778,7 @@ mod tests {
                 to_host: vec![],
                 from_host: Framer::new(),
                 elf: "00".repeat(32),
+                platform: "v5.5.1",
                 ota_left: 0,
                 ota_image: vec![],
                 answers: true,
@@ -943,7 +953,7 @@ mod tests {
                     if fl[2] == "INFO" && fl.len() > 3 {
                         self.to_host.extend(nmea::command(&format!("INFO,80000000,100,0,0,0,0,0,{}", fl[3])));
                     } else if fl[2] == "VER" {
-                        self.to_host.extend(nmea::command(&format!("VER,v1,v5.5.1,ota_0,0,{},POWERON", self.elf)));
+                        self.to_host.extend(nmea::command(&format!("VER,v1,{},ota_0,0,{},POWERON", self.platform, self.elf)));
                     } else if fl[2] == "OTA" {
                         self.ota_left = fl[3].parse().unwrap();
                         self.to_host.extend(nmea::command("OTA,READY"));
@@ -1140,6 +1150,19 @@ mod tests {
         r.for_secs(20);
         assert!(r.states().contains(&"update_failed".to_string()));
         assert_eq!(r.session.state(), "ubx");
+    }
+
+    #[test]
+    fn esp_image_is_not_sent_to_stm32() {
+        let img = Arc::new(super::super::firmware::test_image("v2", 0xcd, 200_000));
+        let mut f = Fake::new(9600, false, true);
+        f.platform = "stm32g4";
+        let mut r = Run::with(Config { firmware: Some(img), ..Config::default() }, f);
+        r.for_secs(15);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.fake.ota_image.is_empty());
+        let msg = "firmware is an ESP32 image, the board is stm32g4";
+        assert!(r.out.events.iter().any(|e| e["state"] == "update_failed" && e["message"] == msg));
     }
 
     #[test]
