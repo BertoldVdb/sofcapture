@@ -228,3 +228,7 @@ numbers to UTC, and shows how to act as a GNSS reference itself
 - On the Raspberry Pi, never flush output (`TCOFLUSH`/`TCIOFLUSH`) on the
   board's tty. Unlinking a full-speed write that is in flight behind a hub
   can freeze the dwc_otg driver.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

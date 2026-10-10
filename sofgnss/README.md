@@ -87,7 +87,8 @@ idf.py menuconfig               # "sofgnss board" and "sofgnss application" menu
 
 ### Updating a running board
 
-This is the normal case. `tools/ota.py` sends the new image over the CDC port
+In normal usage, sofd will update the board to the configued firmware. 
+Alternatively, `tools/ota.py` sends the new image over the CDC port
 into the inactive application slot (A/B, see `partitions.csv`). The device
 verifies it and restarts into it. The first host command after the restart
 confirms the image, and the tool sends `VER` for that. Until the image is
@@ -106,10 +107,7 @@ idf.py build && tools/ota.py            # ~10 s including the restart
 
 This needs the ROM bootloader once. Hold **BOOT** while pressing **RESET**,
 then run `idf.py -p /dev/ttyACM0 flash`. The ROM latches download mode, so
-press **RESET** again after flashing to start the app. esptool can't do that
-over USB, which is why updates go over the CDC port. A changed `partitions.csv`
-also needs this, because an update over the CDC port only replaces the
-application.
+press **RESET** again after flashing to start the app.
 
 The two application slots are 1 MB each (0x100000, at 0x10000 and 0x110000).
 The image is about 390 KB. Wi-Fi and Bluetooth are not used, so the build
@@ -393,33 +391,3 @@ main/app_main.cpp        task wiring (FreeRTOS)
 test/host/               host build of core with a simulated HAL
 ```
 
-## Porting to an STM32 (TIM2 with hardware SOF capture)
-
-`components/core` compiles unchanged. A port needs a `port_stm32` that
-implements `sofgnss/hal.h` and a `main` equivalent. The ESP32 one uses FreeRTOS
-and most of it can be reused. TinyUSB's `dcd_dwc2` driver also serves the
-STM32 OTG core, so the USB glue (`usb_port.cpp`, `usb_descriptors.c`,
-`tusb_config.h`) carries over and only the PHY and clock init change.
-
-STM32 timers can capture the USB SOF in hardware, and the HAL is built for
-that:
-
-- Run TIM2 (32-bit) free at its full clock. Route the OTG SOF trigger to
-  `TIM2_ITR1` (with the `TIM2_OR` remap on F4/F7, or `TIM2_OR1`/`TISEL` on
-  newer parts) and configure CH1 as input capture from the trigger
-  (`CC1S = 11`, IC1 on TRC). Put PPS on another TIM2 channel, for example CH2
-  via a GPIO, with edge capture.
-- `hal::tick_now()` reads `TIM2->CNT` and `hal::tick_hz()` returns its clock.
-- `hal::pps_capture_start()` enables the PPS channel's capture interrupt and
-  passes `CCR` to the callback.
-- `hal::sof_capture_start()` **returns true**. The CH1 capture interrupt then
-  calls the callback with `CCR1` and the 11-bit frame number read from
-  `OTG_DSTS.FNSOF`. The application never creates a `SofSpinSource` in that
-  case, and `hal::usb_sof_wait_change()` can simply return false. The unwrap
-  and divider filter on the ISR side live in `main` (`on_sof_isr`).
-- `hal::sleep_us()` is only used by the spin source, and `vTaskDelay` is good
-  enough for it.
-
-The ESP32 spin path and the STM32 capture path both produce the same
-`(tick, frame)` events, so the sentences, the unwrapping and the divider
-behave the same on both boards.
