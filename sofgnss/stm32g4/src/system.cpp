@@ -182,9 +182,15 @@ void clock_init() {
   RCC->CR |= RCC_CR_PLLON;
   while (!(RCC->CR & RCC_CR_PLLRDY)) {
   }
+  // Through AHB /2 for at least 1 us to limit the current step (RM0440).
+  // Nothing timed runs yet. The loop takes well over 100 cycles.
+  RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_HPRE) | RCC_CFGR_HPRE_3;
   RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (3u << RCC_CFGR_SW_Pos);
   while ((RCC->CFGR & RCC_CFGR_SWS) != (3u << RCC_CFGR_SWS_Pos)) {
   }
+  for (volatile uint32_t i = 0; i < 100; ++i) {
+  }
+  RCC->CFGR &= ~RCC_CFGR_HPRE;
 
   if (s_hse_hz) {
     RCC->CCIPR = (RCC->CCIPR & ~RCC_CCIPR_CLK48SEL) | (2u << RCC_CCIPR_CLK48SEL_Pos);  // PLLQ

@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use timing::Tag;
 
-const MAX_QUEUED_TAGS: usize = 256;
+/// 10 s at div 1, the longest time between samples (0.1 Hz).
+const MAX_QUEUED_TAGS: usize = 10_000;
 
 /// Tags from one board or MQTT client, waiting for the sampler.
 pub struct Feed {

@@ -68,6 +68,9 @@ using CdcRxCallback = void (*)(void* ctx);
 void cdc_set_callbacks(LineCodingCallback lc, CdcRxCallback rx, void* ctx);
 
 bool cdc_connected();         // DTR set (Linux: port open)
+// How often the port dropped queued TX data. With SOFGNSS_REQUIRE_DTR it does
+// so whenever DTR changes. A message whose start was dropped must not go on.
+uint32_t cdc_tx_clears();
 // Sets the DCD line. False if not queued yet; the port retries by itself.
 bool cdc_set_dcd(bool on);
 

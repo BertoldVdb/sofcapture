@@ -107,7 +107,7 @@ default 1024). A Tagger is not safe for concurrent use.
   `ref_rejected` (with `Reason`), `ref_busy` (`Owner`), `ref_lost` and
   `chrony_busy`. MQTT-GUIDE.md describes each one.
 - `Prefix` defaults to `sofd/<this host's name>` and `ClientID` to
-  `sofref-<Client>`.
+  `sofref-<Client>@<Prefix>/<Controller>`.
 
 ## Tests
 

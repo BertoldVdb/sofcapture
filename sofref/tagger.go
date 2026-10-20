@@ -126,6 +126,11 @@ func (t *Tagger) SOF(tick, frame uint64, microframe uint8) error {
 		t.stats.Late++
 		return nil
 	}
+	if n := len(t.pending); n > 0 && tick <= t.pending[n-1].tick {
+		// Counter reset before the next pulse.
+		t.stats.Untagged += uint64(n)
+		t.pending = nil
+	}
 	if len(t.pending) == t.cfg.MaxPending {
 		t.pending = t.pending[1:]
 		t.stats.Overflow++
@@ -155,7 +160,7 @@ func (t *Tagger) PPS(tick uint64, utcNs int64) ([]Tag, error) {
 			break
 		}
 		n++
-		if err == nil && t.prevOK {
+		if err == nil && t.prevOK && s.tick > t.prev.tick {
 			tags = append(tags, t.tag(s, tick, utcNs))
 		}
 	}

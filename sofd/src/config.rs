@@ -1,5 +1,6 @@
 //! The configuration file: HuJSON (JSON with comments and trailing commas).
 
+use crate::gnss::session::SEARCH_BAUDS;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
@@ -46,6 +47,8 @@ impl Mqtt {
 pub struct Sampler {
     /// Samples in the rate/offset fit.
     pub window: usize,
+    /// Span of GNSS tags in the model_gnss fit.
+    pub gnss_window_s: f64,
     /// Run sampler threads SCHED_FIFO at this priority.
     pub rt_prio: Option<i32>,
     /// Pin sampler threads to this CPU.
@@ -62,7 +65,7 @@ pub struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { window: 64, rt_prio: None, cpu: None, default_rate_hz: 50.0, model_hz: 1.0, max_cpu_latency_us: None, cpu_governor: None }
+        Self { window: 64, gnss_window_s: 6.0, rt_prio: None, cpu: None, default_rate_hz: 50.0, model_hz: 1.0, max_cpu_latency_us: None, cpu_governor: None }
     }
 }
 
@@ -73,7 +76,7 @@ pub struct Gnss {
     pub defaults: BoardOptions,
     /// Per-serial overrides of `defaults`.
     pub boards: BTreeMap<String, BoardOptions>,
-    /// MQTT clients allowed to act as GNSS reference, by client name.
+    /// MQTT clients allowed to act as GNSS reference, by client name. `*` allows any other.
     pub external: BTreeMap<String, External>,
 }
 
@@ -130,6 +133,7 @@ pub struct BoardOptions {
     pub baud: Option<u32>,
     pub initial_baud: Option<u32>,
     pub configure: Option<bool>,
+    pub strict: Option<bool>,
     pub frames: Option<bool>,
     pub div: Option<u32>,
     pub sof_delay_ns: Option<i64>,
@@ -151,6 +155,8 @@ pub struct Board {
     /// Receiver's power-on baud; the only one used without `configure`.
     pub initial_baud: u32,
     pub configure: bool,
+    /// Never fall back to NMEA ZDA, keep retrying the setup.
+    pub strict: bool,
     pub frames: bool,
     pub div: Option<u32>,
     pub sof_delay_ns: i64,
@@ -166,12 +172,17 @@ impl Gnss {
             baud: b.baud.or(d.baud).unwrap_or(38_400),
             initial_baud: b.initial_baud.or(d.initial_baud).unwrap_or(9600),
             configure: b.configure.or(d.configure).unwrap_or(true),
+            strict: b.strict.or(d.strict).unwrap_or(false),
             frames: b.frames.or(d.frames).unwrap_or(true),
             div: b.div.or(d.div),
             sof_delay_ns: b.sof_delay_ns.or(d.sof_delay_ns).unwrap_or(0),
             chrony: b.chrony.or(d.chrony.clone()).flatten().map(|p| PathBuf::from(p.replace("{serial}", serial))),
             firmware: b.firmware.or(d.firmware.clone()).flatten(),
         }
+    }
+
+    pub fn external(&self, client: &str) -> Option<&External> {
+        self.external.get(client).or_else(|| self.external.get("*"))
     }
 }
 
@@ -205,11 +216,32 @@ impl Config {
         if !(3..=100_000).contains(&s.window) {
             anyhow::bail!("sampler.window must be within 3..=100000");
         }
+        if !(1.0..=600.0).contains(&s.gnss_window_s) {
+            anyhow::bail!("sampler.gnss_window_s must be within 1..=600");
+        }
         if s.cpu.is_some_and(|c| c >= libc::CPU_SETSIZE as usize) {
             anyhow::bail!("sampler.cpu must be below {}", libc::CPU_SETSIZE);
         }
         if s.rt_prio.is_some_and(|p| !(1..=99).contains(&p)) {
             anyhow::bail!("sampler.rt_prio must be within 1..=99");
+        }
+        let boards = self.gnss.boards.iter().map(|(k, b)| (format!("gnss.boards.{k}"), b)).chain([("gnss.defaults".to_string(), &self.gnss.defaults)]);
+        for (what, b) in boards {
+            let serial = what.strip_prefix("gnss.boards.").unwrap_or("");
+            let merged = self.gnss.board(serial);
+            if merged.strict && !merged.configure {
+                anyhow::bail!("{what}: strict needs configure");
+            }
+            if b.div.is_some_and(|d| !(1..=1_000_000).contains(&d)) {
+                anyhow::bail!("{what}.div must be within 1..=1000000");
+            }
+            for (name, baud) in [("baud", b.baud), ("initial_baud", b.initial_baud)] {
+                if baud.is_some_and(|r| !SEARCH_BAUDS.contains(&r)) {
+                    let mut rates = SEARCH_BAUDS;
+                    rates.sort();
+                    anyhow::bail!("{what}.{name} must be one of {rates:?}");
+                }
+            }
         }
         let delays = (self.gnss.boards.iter().map(|(k, b)| (format!("gnss.boards.{k}"), b.sof_delay_ns)))
             .chain([("gnss.defaults".to_string(), self.gnss.defaults.sof_delay_ns)])
@@ -310,6 +342,9 @@ mod tests {
         assert_eq!((b.baud, b.chrony.as_deref(), b.firmware), (38_400, Some(Path::new("/run/chrony.B2.sock")), None));
         assert_eq!(c.gnss.external["app"].chrony.as_deref(), Some(Path::new("/run/c.sock")));
         assert_eq!((c.gnss.external["app"].sof_delay_ns, c.gnss.external["other"].chrony.is_none()), (40, true));
+        assert!(c.gnss.external("sdrrx").is_none());
+        let c = Config::parse(r#"{"gnss":{"external":{"*":{"sof_delay_ns":5},"app":{}}}}"#).unwrap();
+        assert_eq!((c.gnss.external("sdrrx").unwrap().sof_delay_ns, c.gnss.external("app").unwrap().sof_delay_ns), (5, 0));
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
         assert!(Config::parse(r#"{"gnss":{"attach":"some"}}"#).is_err());
         assert!(Config::parse(r#"{"mqtt":{"prefix":"a/#"}}"#).is_err());
@@ -318,10 +353,17 @@ mod tests {
             r#"{"sampler":{"default_rate_hz":5000}}"#,
             r#"{"sampler":{"model_hz":0}}"#,
             r#"{"sampler":{"window":2}}"#,
+            r#"{"sampler":{"gnss_window_s":0.5}}"#,
+            r#"{"gnss":{"defaults":{"strict":true,"configure":false}}}"#,
+            r#"{"gnss":{"defaults":{"strict":true},"boards":{"A":{"configure":false}}}}"#,
             r#"{"sampler":{"cpu":5000}}"#,
             r#"{"sampler":{"rt_prio":0}}"#,
             r#"{"gnss":{"defaults":{"sof_delay_ns":2000000000}}}"#,
             r#"{"gnss":{"external":{"a":{"sof_delay_ns":-2000000000}}}}"#,
+            r#"{"gnss":{"defaults":{"div":0}}}"#,
+            r#"{"gnss":{"boards":{"A1":{"div":1000001}}}}"#,
+            r#"{"gnss":{"defaults":{"baud":12345}}}"#,
+            r#"{"gnss":{"boards":{"A1":{"initial_baud":1200}}}}"#,
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

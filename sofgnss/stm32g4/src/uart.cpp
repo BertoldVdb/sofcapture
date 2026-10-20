@@ -10,8 +10,9 @@ namespace {
 
 using sofgnss::port::kCoreHz;
 
-// 22 ms at 921600 baud. The main loop drains it every millisecond.
-constexpr uint32_t kRxRing = 2048;
+// 178 ms at 921600 baud. The main loop drains it every millisecond, but may
+// block for a while (CAL pattern fill, baud change, console log lines).
+constexpr uint32_t kRxRing = 16384;
 // Room for one whole host frame (2048) and a USB chunk on top of what's queued.
 constexpr uint32_t kTxRing = 3072;
 constexpr uint32_t kDmaReqUsart3Rx = 28;
@@ -31,7 +32,8 @@ uint32_t rx_wr() {
   return left ? kRxRing - left : 0;
 }
 
-uint32_t tx_used() { return (s_tx_head - s_tx_tail) % kTxRing; }
+uint32_t rx_used() { return (rx_wr() + kRxRing - s_rx_rd) % kRxRing; }
+uint32_t tx_used() { return (s_tx_head + kTxRing - s_tx_tail) % kTxRing; }
 
 // The prescaler lets the core clock reach 300 baud.
 void set_baud(uint32_t baud) {
@@ -153,7 +155,7 @@ void gps_uart_configure(const LineCoding& lc) {
 size_t gps_uart_wait(uint32_t timeout_ms) {
   uint64_t deadline = uptime_us() + uint64_t{timeout_ms} * 1000;
   size_t n;
-  while ((n = (rx_wr() - s_rx_rd) % kRxRing) == 0 && uptime_us() < deadline) watchdog_feed();
+  while ((n = rx_used()) == 0 && uptime_us() < deadline) watchdog_feed();
   return n;
 }
 
@@ -173,7 +175,7 @@ size_t gps_uart_read(uint8_t* buf, size_t cap) {
 
 size_t gps_uart_rx_pending() {
   size_t n = (USART3->ISR & USART_ISR_BUSY) ? 1 : 0;
-  return n + (rx_wr() - s_rx_rd) % kRxRing;
+  return n + rx_used();
 }
 
 size_t gps_uart_write_available() { return kTxRing - 1 - tx_used(); }

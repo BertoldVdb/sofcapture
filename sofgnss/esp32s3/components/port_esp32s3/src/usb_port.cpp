@@ -27,6 +27,8 @@ void* s_cb_ctx;
 uint32_t s_line_coding_events;
 uint32_t s_line_state_events;
 uint32_t s_last_baud;
+bool s_dtr;
+uint32_t s_tx_clears;
 // DCD state, shared between the timing and TinyUSB tasks.
 portMUX_TYPE s_dcd_mux = portMUX_INITIALIZER_UNLOCKED;
 bool s_dcd_wanted;
@@ -75,11 +77,14 @@ extern "C" void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
   (void)rts;
   s_line_state_events++;
 #if CONFIG_SOFGNSS_REQUIRE_DTR
-  // Port closed: drop queued data so the next open starts fresh.
-  if (!dtr) tud_cdc_write_clear();
-#else
-  (void)dtr;
+  // Port opened or closed: drop queued data so an open starts with whole
+  // messages. On opening this drops what usb_tx wrote after the close.
+  if (dtr != s_dtr) {
+    tud_cdc_write_clear();
+    s_tx_clears++;
+  }
 #endif
+  s_dtr = dtr;
 }
 
 extern "C" void tud_cdc_notify_complete_cb(uint8_t itf) {
@@ -94,6 +99,7 @@ extern "C" void tud_mount_cb(void) {
   portENTER_CRITICAL(&s_dcd_mux);
   s_dcd_valid = false;
   portEXIT_CRITICAL(&s_dcd_mux);
+  s_dtr = false;
 }
 
 extern "C" void tud_cdc_rx_cb(uint8_t itf) {
@@ -222,6 +228,7 @@ void cdc_set_callbacks(LineCodingCallback lc, CdcRxCallback rx, void* ctx) {
 }
 
 bool cdc_connected() { return tud_cdc_connected(); }
+uint32_t cdc_tx_clears() { return s_tx_clears; }
 
 bool cdc_set_dcd(bool on) {
   portENTER_CRITICAL(&s_dcd_mux);

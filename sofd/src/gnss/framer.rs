@@ -153,15 +153,13 @@ impl Framer {
                     }
                 }
             }
+            // Reserved bits set: not RTCM3.
+            State::RtcmHeader if self.buf.len() == 1 && b & 0xFC != 0 => self.start(b),
             State::RtcmHeader => {
                 self.buf.push(b);
                 if self.buf.len() == 3 {
-                    if self.buf[1] & 0xFC != 0 {
-                        self.state = State::Idle;
-                    } else {
-                        self.need = 6 + (((self.buf[1] & 3) as usize) << 8 | self.buf[2] as usize);
-                        self.state = State::RtcmBody;
-                    }
+                    self.need = 6 + (((self.buf[1] & 3) as usize) << 8 | self.buf[2] as usize);
+                    self.state = State::RtcmBody;
                 }
             }
             State::RtcmBody => {
@@ -210,6 +208,13 @@ mod tests {
     #[test]
     fn oversize_ubx_header_resyncs() {
         let mut s = vec![0xB5, 0x62, 0x01, 0x02, 0xFF, 0xFF];
+        s.extend(b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47");
+        assert_eq!(frames(&s).len(), 1);
+    }
+
+    #[test]
+    fn false_rtcm_start_keeps_next_sentence() {
+        let mut s = vec![0xD3];
         s.extend(b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47");
         assert_eq!(frames(&s).len(), 1);
     }

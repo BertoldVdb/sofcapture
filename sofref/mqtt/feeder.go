@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,7 +33,7 @@ type Options struct {
 	Prefix string
 	// Client is the name in sofd's gnss.external.
 	Client string
-	// ClientID for the broker (default "sofref-<Client>").
+	// ClientID for the broker (default "sofref-<Client>@<Prefix>/<Controller>").
 	ClientID string
 	// Controller id, e.g. "0000:00:14.0"; see Lookup.
 	Controller string
@@ -73,6 +74,9 @@ type Feeder struct {
 	ref   string
 	want  string
 	stale atomic.Uint64
+	// Held by announce, so Close waits for it.
+	mu     sync.Mutex
+	closed bool
 }
 
 func (o *Options) defaults() error {
@@ -121,7 +125,7 @@ func Connect(ctx context.Context, opts Options) (*Feeder, error) {
 		return nil, errors.New("sofref/mqtt: Client and Controller are required")
 	}
 	if opts.ClientID == "" {
-		opts.ClientID = "sofref-" + opts.Client
+		opts.ClientID = "sofref-" + opts.Client + "@" + opts.Prefix + "/" + opts.Controller
 	}
 	ctrl := opts.Prefix + "/controllers/" + opts.Controller
 	f := &Feeder{opts: opts, ref: ctrl + "/ref/" + opts.Client, want: ctrl + "/want/" + opts.Client}
@@ -148,6 +152,11 @@ func Connect(ctx context.Context, opts Options) (*Feeder, error) {
 
 // announce runs on every (re)connection: clean start drops subscriptions.
 func (f *Feeder) announce(cm *autopaho.ConnectionManager, events string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := cm.Subscribe(ctx, &paho.Subscribe{Subscriptions: []paho.SubscribeOptions{{Topic: events, QoS: 1}}}); err != nil {
@@ -219,6 +228,9 @@ func (f *Feeder) Stale() uint64 {
 
 // Close withdraws the want request and disconnects.
 func (f *Feeder) Close(ctx context.Context) error {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
 	_, err := f.cm.Publish(ctx, &paho.Publish{Topic: f.want, QoS: 1, Retain: true})
 	return errors.Join(err, f.cm.Disconnect(ctx))
 }

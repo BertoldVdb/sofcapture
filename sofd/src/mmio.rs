@@ -19,6 +19,9 @@ unsafe impl Send for Mmio {}
 impl Mmio {
     /// `path` is `/dev/mem` or a sysfs PCI `resourceN`.
     pub fn map(path: &Path, offset: u64, len: usize) -> Result<Self> {
+        if !offset.is_multiple_of(4) {
+            bail!("register address {offset:#x} is not 4-byte aligned");
+        }
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_SYNC)

@@ -183,14 +183,13 @@ void FrameParser::byte(uint8_t b) {
       break;
 
     case State::RtcmHeader:
+      if (len_ == 1 && (b & 0xFC)) {
+        // reserved bits set: not RTCM3
+        abort_to_idle(b);
+        break;
+      }
       buf_[len_++] = b;
       if (len_ == 3) {
-        if (buf_[1] & 0xFC) {
-          // reserved bits set: not RTCM3
-          stats_.junk_bytes += static_cast<uint32_t>(len_);
-          state_ = State::Idle;
-          break;
-        }
         size_t payload = (static_cast<size_t>(buf_[1] & 0x03) << 8) | buf_[2];
         need_ = 3 + payload + 3;
         declared_ = need_;

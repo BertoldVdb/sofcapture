@@ -129,7 +129,12 @@ fn main() -> Result<()> {
         simulate: cli.simulate,
         force_generic: cli.generic.clone(),
         irq_off_max_ns: cli.irq_off_max_us * 1000,
-        sampler: SamplerConfig { window: cfg.sampler.window, rt_prio: cfg.sampler.rt_prio, cpu: cfg.sampler.cpu },
+        sampler: SamplerConfig {
+            window: cfg.sampler.window,
+            gnss_window_ns: (cfg.sampler.gnss_window_s * 1e9) as clock::Ns,
+            rt_prio: cfg.sampler.rt_prio,
+            cpu: cfg.sampler.cpu,
+        },
         default_rate_hz: cfg.sampler.default_rate_hz,
         model_hz: cfg.sampler.model_hz,
         power: power::Settings {

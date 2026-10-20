@@ -104,7 +104,7 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
     "username": "sofd", "password_file": "/etc/sofd/mqtt.pass",   // or "password"
   },
   "sampler": {
-    "window": 64, "default_rate_hz": 50, "model_hz": 1, "rt_prio": 50, "cpu": 2,
+    "window": 64, "gnss_window_s": 6, "default_rate_hz": 50, "model_hz": 1, "rt_prio": 50, "cpu": 2,
     "max_cpu_latency_us": 200,    // while sampling: no CPU sleep state slower to leave than this
     "cpu_governor": "performance",// while sampling (on "cpu" if set, else all CPUs)
   },
@@ -114,6 +114,7 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
       "baud": 38400,              // rate sofd switches the receiver to
       "initial_baud": 9600,       // the receiver's rate before configuration (power-on)
       "configure": true,          // false: use the receiver as it is, at initial_baud
+      "strict": false,            // true: never fall back to NMEA ZDA, keep retrying setup
       "frames": true,             // publish every receiver frame
       "div": null,                // board SOF tag divider (board default)
       "sof_delay_ns": 0,          // bus frame start to the board's capture
@@ -142,6 +143,7 @@ being silently ignored. A file given with `--config` must exist. Without
 | `mqtt.username` | none | Credentials are only sent when this is set. |
 | `mqtt.password`, `mqtt.password_file` | none | The file wins when both are given. Trailing whitespace in it is removed. |
 | `sampler.window` | 64 | Number of samples in each least-squares fit (3–100000). A longer window averages out more noise but follows crystal drift more slowly. At 50 Hz, 64 samples span 1.3 s. |
+| `sampler.gnss_window_s` | 6 | Span of the GNSS tags in `model_gnss` (1–600 s), at most 10000 tags. More tags in the span average out more noise. |
 | `sampler.default_rate_hz` | 50 | Sampling rate (0.1–1000 Hz) for a controller with a board, and for MQTT requests without `rate_hz`. It is also the rate of chrony samples. |
 | `sampler.model_hz` | 1 | How often `controllers/<id>/model` is published (0.1–1000 Hz). A client can ask for more with `model_hz` in its want request. Changes such as a new epoch, a fit appearing or disappearing, or a different GNSS reference are published straight away. |
 | `sampler.rt_prio` | none | Run the sampler threads SCHED_FIFO at this priority (1–99) and lock sofd's memory. |
@@ -151,17 +153,18 @@ being silently ignored. A file given with `--config` must exist. Without
 | `gnss.attach` | `"all"` | Which sofgnss boards to use. `"all"` means every board with the sofgnss descriptors and `"none"` means none. A list of USB serials picks those boards, whatever their descriptors say. |
 | `gnss.defaults` | | Board options (below) for every board. |
 | `gnss.boards.<serial>` | | Board options for one board, by USB serial. Each option set here replaces the one from `defaults`. Options left out fall back to `defaults`, then to the built-in default. |
-| `gnss.external.<client>` | none | An MQTT client that may act as a GNSS reference ([below](#gnss-reference-from-an-mqtt-client)). It takes `chrony` (a socket path) and `sof_delay_ns` (as for boards). |
+| `gnss.external.<client>` | none | An MQTT client that may act as a GNSS reference ([below](#gnss-reference-from-an-mqtt-client)). It takes `chrony` (a socket path) and `sof_delay_ns` (as for boards). The client `*` allows every client not listed by name. |
 
 Board options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `baud` | 38400 | Rate sofd switches the receiver to. Keep it at 38400 or more for the diagnostics messages. |
-| `initial_baud` | 9600 | The receiver's rate before configuration, usually its power-on rate (38400 for u-blox M10/F9). sofd tries it right after `baud`, and if neither gives data it also searches the standard rates. |
+| `baud` | 38400 | Rate sofd switches the receiver to. Keep it at 38400 or more for the diagnostics messages. It must be one of the standard rates (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600). |
+| `initial_baud` | 9600 | The receiver's rate before configuration, usually its power-on rate (38400 for u-blox M10/F9). sofd tries it right after `baud`, and if neither gives data it also searches the standard rates. It must be one of them too. |
 | `configure` | `true` | With `false` sofd leaves the receiver as it is and uses it at `initial_baud`. Pulses are then labelled from TIM-TP if the receiver sends it, and from NMEA ZDA otherwise. |
+| `strict` | `false` | With `true` sofd never falls back to NMEA ZDA ([below](#receiver-setup)) and keeps retrying the setup until it works. Needs `configure`. |
 | `frames` | `true` | Publish every receiver frame on `gnss/<serial>/nmea\|ubx\|rtcm3/…`. Set it to `false` to save broker traffic. sofd still uses the frames itself. |
-| `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1–1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
+| `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
 | `sof_delay_ns` | 0 | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
 | `firmware` | none | The sofgnss image (`sofgnss/esp32s3/build/sofgnss.bin`) the board should run. Boards running another image are updated. `null` in `boards` turns updates off for one board. |
@@ -172,7 +175,8 @@ not give a rate. Each sample costs a spin of up to one microframe (125 µs),
 which is about 0.3 % of a CPU at 50 Hz. `rt_prio` runs the sampler threads
 SCHED_FIFO and locks memory, and `cpu` pins them. Values out of range are
 refused at startup. The ranges are 0.1–1000 Hz for rates, 3–100000 for
-`window`, 1–99 for `rt_prio` and ±1 s for `sof_delay_ns`.
+`window`, 1–600 s for `gnss_window_s`, 1–99 for `rt_prio` and ±1 s for
+`sof_delay_ns`.
 
 `max_cpu_latency_us` and `cpu_governor` trade power for tighter samples. They
 only apply while some controller is being sampled. The latency limit is held
@@ -227,6 +231,9 @@ frames from these topics.
 | `gnss/<serial>/rtcm3/<type>` | | Raw RTCM3 frame, e.g. `.../rtcm3/1005`. |
 | `gnss/<serial>/tx` | by clients | Bytes for the receiver, written as they are. |
 | `cmd/list`, `cmd/lookup` | | Request and response. sofd replies to the MQTT 5 response topic, or to `reply_to` in the body for MQTT 3.1.1. `correlation` is echoed back. Replies are not retained. |
+
+sofd ignores retained messages on `ref`, `tx` and `cmd`, so one retained by
+mistake is not replayed at every reconnect.
 
 A controller is sampled while a board is on it or any client wants it, at the
 highest rate anyone asked for. Its `model` is published at the highest
@@ -317,9 +324,11 @@ controller's true frequency error), `frame_start.t_gnss_ns` and `gnss`.
 
 Every board found is opened and kept alive, but each controller has one
 reference. With several boards on a controller, the first whose receiver
-works (state `ubx`, `nmea_fallback` or `passive`) gets the role and keeps it
-while its receiver keeps working. Then another working board takes over. A
-board without a receiver, still searching for one, never holds the role, so it
+works gets the role and keeps it while its receiver keeps working. Then
+another working board takes over. A receiver works while the board is in
+state `ubx`, `nmea_fallback` or `passive` and is `locked`: a pulse was
+labelled and accepted within the last 5 s, so a receiver without a fix does
+not count. A board without a working receiver never holds the role, so it
 can't keep a working board or an MQTT reference off the controller. Changes
 are logged and sent as a `reference` event.
 
@@ -347,9 +356,9 @@ redone after three misses.
 The states on `gnss/<serial>/status` are `opening`, `updating`, `restarting`
 and `update_failed` for firmware, then `probing`, `identifying`,
 `configuring`, `verifying`, `ubx` (running), `nmea_fallback`, `passive`,
-`detached`, `absent` and `error`. The status also carries `controller`, `tty`,
-`port`, `baud`, `receiver` (MON-VER), `firmware` (`version`, `elf_sha256`,
-`reset_reason`) and `message`.
+`detached`, `absent` and `error`. The status also carries `locked`,
+`controller`, `tty`, `port`, `baud`, `receiver` (MON-VER), `firmware`
+(`version`, `elf_sha256`, `reset_reason`) and `message`.
 
 ### Receiver setup
 
@@ -370,7 +379,9 @@ brings back the receiver's saved settings.
    get CFG-VALSET on the RAM layer. The time pulse stays on the receiver's own
    grid (GPS by default), and NAV-TIMEGPS gives the leap seconds for its
    labels. The edge is the same second boundary on either grid.
-4. Switch the port to the new baud and wait for TIM-TP.
+4. Switch the port to the new baud and wait for TIM-TP, NAV-TIMEGPS or
+   NAV-STATUS. TIM-TP only comes with a fix, so a receiver without one passes
+   too and stays in `ubx` without `locked`.
 
 sofd also turns on some diagnostics for monitoring peers. They are published
 like every other receiver frame on `gnss/<serial>/ubx/<class>/<id>`, and sofd
@@ -389,11 +400,12 @@ the protocol version otherwise. If the receiver rejects a diagnostics message
 or does not acknowledge it, sofd leaves it out and says so in a `configuring`
 status message. It never fails the setup.
 
-Any timeout restarts at step 1. That covers a missing ack, no TIM-TP after
-setup, no frames for 5 s, no TIM-TP for 10 s, and NMEA appearing again after a
-receiver reset. A receiver that does not answer MON-VER, or that fails setup
+Any timeout restarts at step 1. That covers a missing ack, no enabled message
+after setup, no frames for 5 s, and NMEA appearing again after a receiver
+reset. A receiver that keeps sending but has had a fix for 10 s without any
+TIM-TP is set up again from step 3, without a baud search. A receiver that does not answer MON-VER, or that fails setup
 three times in a row, is used as it is, and its pulses are labelled from NMEA
-ZDA instead. With `configure:false` the tty runs at `initial_baud`, and pulses
+ZDA instead. With `strict` sofd keeps retrying the setup instead. With `configure:false` the tty runs at `initial_baud`, and pulses
 are labelled from TIM-TP when it arrives and from ZDA otherwise.
 
 ### Labelling pulses
@@ -503,8 +515,8 @@ the device's frame number, which sofd matches by receive time, so each tag
 must arrive within about 1.9 s. Or it can carry sofd's own epoch and counter,
 which works with any latency.
 
-sofd only accepts clients listed in `gnss.external`, and only that table can
-send them to chrony. A board on the controller whose receiver works takes
+sofd only accepts clients listed in `gnss.external`, or any client when it
+has a `*` entry, and only that table can send them to chrony. A board on the controller whose receiver works takes
 precedence. A reference
 that sends nothing for 10 s, or whose tags have all been rejected for 10 s, is
 dropped. Tag times must lie between 2000 and 2100, and `unc_ns` between 1 ns

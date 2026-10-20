@@ -118,6 +118,24 @@ func TestCounterReset(t *testing.T) {
 	}
 }
 
+func TestCounterResetBeforeFirstPulse(t *testing.T) {
+	tg := newTagger(t, Config{MaxPending: 4})
+	tg.SOF(10*sec, 1, 0)
+	tg.SOF(10*sec+5, 2, 0)
+	// The device restarted before any pulse.
+	tg.SOF(100, 3, 0)
+	tg.SOF(sec/2, 4, 0)
+	pps(t, tg, sec, t0, nil)
+	tg.SOF(sec+sec/2, 5, 0)
+	tags := pps(t, tg, 2*sec, t0+second, nil)
+	if len(tags) != 1 || tags[0].Frame != 5 || tags[0].TGnssNs != t0+second/2 {
+		t.Fatalf("tags %+v", tags)
+	}
+	if s := tg.Stats(); s.Untagged != 4 || s.Tags != 1 || s.Overflow != 0 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
 func TestPendingIsBounded(t *testing.T) {
 	tg := newTagger(t, Config{MaxPending: 4})
 	pps(t, tg, 0, t0, nil)

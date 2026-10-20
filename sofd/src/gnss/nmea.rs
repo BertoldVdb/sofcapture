@@ -63,6 +63,12 @@ fn zda(f: &[&str]) -> Result<Ns, &'static str> {
         return Err("zda_fraction");
     }
     let (d, m, y) = (num(f[2])?, num(f[3])?, num(f[4])?);
+    if !(0..24).contains(&hh) || !(0..60).contains(&mm) || !(0.0..61.0).contains(&secs) {
+        return Err("zda_range");
+    }
+    if !(1..=31).contains(&d) || !(1..=12).contains(&m) || !(2000..=2100).contains(&y) {
+        return Err("zda_range");
+    }
     let s = days_from_civil(y, m, d) * 86_400 + hh * 3600 + mm * 60 + secs as i64;
     Ok(s * 1_000_000_000)
 }
@@ -133,6 +139,8 @@ mod tests {
         assert_eq!(parse(&frame("GPZDA,123456.00,03,10,2026,00,00")), Info::Zda(Ok(t)));
         assert_eq!(parse(&frame("GNZDA,123456.50,03,10,2026,00,00")), Info::Zda(Err("zda_fraction")));
         assert_eq!(parse(&frame("GPZDA,,,,,,")), Info::Zda(Err("zda_empty")));
+        assert_eq!(parse(&frame("GPZDA,123456.00,03,10,9999999999999,00,00")), Info::Zda(Err("zda_range")));
+        assert_eq!(parse(&frame("GPZDA,1234-9e18,03,10,2026,00,00")), Info::Zda(Err("zda_range")));
         assert_eq!(parse(&frame("GPRMC,123456.00,A,1,N,2,E,0,0,031026,,,A")), Info::Fix(true));
         assert_eq!(parse(&frame("GPGGA,123456.00,,,,,0,00,99.99,,,,,,")), Info::Fix(false));
         assert_eq!(days_from_civil(1970, 1, 1), 0);

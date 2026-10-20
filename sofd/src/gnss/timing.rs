@@ -16,7 +16,8 @@ const FIX_MAX_AGE: u64 = 2;
 const SECOND: Ns = 1_000_000_000;
 /// 12.5 ns capture step plus ~46 ns rms spin jitter.
 pub const TAG_UNC_NS: Ns = 50;
-const MAX_PENDING: usize = 256;
+/// Labelling needs every tag back to the previous pulse, 2 s with ZDA: 4 s at div 1.
+const MAX_PENDING: usize = 4096;
 /// Measured on a LEA-5T: 3.9 ns rms edge noise with -qErr, 5.0 ns without, 8.0 ns with +qErr.
 pub const QERR_SIGN: i64 = -1;
 
@@ -381,5 +382,22 @@ mod tests {
             l.on_pps(k * HZ as u64, 300, &mut d, &mut t);
         }
         assert_eq!(d[2].reason, Some("no_fix"));
+    }
+
+    #[test]
+    fn keeps_every_tag_at_div_1() {
+        let mut l = Labeler::new(HZ, Source::Zda);
+        let (mut d, mut t) = (vec![], vec![]);
+        for k in 0..4u64 {
+            let tick = k * HZ as u64;
+            l.on_fix(true);
+            l.on_pps(tick, 300, &mut d, &mut t);
+            l.on_zda(Ok(UTC0 + k as Ns * SECOND));
+            for j in 0..1000 {
+                l.on_sof(tick + j * 80_000 + 40_000, k * 1000 + j, 0);
+            }
+        }
+        // Pulse 2 is decided at pulse 3 and needs the tags after pulse 1.
+        assert_eq!(t.len(), 1000);
     }
 }

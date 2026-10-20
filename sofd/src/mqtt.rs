@@ -15,7 +15,7 @@ use bytes::Bytes;
 use log::{debug, info, warn};
 use rumqttc::v5::mqttbytes::v5::{LastWill, Packet, Publish, PublishProperties};
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{Client, Event, MqttOptions, RecvTimeoutError};
+use rumqttc::v5::{Client, Event, MqttOptions};
 use rumqttc::Outgoing;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,7 +157,7 @@ impl Mqtt {
             .name("mqtt".into())
             .spawn(move || {
                 let mut last_error: Option<String> = None;
-                // Retried when the queue was full.
+                // Retried on the next event when the queue was full.
                 let mut pending: Vec<&str> = vec![];
                 // Keep going until shutdown()'s disconnect has been sent.
                 loop {
@@ -168,11 +168,8 @@ impl Mqtt {
                             true
                         }
                     });
-                    let ev = match conn.recv_timeout(Duration::from_millis(500)) {
-                        Ok(ev) => ev,
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    };
+                    // Never cancelled: that would abort a slow connect or a half written packet.
+                    let Ok(ev) = conn.recv() else { break };
                     match ev {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
                             info!("mqtt: connected to {broker}, prefix {p}");
@@ -211,8 +208,12 @@ impl Mqtt {
         Ok(Self { client, prefix, stop, connected, thread: Some(thread) })
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
     fn up(&self, topic: &str) -> bool {
-        let up = self.connected.load(Ordering::Relaxed);
+        let up = self.is_connected();
         if !up {
             debug!("mqtt: not connected, dropped {topic}");
         }
@@ -272,6 +273,11 @@ fn parse(prefix: &str, p: &Publish) -> Option<In> {
     let topic = std::str::from_utf8(&p.topic).ok()?;
     let rest = topic.strip_prefix(prefix)?.strip_prefix('/')?;
     let parts: Vec<&str> = rest.split('/').collect();
+    // Only want is meant to be retained. A retained tx, ref or cmd would replay on every reconnect.
+    if p.retain && !matches!(parts.as_slice(), ["controllers", _, "want", _]) {
+        warn!("mqtt: {topic}: retained; ignored");
+        return None;
+    }
     match parts.as_slice() {
         ["controllers", ctrl, "want", client] => {
             let req = if p.payload.is_empty() {
@@ -372,6 +378,16 @@ mod tests {
         assert_eq!(parse("sofd/pc", &publish("sofd/pcx/gnss/E07/tx", b"x")), None);
         let r = parse("sofd/pc", &publish("sofd/pc/controllers/c/ref/app1", b"{}"));
         assert!(matches!(r, Some(In::Ref { controller, client, .. }) if controller == "c" && client == "app1"));
+
+        let retained = |topic: &str, payload: &[u8]| {
+            let mut p = publish(topic, payload);
+            p.retain = true;
+            parse("sofd/pc", &p)
+        };
+        for topic in ["sofd/pc/gnss/E07/tx", "sofd/pc/controllers/c/ref/app1", "sofd/pc/cmd/list"] {
+            assert_eq!(retained(topic, b"{}"), None, "{topic}");
+        }
+        assert!(matches!(retained("sofd/pc/controllers/c/want/app1", b"{}"), Some(In::Want { .. })));
     }
 
     #[test]

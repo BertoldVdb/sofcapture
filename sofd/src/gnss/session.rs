@@ -18,7 +18,8 @@ const HANDSHAKE_WARN: Ns = 5_000 * MS;
 const SETTLE: Ns = 250 * MS;
 /// The device only forwards valid frames, so a wrong baud is just silence.
 const PROBE_WAIT: Ns = 1_500 * MS;
-const SEARCH_BAUDS: [u32; 9] = [9600, 38_400, 115_200, 4800, 19_200, 57_600, 230_400, 460_800, 921_600];
+/// Every rate the tty supports, in search order.
+pub const SEARCH_BAUDS: [u32; 9] = [9600, 38_400, 115_200, 4800, 19_200, 57_600, 230_400, 460_800, 921_600];
 const POLL_WAIT: Ns = 1_000 * MS;
 const POLL_TRIES: u32 = 3;
 const ACK_TRIES: u32 = 3;
@@ -26,11 +27,14 @@ const ACK_TRIES: u32 = 3;
 const SWITCH_WAIT: Ns = 200 * MS;
 const VERIFY_WAIT: Ns = 3_500 * MS;
 const FRAME_TIMEOUT: Ns = 5_000 * MS;
+/// TIM-TP only comes with a fix. Missing this long with one, set the receiver up again.
 const TIM_TP_TIMEOUT: Ns = 10_000 * MS;
 /// Failed setups in a row before falling back to ZDA.
 const MAX_FAILURES: u32 = 3;
 /// Use TIM-TP while one arrived this recently, else ZDA.
 const PASSIVE_TP_WINDOW: Ns = 3_000 * MS;
+/// The receiver counts as working while a pulse was accepted this recently.
+const LOCK_TIMEOUT: Ns = 5_000 * MS;
 const VER_WAIT: Ns = 1_000 * MS;
 const VER_TRIES: u32 = 3;
 /// The device erases the update slot before READY.
@@ -38,6 +42,8 @@ const OTA_READY_WAIT: Ns = 15_000 * MS;
 /// Max wait for `OTA,ACK` (sent every 32 KB) or `OTA,OK`.
 const OTA_PROGRESS_WAIT: Ns = 10_000 * MS;
 const OTA_RESTART_WAIT: Ns = 10_000 * MS;
+/// The device drops an update 5 s after its last byte. Until then it takes ours as image data.
+const OTA_ABORT_WAIT: Ns = 6_000 * MS;
 const OTA_CHUNK: usize = 4096;
 /// Max bytes in flight past the last ACK.
 const OTA_WINDOW: usize = 64 * 1024;
@@ -50,6 +56,8 @@ pub struct Config {
     pub initial_baud: u32,
     /// false: use the receiver stream as is.
     pub configure: bool,
+    /// Keep retrying the setup instead of falling back to NMEA ZDA.
+    pub strict: bool,
     /// Emit every GPS frame.
     pub frames: bool,
     pub div: Option<u32>,
@@ -61,7 +69,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { baud: 38_400, initial_baud: 9600, configure: true, frames: true, div: None, sof_delay_ns: 0, firmware: None }
+        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, frames: true, div: None, sof_delay_ns: 0, firmware: None }
     }
 }
 
@@ -125,12 +133,14 @@ enum Rx {
     OtaStart { since: Ns },
     OtaSend { sent: usize, acked: usize, since: Ns, reported: usize },
     OtaDone { since: Ns },
+    /// Quiet until the device gives up on the image.
+    OtaAbort { since: Ns },
     Probe { idx: usize, since: Ns },
     Identify { since: Ns, tries: u32 },
     PortPoll { since: Ns, tries: u32 },
-    /// `stale`: ACKs still due for retries of the previous step. All CFG-MSG steps get the
-    /// same ACK, so a late one must not count for the next step.
-    Configure { steps: Vec<Step>, since: Ns, tries: u32, sends: u32, stale: u32 },
+    /// `sends` 0: a retried step was ACKed, wait for late ACKs of its other sends before
+    /// the next. All CFG-MSG steps get the same ACK, so a late one must not count for it.
+    Configure { steps: Vec<Step>, since: Ns, tries: u32, sends: u32 },
     Switch { since: Ns },
     Verify { since: Ns },
     Running { last_frame: Ns, last_tp: Ns },
@@ -157,8 +167,14 @@ pub struct Session {
     polled_port: Option<Vec<u8>>,
     firmware: Option<DeviceFirmware>,
     state: &'static str,
+    message: Option<String>,
     /// Until NAV-STATUS arrives, the NMEA fix is used.
     last_nav_status: Option<Ns>,
+    /// Since when NAV-STATUS reports a fix.
+    fix_since: Option<Ns>,
+    last_accepted: Option<Ns>,
+    /// A pulse was accepted within LOCK_TIMEOUT. Only then can the board be a reference.
+    locked: bool,
 }
 
 impl Session {
@@ -182,7 +198,11 @@ impl Session {
             polled_port: None,
             firmware: None,
             state: "handshake",
+            message: None,
             last_nav_status: None,
+            fix_since: None,
+            last_accepted: None,
+            locked: false,
         }
     }
 
@@ -193,7 +213,8 @@ impl Session {
 
     fn status(&mut self, state: &'static str, message: Option<String>, out: &mut Output) {
         self.state = state;
-        let mut ev = json!({"event": "gnss_status", "state": state, "baud": self.baud});
+        self.message = message.clone();
+        let mut ev = json!({"event": "gnss_status", "state": state, "baud": self.baud, "locked": self.locked});
         if let Some(r) = &self.receiver {
             ev["receiver"] = json!(r);
         }
@@ -219,6 +240,16 @@ impl Session {
         if let Some(l) = &mut self.labeler {
             l.reset();
         }
+        (self.last_accepted, self.locked, self.fix_since) = (None, false, None);
+    }
+
+    fn update_lock(&mut self, now: Ns, out: &mut Output) {
+        let locked = self.last_accepted.is_some_and(|t| now - t < LOCK_TIMEOUT);
+        if locked != self.locked {
+            self.locked = locked;
+            let (state, message) = (self.state, self.message.clone());
+            self.status(state, message, out);
+        }
     }
 
     pub fn on_bytes(&mut self, data: &[u8], now: Ns, port: &mut dyn Port, out: &mut Output) {
@@ -240,7 +271,7 @@ impl Session {
 
     /// False during a firmware transfer.
     pub fn accepts_tx(&self) -> bool {
-        !matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. })
+        !matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. } | Rx::OtaAbort { .. })
     }
 
     pub fn on_tick(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
@@ -261,6 +292,7 @@ impl Session {
             return;
         }
         self.rx_tick(now, port, out);
+        self.update_lock(now, out);
     }
 
     fn on_pvdb(&mut self, f: &[u8], now: Ns, port: &mut dyn Port, out: &mut Output) {
@@ -293,7 +325,7 @@ impl Session {
                 }
             }
             Pvdb::Ota(m) => self.on_ota(m, now, out),
-            Pvdb::Err(code) if matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. }) => {
+            Pvdb::Err(code) if code.starts_with("OTA") && matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. }) => {
                 self.ota_failed(&format!("device error {code}"), now, port, out);
             }
             Pvdb::Pps { tick, rx_idle_ms } => {
@@ -302,6 +334,9 @@ impl Session {
                     let mut tags = vec![];
                     l.on_pps(tick, rx_idle_ms, &mut decisions, &mut tags);
                     for d in decisions {
+                        if d.accepted {
+                            self.last_accepted = Some(now);
+                        }
                         let mut ev = serde_json::to_value(&d).expect("decision serializes");
                         ev["event"] = json!("gnss_pps");
                         out.events.push(ev);
@@ -311,6 +346,7 @@ impl Session {
                         out.tags.push(t);
                     }
                 }
+                self.update_lock(now, out);
             }
             Pvdb::Sof { tick, frame } => {
                 if let Some(l) = &mut self.labeler {
@@ -349,6 +385,7 @@ impl Session {
                     if let Some(ok) = ubx::fix_ok(p) {
                         l.on_fix(ok);
                         self.last_nav_status = Some(now);
+                        self.fix_since = if ok { self.fix_since.or(Some(now)) } else { None };
                     }
                 }
                 (Kind::Nmea, _) => match nmea::parse(f) {
@@ -409,6 +446,7 @@ impl Session {
                 self.rx = Rx::OtaDone { since: now };
                 self.status("restarting", Some("firmware written, device restarting".into()), out);
             }
+            (Rx::OtaAbort { since }, OtaMsg::Ready) => *since = now,
             _ => {}
         }
     }
@@ -416,7 +454,11 @@ impl Session {
     fn ota_failed(&mut self, why: &str, now: Ns, port: &mut dyn Port, out: &mut Output) {
         self.status("update_failed", Some(why.to_string()), out);
         self.cfg.firmware = None;
-        self.after_version(now, port, out);
+        if matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. }) {
+            self.rx = Rx::OtaAbort { since: now };
+        } else {
+            self.after_version(now, port, out);
+        }
     }
 
     fn ota_tick(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
@@ -477,7 +519,7 @@ impl Session {
 
     fn fail(&mut self, why: &str, now: Ns, port: &mut dyn Port, out: &mut Output) {
         self.failures += 1;
-        if self.failures >= MAX_FAILURES {
+        if self.failures >= MAX_FAILURES && !self.cfg.strict {
             self.fallback(format!("{why}; giving up on UBX setup, labelling pulses from NMEA ZDA"), now, out);
         } else {
             let state = self.state;
@@ -517,17 +559,26 @@ impl Session {
             s.push(Step::required(ubx::cfg_prt(self.polled_port.as_deref(), target), None));
             s
         };
-        self.rx = Rx::Configure { steps, since: now, tries: 0, sends: 0, stale: 0 };
+        self.rx = Rx::Configure { steps, since: now, tries: 0, sends: 0 };
         self.status("configuring", None, out);
         self.send_step(now, port);
     }
 
     fn skip_step(&mut self, why: &str, now: Ns, port: &mut dyn Port, out: &mut Output) {
-        let Rx::Configure { steps, tries, sends, stale, .. } = &mut self.rx else { return };
-        let what = steps.remove(0).optional.unwrap_or_default();
-        (*tries, *stale, *sends) = (0, *sends - 1, 0);
+        let Rx::Configure { steps, .. } = &self.rx else { return };
+        let what = steps[0].optional.clone().unwrap_or_default();
         self.status("configuring", Some(format!("receiver {why} {what}; continuing without")), out);
-        self.send_step(now, port);
+        self.next_step(now, port);
+    }
+
+    fn next_step(&mut self, now: Ns, port: &mut dyn Port) {
+        let Rx::Configure { steps, since, tries, sends } = &mut self.rx else { return };
+        steps.remove(0);
+        let retried = *sends > 1;
+        (*since, *tries, *sends) = (now, 0, 0);
+        if !retried {
+            self.send_step(now, port);
+        }
     }
 
     /// The baud change step has no ACK; go straight to Switch.
@@ -545,7 +596,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     fn rx_frame(&mut self, kind: Kind, msg: Option<(ubx::Id, &[u8])>, tim_tp: bool, zda: bool, now: Ns, port: &mut dyn Port, out: &mut Output) {
         match &mut self.rx {
-            Rx::Idle | Rx::Switch { .. } | Rx::Version { .. } | Rx::OtaStart { .. } | Rx::OtaSend { .. } | Rx::OtaDone { .. } => {}
+            Rx::Idle | Rx::Switch { .. } | Rx::Version { .. } | Rx::OtaStart { .. } | Rx::OtaSend { .. } | Rx::OtaDone { .. } | Rx::OtaAbort { .. } => {}
             Rx::Probe { since, .. } => {
                 if now - *since >= SETTLE {
                     self.rx = Rx::Identify { since: now, tries: 1 };
@@ -573,18 +624,9 @@ impl Session {
                 Some((ubx::ACK_NAK, [0x06, 0x00])) => self.configure(now, port, out),
                 _ => {}
             },
-            Rx::Configure { steps, tries, sends, stale, .. } => match msg {
-                Some((ubx::ACK_ACK, p)) if steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
-                    if *stale > 0 {
-                        // Late ACK for a retry of the previous step.
-                        *stale -= 1;
-                        return;
-                    }
-                    steps.remove(0);
-                    (*tries, *stale, *sends) = (0, *sends - 1, 0);
-                    self.send_step(now, port);
-                }
-                Some((ubx::ACK_NAK, p)) if steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
+            Rx::Configure { steps, sends, .. } => match msg {
+                Some((ubx::ACK_ACK, p)) if *sends > 0 && steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => self.next_step(now, port),
+                Some((ubx::ACK_NAK, p)) if *sends > 0 && steps[0].ack.is_some_and(|a| p == [a.0, a.1]) => {
                     if steps[0].optional.is_some() {
                         self.skip_step("rejected", now, port, out);
                     } else {
@@ -593,8 +635,9 @@ impl Session {
                 }
                 _ => {}
             },
+            // Any enabled message proves the setup; TIM-TP waits for a fix.
             Rx::Verify { .. } => {
-                if tim_tp {
+                if msg.is_some_and(|(id, _)| ubx::ENABLED.contains(&id)) {
                     self.failures = 0;
                     self.set_source(Source::TimTp);
                     self.rx = Rx::Running { last_frame: now, last_tp: now };
@@ -636,6 +679,11 @@ impl Session {
         match &mut self.rx {
             Rx::Idle | Rx::Fallback { .. } | Rx::Passive { .. } => {}
             Rx::OtaStart { .. } | Rx::OtaSend { .. } | Rx::OtaDone { .. } => self.ota_tick(now, port, out),
+            Rx::OtaAbort { since } => {
+                if now - *since >= OTA_ABORT_WAIT {
+                    self.after_version(now, port, out);
+                }
+            }
             Rx::Version { since, tries } => {
                 if now - *since >= VER_WAIT {
                     if *tries >= VER_TRIES {
@@ -661,7 +709,9 @@ impl Session {
             }
             Rx::Identify { since, tries } => {
                 if now - *since >= POLL_WAIT {
-                    if *tries >= POLL_TRIES {
+                    if *tries >= POLL_TRIES && self.cfg.strict {
+                        self.fail("receiver does not answer UBX-MON-VER", now, port, out);
+                    } else if *tries >= POLL_TRIES {
                         self.fallback("receiver does not answer UBX-MON-VER, labelling pulses from NMEA ZDA".into(), now, out);
                     } else {
                         *tries += 1;
@@ -681,8 +731,10 @@ impl Session {
                     }
                 }
             }
-            Rx::Configure { since, tries, steps, .. } => {
-                if now - *since >= POLL_WAIT {
+            Rx::Configure { since, tries, steps, sends } => {
+                if now - *since >= POLL_WAIT && *sends == 0 {
+                    self.send_step(now, port);
+                } else if now - *since >= POLL_WAIT {
                     *tries += 1;
                     if *tries >= ACK_TRIES && steps[0].optional.is_some() {
                         self.skip_step("did not acknowledge", now, port, out);
@@ -702,14 +754,17 @@ impl Session {
             }
             Rx::Verify { since } => {
                 if now - *since >= VERIFY_WAIT {
-                    self.fail("no UBX-TIM-TP after configuration", now, port, out);
+                    self.fail("no UBX output after configuration", now, port, out);
                 }
             }
             Rx::Running { last_frame, last_tp } => {
                 if now - *last_frame >= FRAME_TIMEOUT {
                     self.fail("receiver stopped sending", now, port, out);
-                } else if now - *last_tp >= TIM_TP_TIMEOUT {
-                    self.fail("no UBX-TIM-TP", now, port, out);
+                } else if now - *last_tp >= TIM_TP_TIMEOUT && self.fix_since.is_some_and(|t| now - t >= TIM_TP_TIMEOUT) {
+                    // The receiver still talks at this baud: no need to search.
+                    let state = self.state;
+                    self.status(state, Some("fix but no UBX-TIM-TP; configuring again".into()), out);
+                    self.configure(now, port, out);
                 }
             }
         }
@@ -743,6 +798,9 @@ mod tests {
         /// false: NMEA-only receiver.
         ublox: bool,
         nmea_out: bool,
+        /// false: NMEA without ZDA.
+        zda_out: bool,
+        fix: bool,
         ubx_out: bool,
         enabled: BTreeSet<ubx::Id>,
         to_host: Vec<u8>,
@@ -752,6 +810,10 @@ mod tests {
         /// Image bytes still expected, and those received.
         ota_left: usize,
         ota_image: Vec<u8>,
+        ota_last_ms: i64,
+        /// Slot erase before OTA,READY.
+        ota_erase_ms: i64,
+        ota_ready_at: Option<i64>,
         /// false: output only, ignores polls and config.
         answers: bool,
         /// Delay (ms) the ACK of the first CFG-MSG for this message.
@@ -762,6 +824,8 @@ mod tests {
         lose_cfg_msg: Option<ubx::Id>,
         /// Messages it lacks: CFG-MSG for them gets a NAK.
         nak: BTreeSet<ubx::Id>,
+        /// CFG-MSG received, lost ones included.
+        cfg_msgs: u32,
         now_ms: i64,
     }
 
@@ -773,6 +837,8 @@ mod tests {
                 gen9,
                 ublox,
                 nmea_out: true,
+                zda_out: true,
+                fix: true,
                 ubx_out: true,
                 enabled: BTreeSet::new(),
                 to_host: vec![],
@@ -781,12 +847,16 @@ mod tests {
                 platform: "v5.5.1",
                 ota_left: 0,
                 ota_image: vec![],
+                ota_last_ms: 0,
+                ota_erase_ms: 0,
+                ota_ready_at: None,
                 answers: true,
                 slow_cfg_msg: None,
                 delay_next_ack_ms: 0,
                 delayed: vec![],
                 lose_cfg_msg: None,
                 nak: BTreeSet::new(),
+                cfg_msgs: 0,
                 now_ms: 0,
             }
         }
@@ -836,6 +906,7 @@ mod tests {
                     self.nmea_out = p[14] & 2 != 0;
                 }
                 ubx::CFG_MSG if !self.gen9 => {
+                    self.cfg_msgs += 1;
                     if self.lose_cfg_msg == Some((p[0], p[1])) {
                         self.lose_cfg_msg = None;
                         return;
@@ -889,11 +960,22 @@ mod tests {
             for (_, f) in self.delayed.extract_if(.., |(due, _)| *due <= ms).collect::<Vec<_>>() {
                 self.gps(&f);
             }
+            if self.ota_ready_at.is_some_and(|t| t <= ms) {
+                self.ota_ready_at = None;
+                self.ota_last_ms = ms;
+                self.to_host.extend(nmea::command("OTA,READY"));
+            }
+            if self.ota_left > 0 && self.ota_ready_at.is_none() && ms - self.ota_last_ms > 5000 {
+                self.ota_left = 0;
+                self.to_host.extend(nmea::command("ERR,OTATIMEOUT"));
+            }
             let (s, r) = (ms.div_euclid(1000), ms.rem_euclid(1000));
             if r == 700 && self.ublox && self.ubx_out {
                 let gps = UTC0_S + s + 1 - 315_964_800 + LEAP;
                 let (week, tow) = (gps / 604_800, gps % 604_800);
-                for id in self.enabled.clone() {
+                // Like the LEA-5T: no TIM-TP without a fix.
+                let fix = self.fix;
+                for id in self.enabled.clone().into_iter().filter(|&id| fix || id != ubx::TIM_TP) {
                     let mut p = vec![0u8; 16];
                     match id {
                         ubx::TIM_TP => {
@@ -904,10 +986,11 @@ mod tests {
                             p[10] = LEAP as u8;
                             p[11] = 0x07;
                         }
-                        _ => {
+                        _ if self.fix => {
                             p[4] = 3;
                             p[5] = 0x0D;
                         }
+                        _ => p[5] = 0x0C,
                     }
                     self.gps(&ubx::frame(id, &p));
                 }
@@ -921,8 +1004,11 @@ mod tests {
                 let hms = format!("{:02}{:02}{:02}.00", sod / 3600, sod / 60 % 60, sod % 60);
                 // 2026-09-21 is day 20_717.
                 assert_eq!(t.div_euclid(86_400), 20_717, "test date");
-                self.gps(&nmea::sentence(&format!("GPGGA,{hms},1,N,2,E,1,08,0.9,10,M,0,M,,")));
-                self.gps(&nmea::sentence(&format!("GPZDA,{hms},21,09,2026,00,00")));
+                let q = if self.fix { 1 } else { 0 };
+                self.gps(&nmea::sentence(&format!("GPGGA,{hms},1,N,2,E,{q},08,0.9,10,M,0,M,,")));
+                if self.zda_out {
+                    self.gps(&nmea::sentence(&format!("GPZDA,{hms},21,09,2026,00,00")));
+                }
             }
             if r % 100 == 50 {
                 self.to_host.extend(nmea::command(&format!("SOF,{},{}", ms * 80_000 + 1000, ms)));
@@ -933,6 +1019,7 @@ mod tests {
     impl Port for Fake {
         fn write(&mut self, mut data: &[u8]) {
             if self.ota_left > 0 {
+                self.ota_last_ms = self.now_ms;
                 let n = self.ota_left.min(data.len());
                 let before = self.ota_image.len();
                 self.ota_image.extend(&data[..n]);
@@ -956,7 +1043,9 @@ mod tests {
                         self.to_host.extend(nmea::command(&format!("VER,v1,{},ota_0,0,{},POWERON", self.platform, self.elf)));
                     } else if fl[2] == "OTA" {
                         self.ota_left = fl[3].parse().unwrap();
-                        self.to_host.extend(nmea::command("OTA,READY"));
+                        self.ota_ready_at = Some(self.now_ms + self.ota_erase_ms);
+                    } else if fl[2] == "DIV" {
+                        self.to_host.extend(nmea::command("ERR,BADDIV"));
                     }
                 } else if k == Kind::Ubx && self.ublox && self.answers && self.host_baud == self.rx_baud {
                     let (id, p) = ubx::split(&f);
@@ -1085,6 +1174,17 @@ mod tests {
     }
 
     #[test]
+    fn lost_step_does_not_slow_the_next() {
+        let mut f = Fake::new(9600, false, true);
+        f.lose_cfg_msg = Some(ubx::TIM_TP);
+        let mut r = Run::new(f);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        // 7 steps, and one resend of the lost one.
+        assert_eq!(r.fake.cfg_msgs, 8);
+    }
+
+    #[test]
     fn diagnostics_the_receiver_lacks_are_skipped() {
         let mut f = Fake::new(9600, false, true);
         f.nak = [ubx::NAV_SVINFO, ubx::MON_HW].into_iter().collect();
@@ -1107,6 +1207,77 @@ mod tests {
         r.for_secs(25);
         assert_eq!(r.session.state(), "nmea_fallback", "{:?}", r.states());
         r.check_tags(Source::TimTp);
+    }
+
+    #[test]
+    fn fallback_without_labels_never_locks() {
+        let mut f = Fake::new(9600, false, false);
+        f.zda_out = false;
+        let mut r = Run::new(f);
+        r.for_secs(30);
+        assert!(r.states().contains(&"nmea_fallback".to_string()), "{:?}", r.states());
+        assert!(!r.out.events.iter().any(|e| e["locked"] == true));
+    }
+
+    #[test]
+    fn passive_locks_only_while_pulses_are_accepted() {
+        let cfg = Config { configure: false, ..Config::default() };
+        let mut r = Run::with(cfg, Fake::new(4800, false, true));
+        r.for_secs(10);
+        assert_eq!(r.states(), ["passive"]);
+        assert!(!r.session.locked);
+        r.fake.rx_baud = 9600;
+        r.for_secs(10);
+        assert!(r.session.locked, "{:?}", r.states());
+        r.check_tags(Source::Zda);
+        r.fake.rx_baud = 4800;
+        r.for_secs(10);
+        assert!(!r.session.locked);
+    }
+
+    #[test]
+    fn ubx_without_fix_is_not_locked() {
+        let mut f = Fake::new(9600, false, true);
+        f.fix = false;
+        let mut r = Run::new(f);
+        r.for_secs(30);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert_eq!(r.states().iter().filter(|s| *s == "probing").count(), 1, "{:?}", r.states());
+        assert!(!r.session.locked);
+        r.fake.fix = true;
+        r.for_secs(5);
+        assert!(r.session.locked);
+        let last = r.out.events.iter().rev().find(|e| e["event"] == "gnss_status").unwrap();
+        assert_eq!(last["state"], "ubx");
+        assert_eq!(last["locked"], true);
+    }
+
+    #[test]
+    fn lost_tim_tp_with_a_fix_reconfigures_without_searching() {
+        let mut r = Run::new(Fake::new(9600, false, true));
+        r.for_secs(15);
+        assert_eq!(r.session.state(), "ubx");
+        r.fake.enabled.remove(&ubx::TIM_TP);
+        r.out = Output::default();
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.states().contains(&"configuring".to_string()), "{:?}", r.states());
+        assert!(!r.states().contains(&"probing".to_string()), "{:?}", r.states());
+        assert!(r.fake.enabled.contains(&ubx::TIM_TP));
+        assert!(r.session.locked);
+    }
+
+    #[test]
+    fn strict_keeps_retrying_the_setup() {
+        let cfg = Config { strict: true, ..Config::default() };
+        let mut r = Run::with(cfg, Fake::new(9600, false, false));
+        r.for_secs(120);
+        assert!(!r.states().contains(&"nmea_fallback".to_string()), "{:?}", r.states());
+        assert!(r.states().iter().filter(|s| *s == "identifying").count() > 3, "{:?}", r.states());
+        // Once the receiver answers, setup goes through.
+        r.fake.ublox = true;
+        r.for_secs(60);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
     }
 
     #[test]
@@ -1150,6 +1321,30 @@ mod tests {
         r.for_secs(20);
         assert!(r.states().contains(&"update_failed".to_string()));
         assert_eq!(r.session.state(), "ubx");
+    }
+
+    #[test]
+    fn other_device_errors_do_not_fail_the_update() {
+        let img = Arc::new(super::super::firmware::test_image("v2", 0xcd, 200_000));
+        // The fake answers DIV with ERR,BADDIV, in the same read as VER.
+        let cfg = Config { firmware: Some(img.clone()), div: Some(5), ..Config::default() };
+        let mut r = Run::with(cfg, Fake::new(9600, false, true));
+        r.for_secs(5);
+        assert_eq!(r.session.state(), "restarting", "{:?}", r.states());
+        assert!(r.fake.ota_image == img.data);
+    }
+
+    #[test]
+    fn failed_update_waits_for_the_device_to_give_up() {
+        let img = Arc::new(super::super::firmware::test_image("v2", 0xcd, 200_000));
+        let mut f = Fake::new(9600, false, true);
+        // READY comes after sofd gave up on it.
+        f.ota_erase_ms = 16_000;
+        let mut r = Run::with(Config { firmware: Some(img), ..Config::default() }, f);
+        r.for_secs(40);
+        assert!(r.states().contains(&"update_failed".to_string()));
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.fake.ota_image.is_empty());
     }
 
     #[test]

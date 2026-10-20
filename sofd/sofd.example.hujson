@@ -34,6 +34,7 @@
     // MQTT clients allowed to act as GNSS reference (see MQTT-GUIDE.md)
     "external": {
       // "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 },
+      // "*": {},                         // any other client
     },
   },
 }

@@ -205,16 +205,23 @@ impl Backend for Dwc2 {
             bail!("HFIR.FrInt is zero");
         }
 
+        // At the frame boundary FrNum can change before FrRem reloads (seen as
+        // samples exactly one frame early), so skip reads close to it.
+        let guard = frint / 64;
         let mut best = (Ns::MAX, 0, 0);
         for _ in 0..Self::BURST {
             let t0 = clock::raw();
             let v = self.regs.read32(HFNUM);
             let t1 = clock::raw();
-            if t1 - t0 < best.0 {
+            let rem = v >> 16;
+            if rem > guard && rem < frint - guard && t1 - t0 < best.0 {
                 best = (t1 - t0, t0 + (t1 - t0) / 2, v);
             }
         }
         let (width, mid, v) = best;
+        if width == Ns::MAX {
+            return Ok(None);
+        }
         let frnum = v & 0xffff;
         let frrem = v >> 16;
         // FrRem counts down from FrInt to 0 across one (micro)frame.

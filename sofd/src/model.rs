@@ -39,12 +39,18 @@ impl Fit {
 
 pub struct Model {
     window: usize,
+    span_ns: Option<Ns>,
     pts: VecDeque<(i64, Ns, Ns)>,
 }
 
 impl Model {
     pub fn new(window: usize) -> Self {
-        Self { window: window.max(3), pts: VecDeque::new() }
+        Self { window: window.max(3), span_ns: None, pts: VecDeque::new() }
+    }
+
+    /// Keeps the points of the last `span_ns`, at most `max` of them.
+    pub fn with_span(span_ns: Ns, max: usize) -> Self {
+        Self { window: max.max(3), span_ns: Some(span_ns), pts: VecDeque::new() }
     }
 
     pub fn clear(&mut self) {
@@ -56,6 +62,11 @@ impl Model {
             self.pts.pop_front();
         }
         self.pts.push_back((counter, t, unc));
+        if let Some(span) = self.span_ns {
+            while self.pts.front().is_some_and(|p| t - p.1 > span) {
+                self.pts.pop_front();
+            }
+        }
     }
 
     pub fn fit(&self, unit_ns: f64) -> Option<Fit> {
@@ -139,6 +150,20 @@ mod tests {
         }
         let f = m.fit(125_000.0).unwrap();
         assert!((f.predict(10 * 800) - 1_000_000_000).abs() < 100, "{f:?}");
+    }
+
+    #[test]
+    fn span_keeps_recent_points() {
+        let mut m = Model::with_span(1_000_000_000, 5);
+        for i in 0..20i64 {
+            m.push(i, i * 100_000_000, 50);
+        }
+        assert_eq!(m.fit(1e6).unwrap().n, 5);
+        let mut m = Model::with_span(1_000_000_000, 100);
+        for i in 0..20i64 {
+            m.push(i, i * 100_000_000, 50);
+        }
+        assert_eq!(m.fit(1e6).unwrap().n, 11);
     }
 
     #[test]

@@ -36,6 +36,8 @@ const JUMP_DRIFT_PPM: f64 = 5.0;
 const FULL_FRAME_RANGE: u32 = 1024;
 /// Pass GNSS time on only from a fresh, filled fit: never extrapolate through an outage.
 const GNSS_MIN_POINTS: usize = 5;
+/// The GNSS fit runs at every sample: 10 s of tags at div 1.
+const MAX_GNSS_POINTS: usize = 10_000;
 const GNSS_MAX_AGE_NS: Ns = 5_000_000_000;
 /// A tag matched to the wrong wrap is off by 2.048 s; tag noise is ~50 ns.
 const GNSS_MAX_DEV_NS: Ns = 500_000;
@@ -59,11 +61,14 @@ pub fn persist_epochs(path: PathBuf) {
 /// Unix time in ms, but always above the last epoch.
 fn new_epoch() -> u64 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-    let mut epoch = 0;
-    let _ = LAST_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-        epoch = (last + 1).max(now);
-        Some(epoch)
-    });
+    let mut last = LAST_EPOCH.load(Ordering::Relaxed);
+    let epoch = loop {
+        let next = (last + 1).max(now);
+        match LAST_EPOCH.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break next,
+            Err(current) => last = current,
+        }
+    };
     if let Some(p) = EPOCH_FILE.get() {
         let tmp = p.with_extension("tmp");
         let r = std::fs::write(&tmp, format!("{epoch}\n")).and_then(|()| std::fs::rename(&tmp, p));
@@ -79,6 +84,7 @@ fn new_epoch() -> u64 {
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
     pub window: usize,
+    pub gnss_window_ns: Ns,
     pub rt_prio: Option<i32>,
     pub cpu: Option<usize>,
 }
@@ -222,7 +228,7 @@ fn run(
     let mut model = Model::new(cfg.window);
     let mut fit: Option<Fit> = None;
     let mut model_rt = Model::new(cfg.window);
-    let mut model_gnss = Model::new(cfg.window);
+    let mut model_gnss = Model::with_span(cfg.gnss_window_ns, MAX_GNSS_POINTS);
     let mut join = Join::default();
     let mut gate = Gate::default();
     let mut feed: Option<Arc<Feed>> = None;
@@ -334,19 +340,20 @@ fn run(
         let mut counter = model::unwrap(prev, s.counter, s.t_ns, period_est, counter_bits);
         // Far off the model means the counter jumped (reset, resume).
         // With an unknown wrap point, compare raw counts over gaps too short to wrap.
-        let jumped = match (&fit, counter_bits, prev) {
+        let jump = match (&fit, counter_bits, prev) {
             (Some(f), Some(_), Some((_, pt))) => {
                 let tol = (unit as f64 / 4.0).max((s.t_ns - pt) as f64 * JUMP_DRIFT_PPM * 1e-6);
-                (s.t_ns - f.predict(counter)).abs() as f64 > tol
+                let off = s.t_ns - f.predict(counter);
+                (off.abs() as f64 > tol).then(|| format!("{} us off the fit", off / 1000))
             }
             (_, None, Some((pc, _))) => {
                 let (dc, draw) = (counter - pc, s.counter as i64 - prev_raw as i64);
-                dc < 512 && draw >= 0 && draw != dc
+                (dc < 512 && draw >= 0 && draw != dc).then(|| format!("{draw} counts in {dc} frames"))
             }
-            _ => false,
+            _ => None,
         };
-        if jumped {
-            warn!("{id}: frame counter discontinuity, starting new epoch");
+        if let Some(jump) = jump {
+            warn!("{id}: frame counter discontinuity ({jump}, n {}), starting new epoch", fit.as_ref().map_or(0, |f| f.n));
             (epoch, epoch_start) = (new_epoch(), None);
             model.clear();
             model_rt.clear();

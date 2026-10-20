@@ -13,9 +13,14 @@ namespace {
 const char* TAG = "uart";
 constexpr uart_port_t kUart = static_cast<uart_port_t>(CONFIG_SOFGNSS_GPS_UART_NUM);
 constexpr size_t kRxBuf = 4096;
-constexpr size_t kTxBuf = 2048;
+constexpr size_t kTxBuf = 8192;
+// uart_get_tx_buffer_free_size() only counts the write being sent, not those
+// queued behind it, so uart_write_bytes() could block. Instead write at most
+// one host frame, and only once the UART is idle again.
+constexpr size_t kTxChunk = 2048;
 
 QueueHandle_t s_events;
+bool s_tx_busy;  // written since the UART was last idle
 
 void handle_event(const uart_event_t& ev) {
   if (ev.type == UART_FIFO_OVF || ev.type == UART_BUFFER_FULL) {
@@ -121,9 +126,8 @@ size_t gps_uart_rx_pending() {
 }
 
 size_t gps_uart_write_available() {
-  size_t free = 0;
-  uart_get_tx_buffer_free_size(kUart, &free);
-  return free;
+  if (s_tx_busy && uart_wait_tx_done(kUart, 0) == ESP_OK) s_tx_busy = false;
+  return s_tx_busy ? 0 : kTxChunk;
 }
 
 size_t gps_uart_write(const uint8_t* data, size_t len) {
@@ -131,6 +135,7 @@ size_t gps_uart_write(const uint8_t* data, size_t len) {
   if (len > space) len = space;
   if (len == 0) return 0;
   int n = uart_write_bytes(kUart, data, len);
+  s_tx_busy = true;
   return n > 0 ? static_cast<size_t>(n) : 0;
 }
 

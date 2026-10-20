@@ -86,11 +86,14 @@ def open_iq(path, fmt):
     n = len(raw) // 2
 
     def read(start, count):
-        start = max(0, start)
+        # Zeros before the file, so positions stay right.
+        pad = min(max(0, -start), count)
+        start, count = start + pad, count - pad
         count = max(0, min(count, n - start))
         seg = raw[2 * start:2 * (start + count)].astype(np.float64)
         seg = (seg + offset) * scale
-        return seg[0::2] + 1j * seg[1::2]
+        x = seg[0::2] + 1j * seg[1::2]
+        return np.concatenate([np.zeros(pad), x]) if pad else x
 
     return n, read
 
@@ -404,12 +407,15 @@ def pair_bursts(a, found, cal, tick_hz):
     else:
         sys.exit("pairing needs --iq-start (unix time of the first sample) or --first-n")
     pairs = []
+    last = (found[0][0], first["tick"])
     for f in found:
-        dt = (f[0] - found[0][0]) / a.fs  # seconds, good to ppm
-        want = first["tick"] + dt * tick_hz
+        # Predict from the last pair: the SDR rate error adds up over time.
+        dt = (f[0] - last[0]) / a.fs
+        want = last[1] + dt * tick_hz
         c = min(cal, key=lambda c: abs(c["tick"] - want))
         if abs(c["tick"] - want) < 0.01 * tick_hz:
             pairs.append((f, c))
+            last = (f[0], c["tick"])
     return pairs
 
 
@@ -440,6 +446,7 @@ def report(a, res, lines):
 
 def cmd_log(a):
     import serial
+    from ota import line_settings
 
     def sentence(body):
         s = 0
@@ -447,7 +454,8 @@ def cmd_log(a):
             s ^= ord(ch)
         return f"${body}*{s:02X}\r\n".encode()
 
-    p = serial.Serial(a.port, 115200, timeout=0.2)
+    # Keep the line coding: a new baud rate would retune the GPS UART.
+    p = serial.Serial(a.port, timeout=0.2, **line_settings(a.port))
     p.write(sentence(f"PVDB,SOFPPS,CAL,{a.mode}"))
     last_ping = time.time()
     end = time.time() + a.seconds if a.seconds else float("inf")

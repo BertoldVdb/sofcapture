@@ -94,6 +94,7 @@ struct TimingEvent {
 };
 
 QueueHandle_t s_timing_q;
+std::atomic<uint32_t> s_timing_dropped{0};  // events lost to a full queue
 SofSpinSource* s_spin;
 OtaReceiver* s_ota;
 FrameParser* s_parser;
@@ -118,7 +119,9 @@ TimingEvent make_event(EvKind kind, uint32_t tick = 0, uint64_t frame = 0) {
   return ev;
 }
 
-void post(const TimingEvent& ev) { xQueueSend(s_timing_q, &ev, 0); }
+void post(const TimingEvent& ev) {
+  if (xQueueSend(s_timing_q, &ev, 0) != pdTRUE) s_timing_dropped++;
+}
 void post(EvKind kind, uint32_t tick = 0, uint64_t frame = 0) { post(make_event(kind, tick, frame)); }
 
 // Drops extra edges from ringing or a slow PPS edge.
@@ -130,7 +133,7 @@ bool IRAM_ATTR on_pps_isr(uint32_t tick, void*) {
   if (!s_pps_filter.accept(tick, now, s_tick_hz)) return false;
   TimingEvent ev = make_event(EvKind::Pps, tick, now);
   BaseType_t woken = pdFALSE;
-  xQueueSendFromISR(s_timing_q, &ev, &woken);
+  if (xQueueSendFromISR(s_timing_q, &ev, &woken) != pdTRUE) s_timing_dropped++;
   if (s_cal_task) vTaskNotifyGiveFromISR(s_cal_task, &woken);  // start a calibration burst
   return woken == pdTRUE;
 }
@@ -142,7 +145,7 @@ bool IRAM_ATTR on_cal_isr(uint32_t tick, uint32_t length, void*) {
   ev.cal_synced = s_cal_synced_now;
   ev.cal_length = length;
   BaseType_t woken = pdFALSE;
-  xQueueSendFromISR(s_timing_q, &ev, &woken);
+  if (xQueueSendFromISR(s_timing_q, &ev, &woken) != pdTRUE) s_timing_dropped++;
   return woken == pdTRUE;
 }
 
@@ -189,7 +192,7 @@ FrameUnwrapper s_hw_frames;
 bool IRAM_ATTR on_sof_isr(uint32_t tick, uint16_t frame, void*) {
   TimingEvent ev = make_event(EvKind::Sof, tick, s_hw_frames.update(frame));
   BaseType_t woken = pdFALSE;
-  xQueueSendFromISR(s_timing_q, &ev, &woken);
+  if (xQueueSendFromISR(s_timing_q, &ev, &woken) != pdTRUE) s_timing_dropped++;
   return woken == pdTRUE;
 }
 
@@ -298,15 +301,17 @@ bool host_listening() {
 }
 
 // Writes each message into the CDC FIFO whole so it never gets cut in half.
-// Returns false if the host went away.
+// Returns false if the host went away or the port dropped the message's start.
 bool send_message(const uint8_t* msg, size_t n) {
+  uint32_t clears = hal::cdc_tx_clears();
   size_t off = 0;
   while (off < n) {
     size_t want = n - off;
     size_t limit = hal::cdc_write_capacity();
     if (want > limit) want = limit;
-    while (hal::cdc_write_available() < want) {
-      if (!host_listening()) return false;
+    for (;;) {
+      if (!host_listening() || hal::cdc_tx_clears() != clears) return false;
+      if (hal::cdc_write_available() >= want) break;
       hal::watchdog_feed();
       vTaskDelay(1);
     }
@@ -480,7 +485,8 @@ void send_info(const TimingReporter& reporter, const char* tag = nullptr) {
   info.divider = reporter.divider();
   info.pps = reporter.pps_count();
   info.sof_tags = reporter.sof_count();
-  if (s_spin) info.sof_missed = s_spin->stats().late + s_spin->stats().timeouts;
+  info.sof_missed = s_timing_dropped.load();
+  if (s_spin) info.sof_missed += s_spin->stats().late + s_spin->stats().timeouts;
   info.dropped = s_outbox.dropped();
   info.parse_errors = s_parser->stats().errors();
   info.pps_rejected = s_pps_filter.rejected();
@@ -521,7 +527,8 @@ void timing_task(void*) {
   uint64_t pulse_until = 0;  // end of the LED's PPS pulse
   bool led = false;
   uint32_t info_countdown = 0;
-  bool was_ready = false;
+  bool was_listening = false;
+  uint32_t tx_clears = 0;
   hal::watchdog_register_task();
 
   for (;;) {
@@ -582,12 +589,17 @@ void timing_task(void*) {
         reporter.note_tick(s_spin->last_tick());
       }
 
+      // Host connected: mounted, and with SOFGNSS_REQUIRE_DTR the port opened.
+      // A changed clear count means it was closed and opened again meanwhile.
       bool ready = hal::usb_ready();
-      if (ready && !was_ready) {
+      bool listening = host_listening();
+      uint32_t clears = hal::cdc_tx_clears();
+      if (listening && (!was_listening || clears != tx_clears)) {
         info_countdown = 0;  // send INFO right away
         send_ver();
       }
-      was_ready = ready;
+      was_listening = listening;
+      tx_clears = clears;
       if (ready && CONFIG_SOFGNSS_INFO_INTERVAL_S > 0) {
         if (info_countdown == 0) {
           send_info(reporter);
@@ -621,7 +633,8 @@ void timing_task(void*) {
 extern "C" void app_main() {
   hal::init();
 
-  s_timing_q = xQueueCreate(64, sizeof(TimingEvent));
+  // Up to one SOF per ms (divider 1), so 256 ms of timing task stall.
+  s_timing_q = xQueueCreate(256, sizeof(TimingEvent));
   s_outbox.init();
   static uint8_t parser_buf[CONFIG_SOFGNSS_PARSER_BYTES];
   s_parser = new FrameParser(parser_buf, sizeof parser_buf, on_frame, nullptr);

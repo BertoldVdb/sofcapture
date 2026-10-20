@@ -191,6 +191,14 @@ TEST(parser_rtcm_reserved_bits_reject_false_start) {
   CHECK_EQ(f.sink.frames.size(), 1u);
 }
 
+TEST(parser_rtcm_false_start_keeps_next_sentence) {
+  Fixture f;
+  f.feed(std::vector<uint8_t>{0xD3} + bytes(kGga));
+  CHECK_EQ(f.sink.frames.size(), 1u);
+  CHECK(f.sink.frames[0].data == bytes(kGga));
+  CHECK_EQ(f.parser.stats().junk_bytes, 1u);
+}
+
 TEST(parser_junk_dropped_between_frames) {
   Fixture f;
   std::vector<uint8_t> stream =

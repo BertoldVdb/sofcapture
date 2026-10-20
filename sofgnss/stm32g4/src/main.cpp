@@ -65,8 +65,8 @@ class EventRing {
   uint32_t dropped() const { return dropped_; }
 
  private:
-  // Up to one SOF per ms (divider 1), so 32 ms of main loop stall.
-  static constexpr uint32_t kSize = 32;
+  // Up to one SOF per ms (divider 1), so 256 ms of main loop stall.
+  static constexpr uint32_t kSize = 256;
   TimingEvent buf_[kSize];
   volatile uint32_t head_ = 0;
   volatile uint32_t tail_ = 0;
@@ -227,6 +227,7 @@ void gps_rx_poll(uint64_t now) {
 // size) so it never gets cut in half.
 uint8_t s_msg[CONFIG_SOFGNSS_PARSER_BYTES];
 size_t s_msg_len, s_msg_off;
+uint32_t s_msg_clears;
 
 void usb_tx_poll() {
   if (!host_listening()) {
@@ -234,6 +235,11 @@ void usb_tx_poll() {
     s_outbox.clear();
     s_msg_len = s_msg_off = 0;
     return;
+  }
+  // The port dropped the start of this message (closed and opened again).
+  if (hal::cdc_tx_clears() != s_msg_clears) {
+    s_msg_clears = hal::cdc_tx_clears();
+    s_msg_len = s_msg_off = 0;
   }
   for (;;) {
     if (s_msg_off == s_msg_len) {
@@ -460,7 +466,8 @@ void cal_poll(uint64_t now) {
 
 uint64_t s_next_housekeeping;
 uint32_t s_info_countdown;
-bool s_was_ready;
+bool s_was_listening;
+uint32_t s_tx_clears;
 
 void housekeeping(uint64_t now) {
   if (s_pulse_until && now >= s_pulse_until) s_pulse_until = 0;
@@ -475,12 +482,17 @@ void housekeeping(uint64_t now) {
   s_next_housekeeping = now + 1000000;
   s_reporter.note_tick(hal::tick_now());
 
+  // Host connected: mounted, and with SOFGNSS_REQUIRE_DTR the port opened.
+  // A changed clear count means it was closed and opened again meanwhile.
   bool ready = hal::usb_ready();
-  if (ready && !s_was_ready) {
+  bool listening = host_listening();
+  uint32_t clears = hal::cdc_tx_clears();
+  if (listening && (!s_was_listening || clears != s_tx_clears)) {
     s_info_countdown = 0;  // send INFO right away
     send_ver();
   }
-  s_was_ready = ready;
+  s_was_listening = listening;
+  s_tx_clears = clears;
   if (ready && CONFIG_SOFGNSS_INFO_INTERVAL_S > 0) {
     if (s_info_countdown == 0) {
       send_info();

@@ -12,6 +12,8 @@ void* s_cb_ctx;
 uint32_t s_line_coding_events;
 uint32_t s_line_state_events;
 uint32_t s_last_baud;
+bool s_dtr;
+uint32_t s_tx_clears;
 bool s_dcd_wanted;
 bool s_dcd_sent;
 bool s_dcd_valid;  // s_dcd_sent is what the host has seen
@@ -31,18 +33,9 @@ bool dcd_send() {
 
 extern "C" {
 
-// Flags the handler so a PPS arriving meanwhile doesn't start a burst (see cal_start).
-volatile bool s_usb_isr_active;
-
-static void usb_irq() {
-  s_usb_isr_active = true;
-  tud_int_handler(0);
-  s_usb_isr_active = false;
-}
-
-void USB_HP_IRQHandler() { usb_irq(); }
-void USB_LP_IRQHandler() { usb_irq(); }
-void USBWakeUp_IRQHandler() { usb_irq(); }
+void USB_HP_IRQHandler() { tud_int_handler(0); }
+void USB_LP_IRQHandler() { tud_int_handler(0); }
+void USBWakeUp_IRQHandler() { tud_int_handler(0); }
 
 uint32_t tusb_time_millis_api() { return static_cast<uint32_t>(sofgnss::hal::uptime_us() / 1000); }
 
@@ -57,18 +50,23 @@ void tud_cdc_line_coding_cb(uint8_t, cdc_line_coding_t const* p) {
 void tud_cdc_line_state_cb(uint8_t, bool dtr, bool) {
   s_line_state_events++;
 #if CONFIG_SOFGNSS_REQUIRE_DTR
-  // Port closed: drop queued data so the next open starts fresh.
-  if (!dtr) tud_cdc_write_clear();
-#else
-  (void)dtr;
+  // Port opened or closed: drop queued data so an open starts with whole messages.
+  if (dtr != s_dtr) {
+    tud_cdc_write_clear();
+    s_tx_clears++;
+  }
 #endif
+  s_dtr = dtr;
 }
 
 void tud_cdc_notify_complete_cb(uint8_t) {
   if (s_dcd_valid && s_dcd_sent != s_dcd_wanted) dcd_send();
 }
 
-void tud_mount_cb() { s_dcd_valid = false; }
+void tud_mount_cb() {
+  s_dcd_valid = false;
+  s_dtr = false;
+}
 
 void tud_cdc_rx_cb(uint8_t) {
   if (s_rx_cb) s_rx_cb(s_cb_ctx);
@@ -78,7 +76,12 @@ void tud_cdc_rx_cb(uint8_t) {
 
 namespace sofgnss::port {
 
-bool usb_isr_active() { return s_usb_isr_active; }
+// So a PPS that preempts a USB handler doesn't start a burst (see cal_start).
+// The active bits are set on handler entry, before its first instruction.
+bool usb_isr_active() {
+  return NVIC_GetActive(USB_HP_IRQn) || NVIC_GetActive(USB_LP_IRQn) ||
+         NVIC_GetActive(USBWakeUp_IRQn);
+}
 
 void usb_detach(uint32_t ms) {
   tud_disconnect();
@@ -131,6 +134,7 @@ void cdc_set_callbacks(LineCodingCallback lc, CdcRxCallback rx, void* ctx) {
 }
 
 bool cdc_connected() { return tud_cdc_connected(); }
+uint32_t cdc_tx_clears() { return s_tx_clears; }
 
 bool cdc_set_dcd(bool on) {
   s_dcd_wanted = on;

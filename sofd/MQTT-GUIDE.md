@@ -73,6 +73,7 @@ have one, so every `cmd/*` also accepts the reply topic in its body:
 sofd removes both fields before the command sees the request, so you can add
 them to any command. The reply is published once, at QoS 1 and not retained.
 Subscribe to the reply topic before you send the command, or you will miss it.
+Don't retain the command: sofd ignores retained commands.
 A `reply_to` in the body wins over an MQTT 5 response topic. Errors come back
 the same way, with `"ok":false`, an `"error"` and your `correlation`. A command
 without any reply topic still runs, but its answer only goes to the log.
@@ -323,16 +324,17 @@ its configuration file, and only the configuration can send them to chrony:
 }
 ```
 
-It is a good idea to restrict publishing to `controllers/+/ref/+` with broker
-ACLs as well.
+A `*` entry accepts any client not listed by name, with its settings. Use it
+only on a broker where every client is trusted. It is a good idea to restrict
+publishing to `controllers/+/ref/+` with broker ACLs as well.
 
 ### Publishing tags
 
 1. Find the controller your device is on with `cmd/lookup`, as in Part 1.
 2. Ask for sampling with a retained `controllers/<id>/want/<client>` and a will
    that clears it. Tags on their own don't start sampling.
-3. Publish tags on `sofd/pc1/controllers/<id>/ref/<client>`, not retained, at
-   QoS 0 or 1, in one of the two forms below.
+3. Publish tags on `sofd/pc1/controllers/<id>/ref/<client>`, not retained
+   (sofd ignores retained tags), at QoS 0 or 1, in one of the two forms below.
 
 Neither form needs NTP or a correct host clock, so an external reference can
 bring up chrony on a machine without network time.
@@ -394,8 +396,9 @@ Both forms accept a batch: `{"tags": [ {…}, {…} ]}`.
 Some guidelines:
 
 - Send at least one tag per second, and at most about the sampling rate. The
-  fit holds the last `sampler.window` (64) tags. GNSS time is only used and
-  sent to chrony with at least 5 tags and the newest received under 5 s ago.
+  fit holds the tags of the last `sampler.gnss_window_s` (6 s). GNSS time is
+  only used and sent to chrony with at least 5 tags and the newest received
+  under 5 s ago.
 - There is one reference per controller, and a sofgnss board on the
   controller whose receiver works takes precedence. Otherwise the first allowed client to send
   valid tags owns the controller until it has sent nothing, or only rejected
@@ -425,7 +428,7 @@ The reasons for `ref_rejected` are:
 | `microframe` | Non-zero on a full-speed controller. |
 | `no_bus_frame` | The controller gives no bus frame number, so use form B. |
 | `inconsistent` | The tag is more than 0.5 ms off `model_gnss`. It was matched to the wrong wrap or your time jumped. After 5 such tags spread over 3 s the fit restarts from your tags. |
-| `not_allowed` | The client isn't in `gnss.external`. |
+| `not_allowed` | The client isn't in `gnss.external` and there is no `*` entry. |
 | `invalid` | The tag is malformed, and `message` says why. |
 
 The controller's samples and model name the reference in `gnss`:

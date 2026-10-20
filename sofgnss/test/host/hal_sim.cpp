@@ -75,6 +75,7 @@ bool usb_sof_wait_change(uint32_t timeout_ticks, uint32_t* tick, uint16_t* frame
 
 void cdc_set_callbacks(LineCodingCallback, CdcRxCallback, void*) {}
 bool cdc_connected() { return true; }
+uint32_t cdc_tx_clears() { return 0; }
 bool cdc_set_dcd(bool) { return true; }
 UsbStats usb_stats() { return UsbStats{true, false, true, 0, 0, 0}; }
 size_t cdc_write(const uint8_t*, size_t len) { return len; }

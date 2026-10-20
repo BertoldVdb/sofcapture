@@ -260,7 +260,9 @@ fn run(
         }
         for ev in o.events.drain(..) {
             let m = if ev["event"] == "gnss_status" {
-                info!("{}: {} {}", info.serial, ev["state"], ev.get("message").map_or(String::new(), |m| m.to_string()));
+                let lock = if ev["locked"] == true { " locked" } else { "" };
+                let msg = ev.get("message").map_or(String::new(), |m| format!(" {m}"));
+                info!("{}: {}{lock}{msg}", info.serial, ev["state"]);
                 BoardOut::Status(ev)
             } else {
                 BoardOut::Pps(ev)

@@ -161,6 +161,8 @@ struct Slot {
     chrony_busy: bool,
     /// Already warned that its firmware is left alone.
     update_given_up: bool,
+    /// The session ended and took its feed out of the hub, before its Ended arrived.
+    ended: bool,
 }
 
 /// An MQTT client acting as a controller's GNSS reference.
@@ -201,6 +203,8 @@ pub struct Daemon {
     start_failed: BTreeMap<String, StartFailed>,
     slots: BTreeMap<String, Slot>,
     hub: Hub,
+    /// controller -> the board feeding its GNSS reference
+    board_refs: BTreeMap<String, Arc<Feed>>,
     /// controller -> the external reference feeding it
     refs: BTreeMap<String, ExtRef>,
     /// Last problem told to each client, so it is told only once.
@@ -258,6 +262,7 @@ impl Daemon {
             start_failed: BTreeMap::new(),
             slots: BTreeMap::new(),
             hub: Hub::default(),
+            board_refs: BTreeMap::new(),
             refs: BTreeMap::new(),
             ref_told: BTreeMap::new(),
             images: BTreeMap::new(),
@@ -460,9 +465,13 @@ impl Daemon {
         }
         self.print(&s.event);
         let (Some(name), Some(p)) = (s.board, s.chrony) else { return };
+        // Queued from a reference that was just replaced: it must not take the socket back.
+        if !self.hub.lock().unwrap().get(&s.controller).is_some_and(|f| f.serial == name) {
+            return;
+        }
         let client = name.strip_prefix(external::NAME_PREFIX);
         let path = match client {
-            Some(c) => self.gnss.external.get(c).and_then(|e| e.chrony.clone()),
+            Some(c) => self.gnss.external(c).and_then(|e| e.chrony.clone()),
             None => self.slots.get(&name).and_then(|sl| sl.cfg.chrony.clone()),
         };
         let Some(path) = path else { return };
@@ -549,36 +558,50 @@ impl Daemon {
     }
 
     /// Picks the board that feeds each controller's GNSS reference: one whose
-    /// receiver works, keeping the current one while it does. Boards without a
-    /// working receiver stay open but feed nothing, so they block neither a
-    /// board with GNSS on the same controller nor an MQTT reference.
+    /// receiver works (`locked`: pulses accepted), keeping the current one while
+    /// it does. Boards without a working receiver stay open but feed nothing, so
+    /// they block neither a board with GNSS on the same controller nor an MQTT
+    /// reference.
     fn assign_feeds(&mut self) {
+        let mut hub = self.hub.lock().unwrap();
+        // An ended session took its feed out of the hub: don't put it back.
+        for (c, f) in &self.board_refs {
+            if !hub.get(c).is_some_and(|h| Arc::ptr_eq(h, f)) {
+                if let Some(sl) = self.slots.get_mut(&f.serial).filter(|sl| sl.board.as_ref().is_some_and(|b| Arc::ptr_eq(&b.feed, f))) {
+                    sl.ended = true;
+                }
+            }
+        }
         let mut ready: BTreeMap<String, Vec<Arc<Feed>>> = BTreeMap::new();
-        for slot in self.slots.values() {
-            if let Some(b) = slot.board.as_ref().filter(|_| RUNNING_STATES.contains(&slot.state.as_str())) {
+        for slot in self.slots.values().filter(|s| !s.ended) {
+            let working = RUNNING_STATES.contains(&slot.state.as_str()) && slot.status["locked"] == true;
+            if let Some(b) = slot.board.as_ref().filter(|_| working) {
                 ready.entry(b.info.controller.clone()).or_default().push(b.feed.clone());
             }
         }
         let mut changes: Vec<(String, Option<String>, Option<String>)> = vec![];
-        {
-            let mut hub = self.hub.lock().unwrap();
-            let stale: Vec<String> = hub
-                .iter()
-                .filter(|(c, f)| f.client.is_none() && !ready.get(*c).is_some_and(|r| r.iter().any(|rf| Arc::ptr_eq(rf, f))))
-                .map(|(c, _)| c.clone())
-                .collect();
-            for c in stale {
-                let old = hub.remove(&c).map(|f| f.serial.clone());
-                changes.push((c, None, old));
+        let controllers: BTreeSet<String> = self.board_refs.keys().chain(ready.keys()).cloned().collect();
+        for c in controllers {
+            let feeds = ready.get(&c);
+            let keep = self.board_refs.get(&c).is_some_and(|f| {
+                hub.get(&c).is_some_and(|h| Arc::ptr_eq(h, f)) && feeds.is_some_and(|r| r.iter().any(|rf| Arc::ptr_eq(rf, f)))
+            });
+            if keep {
+                continue;
             }
-            for (c, feeds) in ready {
-                if hub.get(&c).is_some_and(|f| f.client.is_none()) {
-                    continue;
-                }
-                let old = hub.insert(c.clone(), feeds[0].clone()).map(|f| f.serial.clone());
-                changes.push((c, Some(feeds[0].serial.clone()), old));
+            let mut old = self.board_refs.remove(&c).map(|f| f.serial.clone());
+            if hub.get(&c).is_some_and(|f| f.client.is_none()) {
+                hub.remove(&c);
             }
+            let new = feeds.map(|r| r[0].clone());
+            if let Some(n) = &new {
+                // Or the MQTT reference it takes over from.
+                old = old.or(hub.insert(c.clone(), n.clone()).map(|f| f.serial.clone()));
+                self.board_refs.insert(c.clone(), n.clone());
+            }
+            changes.push((c, new.map(|n| n.serial.clone()), old));
         }
+        drop(hub);
         for (c, new, old) in changes {
             if let Some(o) = old.as_ref().filter(|o| !o.starts_with(external::NAME_PREFIX)) {
                 // Let the next reference feed the chrony socket.
@@ -624,17 +647,22 @@ impl Daemon {
                         m.publish_json(&format!("gnss/{serial}/status"), &slot.status, true);
                     }
                 }
-                // Clear stale retained models of controllers we don't sample.
-                if let (Some(m), Some(d)) = (&self.mqtt, &self.discovered) {
-                    for c in d.controllers.iter().filter(|c| !self.samplers.contains_key(&c.id)) {
-                        m.publish(&format!("controllers/{}/model", c.id), Vec::new(), true);
+                // Clear stale retained models of controllers we don't sample, or that left while we were away.
+                if let Some(m) = &self.mqtt {
+                    let found = self.discovered.iter().flat_map(|d| d.controllers.iter().map(|c| &c.id));
+                    let ids: BTreeSet<&String> = found.chain(self.infos.keys()).collect();
+                    for id in ids.into_iter().filter(|id| !self.samplers.contains_key(*id)) {
+                        m.publish(&format!("controllers/{id}/model"), Vec::new(), true);
                     }
                 }
                 // Retained requests get redelivered; one withdrawn while we were away won't.
                 for w in self.wants.values_mut().flat_map(|w| w.values_mut()).filter(|w| w.mqtt && w.expires.is_none()) {
                     w.expires = Some(expiry(RECONFIRM));
                 }
-                self.infos.clear();
+                // Republish everything, and clear infos of controllers gone meanwhile.
+                for v in self.infos.values_mut() {
+                    *v = Value::Null;
+                }
                 self.publish_infos();
             }
             mqtt::In::Want { controller, client, req } => {
@@ -690,7 +718,7 @@ impl Daemon {
 
     /// A board on the same controller takes precedence.
     fn on_ref(&mut self, controller: &str, client: &str, payload: &[u8], t_rx: Ns) {
-        let Some(ext) = self.gnss.external.get(client).cloned() else {
+        let Some(ext) = self.gnss.external(client).cloned() else {
             return self.ref_problem(controller, client, json!({"event": "ref_rejected", "reason": "not_allowed"}));
         };
         let tags = match external::parse(payload) {
@@ -883,6 +911,7 @@ impl Daemon {
                 status: Value::Null,
                 chrony_busy: false,
                 update_given_up: false,
+                ended: false,
             });
             slot.present = true;
             // Re-enumerated before the old session noticed.
@@ -915,6 +944,7 @@ impl Daemon {
             baud: b.baud,
             initial_baud: b.initial_baud,
             configure: b.configure,
+            strict: b.strict,
             frames: b.frames,
             div: b.div,
             sof_delay_ns: b.sof_delay_ns as Ns,
@@ -926,6 +956,7 @@ impl Daemon {
         match result {
             Ok(board) => {
                 slot.board = Some(board);
+                slot.ended = false;
                 let st = json!({"state": "opening", "controller": info.controller, "tty": info.tty, "port": info.port});
                 self.set_status(&serial, st);
             }
@@ -1017,11 +1048,6 @@ impl Daemon {
                 m.publish(&format!("controllers/{c}/model"), Vec::new(), true);
             }
         }
-        if desired.is_empty() {
-            self.power = None;
-        } else if self.power.is_none() {
-            self.power = power::Held::apply(&self.opts.power);
-        }
         let now = Instant::now();
         self.start_failed.retain(|c, _| desired.contains_key(c));
         for (c, rate) in desired {
@@ -1059,6 +1085,11 @@ impl Daemon {
                 }
             }
         }
+        if self.samplers.is_empty() {
+            self.power = None;
+        } else if self.power.is_none() {
+            self.power = power::Held::apply(&self.opts.power);
+        }
     }
 
     fn start_sampler(&self, id: &str, rate: f64) -> Result<Running> {
@@ -1075,7 +1106,8 @@ impl Daemon {
     }
 
     fn publish_infos(&mut self) {
-        if self.mqtt.is_none() {
+        // While down, infos keeps what the broker has, so Connected can clear what went away.
+        if !self.mqtt.as_ref().is_some_and(Mqtt::is_connected) {
             return;
         }
         let Ok(v) = self.list() else { return };
