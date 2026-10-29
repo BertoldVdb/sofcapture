@@ -161,7 +161,7 @@ converting frames as in step 4.
 | `controllers/<id>/model` | The normal choice. It is retained and holds the latest fits, so you get it as soon as you subscribe. sofd publishes it `model_hz` times a second (once by default), and straight away when the epoch changes, a fit appears or disappears, or the GNSS reference changes. An empty payload means sampling stopped. |
 | `controllers/<id>/sample` | Every sample with all its fields, not retained. It is only published while some client asks with `"samples":true`. Useful for logging or your own fitting. |
 | `controllers/<id>/event` | `realtime_step` (CLOCK_REALTIME was stepped), `error` and `recovered`. |
-| `gnss/<serial>/status` | The board's state. `ubx` means it is running normally. |
+| `gnss/<serial>/status` | The board's state, or a receiver's by its name. `ubx` means it is running normally. |
 
 A `model` message looks like this:
 

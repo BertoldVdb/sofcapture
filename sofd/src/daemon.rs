@@ -1,7 +1,7 @@
 //! Main loop: runs sofgnss boards, samples controllers, and publishes to MQTT, chrony and stdout.
 
 use crate::backend;
-use crate::chrony::{self, Chrony, Sent};
+use crate::chrony::{self, Chrony, Priority, Sent};
 use crate::clock::{self, Ns};
 use crate::config;
 use crate::discovery::{self, BackendKind, Controller, DeviceQuery, MmioOverride, UsbDevice};
@@ -165,6 +165,15 @@ struct Slot {
     ended: bool,
 }
 
+/// A receiver on a serial port with its pulses on /dev/pps.
+struct RecvSlot {
+    rx: Option<device::Receiver>,
+    retry_at: Instant,
+    backoff: Duration,
+    status: Value,
+    chrony_busy: bool,
+}
+
 /// An MQTT client acting as a controller's GNSS reference.
 struct ExtRef {
     client: String,
@@ -202,6 +211,7 @@ pub struct Daemon {
     wants: BTreeMap<String, BTreeMap<String, Want>>,
     start_failed: BTreeMap<String, StartFailed>,
     slots: BTreeMap<String, Slot>,
+    receivers: BTreeMap<String, RecvSlot>,
     hub: Hub,
     /// controller -> the board feeding its GNSS reference
     board_refs: BTreeMap<String, Arc<Feed>>,
@@ -250,6 +260,12 @@ fn backoff(b: Duration) -> Duration {
 impl Daemon {
     pub fn new(opts: Options, gnss: config::Gnss, tx: Sender<Msg>, mqtt: Option<Mqtt>, stdout: bool) -> Self {
         let usb_watch = uevent::watch().map_err(|e| warn!("{e:#}; scanning USB every second")).ok();
+        let now = Instant::now();
+        let receivers = gnss
+            .receivers
+            .keys()
+            .map(|n| (n.clone(), RecvSlot { rx: None, retry_at: now, backoff: Duration::ZERO, status: Value::Null, chrony_busy: false }))
+            .collect();
         Self {
             opts,
             usb_watch,
@@ -261,6 +277,7 @@ impl Daemon {
             wants: BTreeMap::new(),
             start_failed: BTreeMap::new(),
             slots: BTreeMap::new(),
+            receivers,
             hub: Hub::default(),
             board_refs: BTreeMap::new(),
             refs: BTreeMap::new(),
@@ -341,6 +358,13 @@ impl Daemon {
         for slot in self.slots.values_mut() {
             slot.board = None;
         }
+        let receivers: Vec<String> = self.receivers.iter().filter(|(_, r)| r.rx.is_some()).map(|(k, _)| k.clone()).collect();
+        for r in self.receivers.values_mut() {
+            r.rx = None;
+        }
+        for name in receivers {
+            self.set_receiver_status(&name, json!({"state": "stopped"}));
+        }
         let sampled: Vec<String> = self.samplers.keys().cloned().collect();
         self.samplers.clear();
         self.power = None;
@@ -376,6 +400,14 @@ impl Daemon {
         self.print(&ev);
     }
 
+    fn receiver_event(&self, name: &str, mut ev: Value) {
+        ev["receiver"] = json!(name);
+        if let Some(m) = &self.mqtt {
+            m.publish_event(&format!("gnss/{name}/event"), &ev);
+        }
+        self.print(&ev);
+    }
+
     fn controller_event(&self, controller: &str, ev: &Value) {
         if let Some(m) = &self.mqtt {
             m.publish_event(&format!("controllers/{controller}/event"), ev);
@@ -406,7 +438,9 @@ impl Daemon {
             Msg::Controller { controller, event } => self.on_controller_event(&controller, &event),
             Msg::Board { serial, id, out } => {
                 // Drop late messages from a replaced session.
-                if self.slots.get(&serial).and_then(|s| s.board.as_ref()).is_some_and(|b| b.id == id) {
+                if self.receivers.get(&serial).and_then(|r| r.rx.as_ref()).is_some_and(|r| r.id == id) {
+                    self.on_receiver(&serial, out);
+                } else if self.slots.get(&serial).and_then(|s| s.board.as_ref()).is_some_and(|b| b.id == id) {
                     self.on_board(&serial, out);
                 }
             }
@@ -475,7 +509,7 @@ impl Daemon {
             None => self.slots.get(&name).and_then(|sl| sl.cfg.chrony.clone()),
         };
         let Some(path) = path else { return };
-        let busy = match self.chrony.send(&path, &name, p, clock::raw()) {
+        let busy = match self.chrony.send(&path, &name, Priority::Reference, p, clock::raw()) {
             Sent::Ok => None,
             Sent::Busy(owner) => Some(owner),
         };
@@ -646,6 +680,9 @@ impl Daemon {
                     for (serial, slot) in &self.slots {
                         m.publish_json(&format!("gnss/{serial}/status"), &slot.status, true);
                     }
+                    for (name, r) in self.receivers.iter().filter(|(_, r)| !r.status.is_null()) {
+                        m.publish_json(&format!("gnss/{name}/status"), &r.status, true);
+                    }
                 }
                 // Clear stale retained models of controllers we don't sample, or that left while we were away.
                 if let Some(m) = &self.mqtt {
@@ -691,10 +728,15 @@ impl Daemon {
                 self.publish_infos();
             }
             mqtt::In::Ref { controller, client, payload, t_rx } => self.on_ref(&controller, &client, &payload, t_rx),
-            mqtt::In::Tx { serial, data } => match self.slots.get(&serial).and_then(|s| s.board.as_ref()) {
-                Some(b) => b.send(data),
-                None => warn!("{serial}: tx for a board that is not attached"),
-            },
+            mqtt::In::Tx { serial, data } => {
+                if let Some(r) = self.receivers.get(&serial).and_then(|r| r.rx.as_ref()) {
+                    r.send(data);
+                } else if let Some(b) = self.slots.get(&serial).and_then(|s| s.board.as_ref()) {
+                    b.send(data);
+                } else {
+                    warn!("{serial}: tx for a board or receiver that is not open");
+                }
+            }
             mqtt::In::Cmd { name, payload, reply: to } => {
                 let result = self.command(&name, &payload);
                 let mut reply = match result {
@@ -827,6 +869,7 @@ impl Daemon {
             c["model_hz"] = json!(self.samplers.get(&id).map(|r| self.model_hz(&id).min(r.rate_hz)));
         }
         v["boards"] = json!(self.slots.iter().map(|(s, sl)| { let mut st = sl.status.clone(); st["board"] = json!(s); st }).collect::<Vec<_>>());
+        v["receivers"] = json!(self.receivers.iter().map(|(n, r)| { let mut st = r.status.clone(); st["receiver"] = json!(n); st }).collect::<Vec<_>>());
         Ok(v)
     }
 
@@ -846,6 +889,8 @@ impl Daemon {
     }
 
     fn scan(&mut self) {
+        // They need no USB.
+        self.open_receivers();
         if let Err(e) = self.discover() {
             warn!("{e:#}");
             return;
@@ -940,16 +985,7 @@ impl Daemon {
                 firmware = None;
             }
         }
-        let cfg = session::Config {
-            baud: b.baud,
-            initial_baud: b.initial_baud,
-            configure: b.configure,
-            strict: b.strict,
-            frames: b.frames,
-            div: b.div,
-            sof_delay_ns: b.sof_delay_ns as Ns,
-            firmware,
-        };
+        let cfg = session::Config { firmware, ..session_config(&b) };
         let result = device::spawn(info.clone(), cfg, &self.hub, &self.tx);
         let slot = self.slots.get_mut(&serial).unwrap();
         slot.cfg = b;
@@ -967,6 +1003,101 @@ impl Daemon {
                 warn!("{serial}: {msg}; retrying in {} s", slot.backoff.as_secs());
                 self.set_status(&serial, json!({"state": "error", "message": msg, "tty": info.tty, "port": info.port}));
             }
+        }
+    }
+
+    fn open_receivers(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self.receivers.iter().filter(|(_, r)| r.rx.is_none() && now >= r.retry_at).map(|(n, _)| n.clone()).collect();
+        for name in due {
+            let rc = &self.gnss.receivers[&name];
+            let (tty, pps) = (rc.tty.clone(), rc.pps.clone());
+            let result = device::spawn_receiver(&name, &tty, &pps, session_config(&self.gnss.receiver(&name)), &self.tx);
+            let r = self.receivers.get_mut(&name).unwrap();
+            match result {
+                Ok(rx) => {
+                    r.rx = Some(rx);
+                    self.set_receiver_status(&name, json!({"state": "opening", "tty": tty, "pps": pps}));
+                }
+                Err(e) => {
+                    r.backoff = backoff(r.backoff);
+                    r.retry_at = now + r.backoff;
+                    let msg = format!("{e:#}");
+                    warn!("{name}: {msg}; retrying in {} s", r.backoff.as_secs());
+                    self.set_receiver_status(&name, json!({"state": "error", "message": msg, "tty": tty, "pps": pps}));
+                }
+            }
+        }
+    }
+
+    fn set_receiver_status(&mut self, name: &str, status: Value) {
+        if let Some(m) = &self.mqtt {
+            m.publish_json(&format!("gnss/{name}/status"), &status, true);
+        }
+        if let Some(r) = self.receivers.get_mut(name) {
+            r.status = status;
+        }
+    }
+
+    fn on_receiver(&mut self, name: &str, out: BoardOut) {
+        match out {
+            BoardOut::Status(mut ev) => {
+                ev.as_object_mut().map(|o| o.remove("event"));
+                let rc = &self.gnss.receivers[name];
+                (ev["tty"], ev["pps"]) = (json!(rc.tty), json!(rc.pps));
+                if RUNNING_STATES.contains(&ev["state"].as_str().unwrap_or("")) {
+                    self.receivers.get_mut(name).unwrap().backoff = Duration::ZERO;
+                }
+                let mut printed = ev.clone();
+                (printed["event"], printed["receiver"]) = (json!("gnss_status"), json!(name));
+                self.print(&printed);
+                self.set_receiver_status(name, ev);
+            }
+            BoardOut::Pps(mut ev) => {
+                ev["receiver"] = json!(name);
+                if let Some(m) = &self.mqtt {
+                    m.publish_json(&format!("gnss/{name}/pps"), &ev, false);
+                }
+                self.print(&ev);
+                let point = (ev["accepted"] == true).then(|| ev["t_realtime_ns"].as_i64().zip(ev["utc_ns"].as_i64())).flatten();
+                if let Some((t_realtime_ns, t_gnss_ns)) = point {
+                    self.receiver_to_chrony(name, chrony::Point { t_realtime_ns, t_gnss_ns });
+                }
+            }
+            BoardOut::Frame(kind, f) => {
+                if let Some(m) = &self.mqtt {
+                    m.publish(&format!("gnss/{name}/{}", mqtt::frame_topic(kind, &f)), f.clone(), false);
+                }
+                if self.stdout {
+                    self.print(&frame_json(name, kind, &f));
+                }
+            }
+            BoardOut::Ended(reason) => {
+                warn!("{name}: {reason}");
+                let r = self.receivers.get_mut(name).unwrap();
+                r.rx = None;
+                r.backoff = backoff(r.backoff);
+                r.retry_at = Instant::now() + r.backoff;
+                self.chrony.release(name);
+                self.receiver_event(name, json!({"event": "detached", "reason": reason}));
+                let rc = &self.gnss.receivers[name];
+                let st = json!({"state": "error", "message": reason, "tty": rc.tty, "pps": rc.pps});
+                self.set_receiver_status(name, st);
+            }
+        }
+    }
+
+    fn receiver_to_chrony(&mut self, name: &str, p: chrony::Point) {
+        let Some(path) = self.gnss.receiver(name).chrony else { return };
+        let busy = match self.chrony.send(&path, name, Priority::Pps, p, clock::raw()) {
+            Sent::Ok => None,
+            Sent::Busy(owner) => Some(owner),
+        };
+        let r = self.receivers.get_mut(name).unwrap();
+        let was = std::mem::replace(&mut r.chrony_busy, busy.is_some());
+        if let (Some(owner), false) = (busy, was) {
+            warn!("{name}: chrony socket {} is fed by {owner}", path.display());
+            self.receiver_event(name, json!({"event": "chrony_busy", "socket": path, "owner": owner}));
         }
     }
 
@@ -1207,4 +1338,19 @@ pub fn board_serial(spec: &str, controller: &str, simulate: bool) -> Result<Stri
         d
     };
     dev.serial.ok_or_else(|| anyhow!("USB device {} has no serial number", dev.port))
+}
+
+fn session_config(b: &config::Board) -> session::Config {
+    session::Config {
+        baud: b.baud,
+        initial_baud: b.initial_baud,
+        configure: b.configure,
+        strict: b.strict,
+        leap_seconds: b.leap_seconds,
+        plain: false,
+        frames: b.frames,
+        div: b.div,
+        sof_delay_ns: b.sof_delay_ns as Ns,
+        firmware: None,
+    }
 }

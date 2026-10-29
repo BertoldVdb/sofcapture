@@ -45,8 +45,18 @@ fn encode(p: Point) -> Vec<u8> {
         .to_vec()
 }
 
+/// A source takes a socket from a lower one at once, from an equal one only after OWNER_TIMEOUT_NS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    /// A receiver's kernel PPS timestamps.
+    Pps,
+    /// A controller's GNSS reference (board or MQTT client): SOF timing, no interrupt latency.
+    Reference,
+}
+
 struct Owner {
     serial: String,
+    prio: Priority,
     last_ns: Ns,
     /// Last send error, so it is logged once.
     error: Option<String>,
@@ -73,14 +83,15 @@ impl Chrony {
         Self { sock, owners: BTreeMap::new() }
     }
 
-    pub fn send(&mut self, path: &Path, serial: &str, p: Point, now: Ns) -> Sent {
-        let o = self.owners.entry(path.to_path_buf()).or_insert_with(|| Owner { serial: serial.into(), last_ns: now, error: None });
+    pub fn send(&mut self, path: &Path, serial: &str, prio: Priority, p: Point, now: Ns) -> Sent {
+        let new = || Owner { serial: serial.into(), prio, last_ns: now, error: None };
+        let o = self.owners.entry(path.to_path_buf()).or_insert_with(new);
         if o.serial != serial {
-            if now - o.last_ns < OWNER_TIMEOUT_NS {
+            if prio <= o.prio && now - o.last_ns < OWNER_TIMEOUT_NS {
                 return Sent::Busy(o.serial.clone());
             }
             info!("chrony {}: now fed by {serial} (was {})", path.display(), o.serial);
-            *o = Owner { serial: serial.into(), last_ns: now, error: None };
+            *o = new();
         }
         o.last_ns = now;
         let Some(sock) = &self.sock else { return Sent::Ok };
@@ -135,11 +146,12 @@ mod tests {
         server.set_nonblocking(true).unwrap();
         let mut c = Chrony::new();
         let p = Point { t_realtime_ns: 0, t_gnss_ns: 0 };
-        assert!(matches!(c.send(&path, "A", p, 0), Sent::Ok));
-        assert!(matches!(c.send(&path, "B", p, 1), Sent::Busy(o) if o == "A"));
-        assert!(matches!(c.send(&path, "B", p, OWNER_TIMEOUT_NS + 1), Sent::Ok));
+        let r = Priority::Reference;
+        assert!(matches!(c.send(&path, "A", r, p, 0), Sent::Ok));
+        assert!(matches!(c.send(&path, "B", r, p, 1), Sent::Busy(o) if o == "A"));
+        assert!(matches!(c.send(&path, "B", r, p, OWNER_TIMEOUT_NS + 1), Sent::Ok));
         c.release("B");
-        assert!(matches!(c.send(&path, "A", p, OWNER_TIMEOUT_NS + 2), Sent::Ok));
+        assert!(matches!(c.send(&path, "A", r, p, OWNER_TIMEOUT_NS + 2), Sent::Ok));
         let mut buf = [0u8; 64];
         let mut n = 0;
         while server.recv(&mut buf).is_ok() {
@@ -147,5 +159,23 @@ mod tests {
         }
         assert_eq!(n, 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reference_takes_the_socket_from_a_receiver() {
+        let path = Path::new("/nonexistent/sofd-test.sock");
+        let mut c = Chrony::new();
+        let p = Point { t_realtime_ns: 0, t_gnss_ns: 0 };
+        let (pps, r) = (Priority::Pps, Priority::Reference);
+        assert!(matches!(c.send(path, "rx", pps, p, 0), Sent::Ok));
+        assert!(matches!(c.send(path, "board", r, p, 1), Sent::Ok));
+        assert!(matches!(c.send(path, "rx", pps, p, 2), Sent::Busy(o) if o == "board"));
+        assert!(matches!(c.send(path, "rx", pps, p, OWNER_TIMEOUT_NS), Sent::Busy(_)));
+        // Back to the receiver once the board is quiet.
+        assert!(matches!(c.send(path, "rx", pps, p, OWNER_TIMEOUT_NS + 2), Sent::Ok));
+        c.release("rx");
+        assert!(matches!(c.send(path, "board", r, p, OWNER_TIMEOUT_NS + 3), Sent::Ok));
+        c.release("board");
+        assert!(matches!(c.send(path, "rx", pps, p, OWNER_TIMEOUT_NS + 4), Sent::Ok));
     }
 }

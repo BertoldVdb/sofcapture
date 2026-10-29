@@ -35,6 +35,8 @@ const MAX_FAILURES: u32 = 3;
 const PASSIVE_TP_WINDOW: Ns = 3_000 * MS;
 /// The receiver counts as working while a pulse was accepted this recently.
 const LOCK_TIMEOUT: Ns = 5_000 * MS;
+/// Plain mode pulse ticks are ns.
+pub const PLAIN_TICK_HZ: u32 = 1_000_000_000;
 const VER_WAIT: Ns = 1_000 * MS;
 const VER_TRIES: u32 = 3;
 /// The device erases the update slot before READY.
@@ -58,6 +60,10 @@ pub struct Config {
     pub configure: bool,
     /// Keep retrying the setup instead of falling back to NMEA ZDA.
     pub strict: bool,
+    /// GPS minus UTC, used until the receiver knows it.
+    pub leap_seconds: Option<i8>,
+    /// No sofgnss board: the port is the receiver's own, pulses come in through `on_pulse`.
+    pub plain: bool,
     /// Emit every GPS frame.
     pub frames: bool,
     pub div: Option<u32>,
@@ -69,7 +75,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, frames: true, div: None, sof_delay_ns: 0, firmware: None }
+        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, leap_seconds: None, plain: false, frames: true, div: None, sof_delay_ns: 0, firmware: None }
     }
 }
 
@@ -172,6 +178,7 @@ pub struct Session {
     last_nav_status: Option<Ns>,
     /// Since when NAV-STATUS reports a fix.
     fix_since: Option<Ns>,
+    leap_warned: bool,
     last_accepted: Option<Ns>,
     /// A pulse was accepted within LOCK_TIMEOUT. Only then can the board be a reference.
     locked: bool,
@@ -180,16 +187,17 @@ pub struct Session {
 impl Session {
     pub fn new(cfg: Config, nonce: String, now: Ns) -> Self {
         let baud = cfg.baud;
+        let plain = cfg.plain;
         Self {
             cfg,
             nonce,
-            ready: false,
+            ready: plain,
             started: now,
             last_handshake: None,
             warned: false,
             last_ping: None,
             framer: Framer::new(),
-            labeler: None,
+            labeler: plain.then(|| Labeler::new(PLAIN_TICK_HZ, Source::TimTp)),
             tick_hz: 0,
             rx: Rx::Idle,
             baud,
@@ -201,6 +209,7 @@ impl Session {
             message: None,
             last_nav_status: None,
             fix_since: None,
+            leap_warned: false,
             last_accepted: None,
             locked: false,
         }
@@ -256,7 +265,7 @@ impl Session {
         let mut frames = vec![];
         self.framer.feed(data, |k, f| frames.push((k, f.to_vec())));
         for (kind, f) in frames {
-            if kind == Kind::Nmea && f.starts_with(nmea::PVDB_PREFIX) {
+            if kind == Kind::Nmea && f.starts_with(nmea::PVDB_PREFIX) && !self.cfg.plain {
                 self.on_pvdb(&f, now, port, out);
             } else if self.ready {
                 self.on_gps(kind, &f, now, port, out);
@@ -275,6 +284,13 @@ impl Session {
     }
 
     pub fn on_tick(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
+        if self.cfg.plain {
+            if let Rx::Idle = self.rx {
+                self.after_version(now, port, out);
+            }
+            self.rx_tick(now, port, out);
+            return self.update_lock(now, out);
+        }
         if self.accepts_tx() && self.last_ping.is_none_or(|t| now - t >= PING_EVERY) {
             port.write(&nmea::command("PING"));
             self.last_ping = Some(now);
@@ -328,26 +344,7 @@ impl Session {
             Pvdb::Err(code) if code.starts_with("OTA") && matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. }) => {
                 self.ota_failed(&format!("device error {code}"), now, port, out);
             }
-            Pvdb::Pps { tick, rx_idle_ms } => {
-                if let Some(l) = &mut self.labeler {
-                    let mut decisions: Vec<PpsDecision> = vec![];
-                    let mut tags = vec![];
-                    l.on_pps(tick, rx_idle_ms, &mut decisions, &mut tags);
-                    for d in decisions {
-                        if d.accepted {
-                            self.last_accepted = Some(now);
-                        }
-                        let mut ev = serde_json::to_value(&d).expect("decision serializes");
-                        ev["event"] = json!("gnss_pps");
-                        out.events.push(ev);
-                    }
-                    for mut t in tags {
-                        t.utc_ns -= self.cfg.sof_delay_ns;
-                        out.tags.push(t);
-                    }
-                }
-                self.update_lock(now, out);
-            }
+            Pvdb::Pps { tick, rx_idle_ms } => self.on_pulse(tick, rx_idle_ms, now, out),
             Pvdb::Sof { tick, frame } => {
                 if let Some(l) = &mut self.labeler {
                     l.on_sof(tick, frame, now);
@@ -361,6 +358,29 @@ impl Session {
         }
     }
 
+    /// A PPS edge at `tick`, after the GPS line was quiet for `rx_idle_ms`.
+    /// In plain mode ticks are ns of CLOCK_MONOTONIC_RAW.
+    pub fn on_pulse(&mut self, tick: u64, rx_idle_ms: u32, now: Ns, out: &mut Output) {
+        if let Some(l) = &mut self.labeler {
+            let mut decisions: Vec<PpsDecision> = vec![];
+            let mut tags = vec![];
+            l.on_pps(tick, rx_idle_ms, &mut decisions, &mut tags);
+            for d in decisions {
+                if d.accepted {
+                    self.last_accepted = Some(now);
+                }
+                let mut ev = serde_json::to_value(&d).expect("decision serializes");
+                ev["event"] = json!("gnss_pps");
+                out.events.push(ev);
+            }
+            for mut t in tags {
+                t.utc_ns -= self.cfg.sof_delay_ns;
+                out.tags.push(t);
+            }
+        }
+        self.update_lock(now, out);
+    }
+
     fn on_gps(&mut self, kind: Kind, f: &[u8], now: Ns, port: &mut dyn Port, out: &mut Output) {
         let msg = (kind == Kind::Ubx).then(|| ubx::split(f));
         if self.cfg.frames {
@@ -368,6 +388,7 @@ impl Session {
         }
         let mut tim_tp = false;
         let mut zda = false;
+        let mut leap_differs = None;
         if let Some(l) = &mut self.labeler {
             match (kind, msg) {
                 (Kind::Ubx, Some((ubx::TIM_TP, p))) => {
@@ -378,7 +399,9 @@ impl Session {
                 }
                 (Kind::Ubx, Some((ubx::NAV_TIMEGPS, p))) => {
                     if let Some(leap) = ubx::leap_seconds(p) {
-                        l.on_leap(leap);
+                        let cfg = self.cfg.leap_seconds;
+                        leap_differs = Some(leap.zip(cfg).filter(|(r, c)| r != c));
+                        l.on_leap(leap.or(cfg));
                     }
                 }
                 (Kind::Ubx, Some((ubx::NAV_STATUS, p))) => {
@@ -403,6 +426,15 @@ impl Session {
                 },
                 _ => {}
             }
+        }
+        match leap_differs {
+            Some(Some((r, c))) if !self.leap_warned => {
+                self.leap_warned = true;
+                let state = self.state;
+                self.status(state, Some(format!("receiver reports {r} leap seconds, the config says {c}")), out);
+            }
+            Some(None) => self.leap_warned = false,
+            _ => {}
         }
         self.rx_frame(kind, msg, tim_tp, zda, now, port, out);
     }
@@ -801,6 +833,8 @@ mod tests {
         /// false: NMEA without ZDA.
         zda_out: bool,
         fix: bool,
+        /// NAV-TIMEGPS leapSValid.
+        leap_valid: bool,
         ubx_out: bool,
         enabled: BTreeSet<ubx::Id>,
         to_host: Vec<u8>,
@@ -827,6 +861,9 @@ mod tests {
         /// CFG-MSG received, lost ones included.
         cfg_msgs: u32,
         now_ms: i64,
+        /// No board: pulses go to `pulses` (ms), no $PVDB in either direction.
+        plain: bool,
+        pulses: Vec<i64>,
     }
 
     impl Fake {
@@ -839,6 +876,7 @@ mod tests {
                 nmea_out: true,
                 zda_out: true,
                 fix: true,
+                leap_valid: true,
                 ubx_out: true,
                 enabled: BTreeSet::new(),
                 to_host: vec![],
@@ -858,6 +896,8 @@ mod tests {
                 nak: BTreeSet::new(),
                 cfg_msgs: 0,
                 now_ms: 0,
+                plain: false,
+                pulses: vec![],
             }
         }
 
@@ -983,8 +1023,8 @@ mod tests {
                             p[12..14].copy_from_slice(&(week as u16).to_le_bytes());
                         }
                         ubx::NAV_TIMEGPS => {
-                            p[10] = LEAP as u8;
-                            p[11] = 0x07;
+                            // An unknown count is the firmware default.
+                            (p[10], p[11]) = if self.leap_valid { (LEAP as u8, 0x07) } else { (15, 0x03) };
                         }
                         _ if self.fix => {
                             p[4] = 3;
@@ -995,7 +1035,9 @@ mod tests {
                     self.gps(&ubx::frame(id, &p));
                 }
             }
-            if r == 0 {
+            if r == 0 && self.plain {
+                self.pulses.push(ms);
+            } else if r == 0 {
                 self.to_host.extend(nmea::command(&format!("PPS,{},300", ms * 80_000 + 1000)));
             }
             if r == 100 && self.nmea_out {
@@ -1010,7 +1052,7 @@ mod tests {
                     self.gps(&nmea::sentence(&format!("GPZDA,{hms},21,09,2026,00,00")));
                 }
             }
-            if r % 100 == 50 {
+            if r % 100 == 50 && !self.plain {
                 self.to_host.extend(nmea::command(&format!("SOF,{},{}", ms * 80_000 + 1000, ms)));
             }
         }
@@ -1036,6 +1078,7 @@ mod tests {
             self.from_host.feed(data, |k, f| frames.push((k, f.to_vec())));
             for (k, f) in frames {
                 if f.starts_with(nmea::PVDB_PREFIX) {
+                    assert!(!self.plain, "board command to a plain receiver");
                     let fl = nmea::fields(&f);
                     if fl[2] == "INFO" && fl.len() > 3 {
                         self.to_host.extend(nmea::command(&format!("INFO,80000000,100,0,0,0,0,0,{}", fl[3])));
@@ -1084,6 +1127,9 @@ mod tests {
                 let now = self.ms * MS;
                 let bytes = std::mem::take(&mut self.fake.to_host);
                 self.session.on_bytes(&bytes, now, &mut self.fake, &mut self.out);
+                for p in std::mem::take(&mut self.fake.pulses) {
+                    self.session.on_pulse(p as u64 * 1_000_000 + 1000, 300, now, &mut self.out);
+                }
                 self.session.on_tick(now, &mut self.fake, &mut self.out);
             }
             self
@@ -1278,6 +1324,51 @@ mod tests {
         r.fake.ublox = true;
         r.for_secs(60);
         assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+    }
+
+    #[test]
+    fn configured_leap_seconds_fill_in_until_the_receiver_knows() {
+        let mut f = Fake::new(9600, false, true);
+        f.leap_valid = false;
+        let mut r = Run::new(f);
+        r.for_secs(20);
+        assert!(r.out.tags.is_empty());
+        assert!(r.out.events.iter().any(|e| e["reason"] == "no_leap_seconds"));
+
+        let mut f = Fake::new(9600, false, true);
+        f.leap_valid = false;
+        let mut r = Run::with(Config { leap_seconds: Some(LEAP as i8), ..Config::default() }, f);
+        r.for_secs(20);
+        assert!(r.session.locked);
+        r.check_tags(Source::TimTp);
+    }
+
+    #[test]
+    fn receiver_leap_seconds_win_over_the_config() {
+        let mut r = Run::with(Config { leap_seconds: Some(17), ..Config::default() }, Fake::new(9600, false, true));
+        r.for_secs(20);
+        r.check_tags(Source::TimTp);
+        let msg = format!("receiver reports {LEAP} leap seconds, the config says 17");
+        // Once, not at every NAV-TIMEGPS. The lock change repeats the message.
+        let warned: Vec<_> = r.out.events.iter().filter(|e| e["message"] == msg.as_str()).collect();
+        assert_eq!(warned.iter().filter(|e| e["locked"] == false).count(), 1, "{warned:?}");
+    }
+
+    #[test]
+    fn plain_receiver_labels_kernel_pulses() {
+        let mut f = Fake::new(9600, false, true);
+        f.plain = true;
+        let mut r = Run::with(Config { plain: true, ..Config::default() }, f);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.session.locked);
+        let accepted: Vec<&Value> = r.out.events.iter().filter(|e| e["event"] == "gnss_pps" && e["accepted"] == true).collect();
+        assert!(accepted.len() > 10, "{:?}", r.out.events);
+        for e in accepted {
+            let tick = e["tick"].as_i64().unwrap();
+            assert_eq!(e["utc_ns"].as_i64().unwrap(), UTC0_S * 1_000_000_000 + tick - 1000, "{e}");
+        }
+        assert!(r.out.tags.is_empty());
     }
 
     #[test]

@@ -115,6 +115,7 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
       "initial_baud": 9600,       // the receiver's rate before configuration (power-on)
       "configure": true,          // false: use the receiver as it is, at initial_baud
       "strict": false,            // true: never fall back to NMEA ZDA, keep retrying setup
+      "leap_seconds": null,       // GPS minus UTC (18 since 2017) until the receiver knows it
       "frames": true,             // publish every receiver frame
       "div": null,                // board SOF tag divider (board default)
       "sof_delay_ns": 0,          // bus frame start to the board's capture
@@ -123,6 +124,8 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
     },
     "boards": { "E072A1F9D198": { "chrony": null } },   // null switches chrony or firmware off
     "external": { "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 } },
+    // a receiver on a serial port with its PPS on /dev/pps, no board (below)
+    "receivers": { "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" } },
   },
 }
 ```
@@ -153,6 +156,7 @@ being silently ignored. A file given with `--config` must exist. Without
 | `gnss.attach` | `"all"` | Which sofgnss boards to use. `"all"` means every board with the sofgnss descriptors and `"none"` means none. A list of USB serials picks those boards, whatever their descriptors say. |
 | `gnss.defaults` | | Board options (below) for every board. |
 | `gnss.boards.<serial>` | | Board options for one board, by USB serial. Each option set here replaces the one from `defaults`. Options left out fall back to `defaults`, then to the built-in default. |
+| `gnss.receivers.<name>` | none | A receiver without a sofgnss board ([below](#receivers-without-a-board)). It needs `tty` and `pps` (device paths) and takes the board options except `div`, `sof_delay_ns` and `firmware`. Options left out fall back to `defaults`, and `{serial}` in `chrony` is replaced by the name. |
 | `gnss.external.<client>` | none | An MQTT client that may act as a GNSS reference ([below](#gnss-reference-from-an-mqtt-client)). It takes `chrony` (a socket path) and `sof_delay_ns` (as for boards). The client `*` allows every client not listed by name. |
 
 Board options:
@@ -162,6 +166,7 @@ Board options:
 | `baud` | 38400 | Rate sofd switches the receiver to. Keep it at 38400 or more for the diagnostics messages. It must be one of the standard rates (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600). |
 | `initial_baud` | 9600 | The receiver's rate before configuration, usually its power-on rate (38400 for u-blox M10/F9). sofd tries it right after `baud`, and if neither gives data it also searches the standard rates. It must be one of them too. |
 | `configure` | `true` | With `false` sofd leaves the receiver as it is and uses it at `initial_baud`. Pulses are then labelled from TIM-TP if the receiver sends it, and from NMEA ZDA otherwise. |
+| `leap_seconds` | none | GPS minus UTC in seconds, used for TIM-TP labels until the receiver reports a valid count. After a cold start that takes up to 12.5 min, and pulses are rejected (`no_leap_seconds`) until then. The receiver's count always wins, and a different one is reported in a status message. A wrong value puts every label off by whole seconds for that time, so only set it while the count is certain. |
 | `strict` | `false` | With `true` sofd never falls back to NMEA ZDA ([below](#receiver-setup)) and keeps retrying the setup until it works. Needs `configure`. |
 | `frames` | `true` | Publish every receiver frame on `gnss/<serial>/nmea\|ubx\|rtcm3/…`. Set it to `false` to save broker traffic. sofd still uses the frames itself. |
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
@@ -230,6 +235,7 @@ frames from these topics.
 | `gnss/<serial>/ubx/<class>/<id>` | | Raw UBX frame (binary, hex ids), e.g. `.../ubx/0d/01`. |
 | `gnss/<serial>/rtcm3/<type>` | | Raw RTCM3 frame, e.g. `.../rtcm3/1005`. |
 | `gnss/<serial>/tx` | by clients | Bytes for the receiver, written as they are. |
+| `gnss/<name>/…` | | The same topics for a [receiver without a board](#receivers-without-a-board), by its name. Its `pps` events also carry `t_realtime_ns`, the kernel's timestamp of the edge, and its events carry `receiver` instead of `board`. |
 | `cmd/list`, `cmd/lookup` | | Request and response. sofd replies to the MQTT 5 response topic, or to `reply_to` in the body for MQTT 3.1.1. `correlation` is echoed back. Replies are not retained. |
 
 sofd ignores retained messages on `ref`, `tx` and `cmd`, so one retained by
@@ -378,7 +384,7 @@ brings back the receiver's saved settings.
    Generation 9 and 10 (protocol ≥ 27, or MON-VER hardware 00190000/000A0000)
    get CFG-VALSET on the RAM layer. The time pulse stays on the receiver's own
    grid (GPS by default), and NAV-TIMEGPS gives the leap seconds for its
-   labels. The edge is the same second boundary on either grid.
+   labels, or `leap_seconds` until the receiver knows them. The edge is the same second boundary on either grid.
 4. Switch the port to the new baud and wait for TIM-TP, NAV-TIMEGPS or
    NAV-STATUS. TIM-TP only comes with a fix, so a receiver without one passes
    too and stays in `ubx` without `locked`.
@@ -471,7 +477,9 @@ accepted within the last 5 s.
 
 One board feeds one socket. With a default path and several boards, the first
 valid board owns the socket until it is gone or has been silent for 10 s, and
-the others get `chrony_busy`. Put `{serial}` in the path to get one source per
+the others get `chrony_busy`. A [receiver without a board](#receivers-without-a-board)
+on the same socket gives way at once to a board or MQTT reference with a valid
+reference, and gets the socket back once that has been gone or silent for 10 s. Put `{serial}` in the path to get one source per
 board. The leap flag is always 0, so give chrony `leapsectz right/UTC`.
 
 ```
@@ -505,6 +513,47 @@ residual was 44 ns rms, which is the board's SOF capture.
 against an NTP-disciplined clock. Single chrony samples scatter by the
 host-side bracket, about 165 ns rms with turbo and 440 ns without. That
 scatter is white, so chrony's filter averages it down.
+
+### Receivers without a board
+
+sofd can also run a receiver that is wired to a serial port, with its PPS on
+a Linux PPS device, for example `dtoverlay=pps-gpio` on a Raspberry Pi. That
+replaces gpsd on hosts that only need their clock disciplined. The receiver is
+set up as above (baud search, UBX configuration, `strict`, `leap_seconds`),
+its pulses are labelled the same way and must be accepted the same way, and
+its status, pulses and frames go to MQTT under `gnss/<name>/`.
+
+```jsonc
+"gnss": {
+  "receivers": {
+    "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" }
+  }
+}
+```
+
+Each accepted pulse goes to chrony as one sample: the kernel's CLOCK_REALTIME
+timestamp of the edge and its UTC label, with qErr applied. A board sharing the
+socket takes precedence while its reference is valid, because its SOF timing
+has no interrupt latency ([chrony](#chrony)).
+
+```
+refclock SOCK /run/chrony.ttyS0.sock refid GPS precision 1e-6
+```
+
+The kernel takes the timestamp in its interrupt handler, so its interrupt
+latency sets the precision, not sofd. sofd reads the edge with a
+non-blocking `PPS_FETCH` every time it polls the serial port (every 20 ms at
+most), and only the assert edge is used. Without a board nobody measures how
+long the serial line was quiet before an edge, so sofd estimates it from when
+it read the bytes. Bytes read within 10 ms after an edge may have arrived
+before it, and that pulse counts as `line_busy`. That is rare: the LEA-5T's
+line was quiet for about 700 ms before each pulse. Receivers have no controller,
+so they are never a controller's GNSS reference. Their samples just steer the
+clock, and `model_realtime` follows it.
+
+The serial port must be free: turn off a serial console or getty on it, and
+stop gpsd. sofd opens the port exclusively and retries with a backoff when it
+cannot.
 
 ### GNSS reference from an MQTT client
 

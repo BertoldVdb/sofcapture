@@ -322,11 +322,11 @@ a `NOISE` burst lasts 3.64 ms and its nulls sit at multiples of 72 MHz (144,
 harmonics at 36, 108, 180 … MHz) and `SQ2` a 3.6 MHz one (odd harmonics every
 7.2 MHz, for example 154.8 and 162 MHz). `SQ40` answers `ERR,NOCAL`.
 
-| Signal | Pin | Nucleo |
-|---|---|---|
-| Burst output | PA7 (SPI1_MOSI) | D11 |
-| Start marker, low during the burst | PA4 (SPI1_NSS) | A2 |
-| Start capture (TIM2_CH3) | PA9 | D8 |
+| Signal | Pin |
+|---|---|
+| Burst output | PA7 (SPI1_MOSI) |
+| Start marker, low during the burst | PA4 (SPI1_NSS) |
+| Start capture (TIM2_CH3) | PA9 |
 
 Wire PA4 to PA9. The marker falls as the SPI starts with its FIFO already
 filled by DMA, and TIM2 captures that edge, so the `CAL` tick is exact to one
@@ -454,17 +454,19 @@ drops the pair if another SOF arrived meanwhile (counted in INFO's
 `<sof_missed>`). Every SOF is captured, and the divider and dither then pick
 the tagged frames as on the ESP32-S3.
 
-Pins (NUCLEO-G474RE, set in `stm32g4/include/port.h`). The GPS UART is on
-PB10/PB11, which every G474 package has:
+The target is the WeAct STM32G474 core board (STM32G474CEU6, 8 MHz crystal,
+USB-C). Its headers are labelled with the pin names. The pins are set in
+`stm32g4/include/port.h`, and the GPS UART is on PB10/PB11, which every G474
+package has:
 
-| Signal              | Pin  | Nucleo      | Function    |
-|---------------------|------|-------------|-------------|
-| GPS TX ← board      | PB10 | D6          | USART3_TX   |
-| GPS RX → board      | PB11 | CN10 pin 18 | USART3_RX   |
-| PPS in              | PA1  | A1          | TIM2_CH2    |
-| Status LED          | PA5  | LD2         |             |
-| Debug console TX    | PA2  | ST-LINK VCP | LPUART1, 115200 |
-| USB D− / D+         | PA11 / PA12 | CN10 | USB      |
+| Signal              | Pin  | Function    |
+|---------------------|------|-------------|
+| GPS TX ← board      | PB10 | USART3_TX   |
+| GPS RX → board      | PB11 | USART3_RX   |
+| PPS in              | PA1  | TIM2_CH2, rising edge |
+| Status LED          | PC6  | the board's LED |
+| Debug console TX    | PA2  | LPUART1, 115200, to a 3.3 V USB serial adapter |
+| USB D− / D+         | PA11 / PA12 | USB-C |
 
 The core clock comes from HSE through the PLL. At boot the firmware measures
 HSE against HSI16 (HSE/32 into TIM17) and accepts an 8, 12 or 24 MHz external
@@ -483,8 +485,13 @@ HSI48 trimmed by the CRS, so SOF captures are unreliable. USB runs from HSI48, t
 ```sh
 cmake -S stm32g4 -B stm32g4/build          # fetches TinyUSB and CMSIS
 cmake --build stm32g4/build                # stm32g4/build/sofgnss.bin
-cmake --build stm32g4/build --target flash # over ST-LINK (OpenOCD)
+cmake --build stm32g4/build --target dfu   # over USB (dfu-util)
+cmake --build stm32g4/build --target flash # or over ST-LINK (OpenOCD)
 ```
+
+For DFU, hold BOOT0, press and release NRST, then release BOOT0. The chip's
+ROM bootloader then shows up as `0483:df11`, and the app starts after the
+download.
 
 There is no OTA yet (a bootloader will do it later): `OTA` answers
 `ERR,OTABEGIN`, and sofd doesn't send ESP32 images to boards whose VER reports

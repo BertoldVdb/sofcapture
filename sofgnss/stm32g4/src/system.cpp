@@ -6,6 +6,7 @@
 
 #include "port.h"
 #include "sofgnss/hal.h"
+#include "sofgnss_version.h"
 
 namespace {
 

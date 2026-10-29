@@ -7,6 +7,7 @@ pub mod firmware;
 pub mod framer;
 pub mod join;
 pub mod nmea;
+pub mod pps;
 pub mod session;
 pub mod timing;
 pub mod ubx;

@@ -27,9 +27,14 @@
       "initial_baud": 9600,              // receiver's power-on baud, e.g. 38400 for u-blox M10/F9
       // "chrony": "/run/chrony.sofgnss.sock",       // use {serial} for one socket per board
       // "firmware": "/var/lib/sofd/sofgnss.bin",
+      // "leap_seconds": 18,             // GPS minus UTC until the receiver knows it (up to 12.5 min after a cold start)
     },
     "boards": {
       // "E072A1F9D198": { "sof_delay_ns": 0 },
+    },
+    // Receivers on a serial port with their PPS on /dev/pps, no board (README)
+    "receivers": {
+      // "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" },
     },
     // MQTT clients allowed to act as GNSS reference (see MQTT-GUIDE.md)
     "external": {

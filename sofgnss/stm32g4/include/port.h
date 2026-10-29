@@ -19,20 +19,20 @@ constexpr uint32_t kPrioUart = 1;
 constexpr uint32_t kPrioUsb = 2;
 constexpr uint32_t kPrioSysTick = 3;
 
-// ---- Pins (NUCLEO-G474RE) ---------------------------------------------------
+// ---- Pins (WeAct STM32G474 core board) --------------------------------------
 struct Pin {
   GPIO_TypeDef* port;
   uint8_t pin;
   uint8_t af;
 };
-constexpr Pin kGpsTx{GPIOB, 10, 7};     // USART3_TX, Arduino D6
-constexpr Pin kGpsRx{GPIOB, 11, 7};     // USART3_RX, CN10 pin 18
-constexpr Pin kPps{GPIOA, 1, 1};        // TIM2_CH2, Arduino A1
-constexpr Pin kConsoleTx{GPIOA, 2, 12}; // LPUART1_TX, ST-LINK virtual COM port
-constexpr Pin kLed{GPIOA, 5, 0};        // LD2, active high
-constexpr Pin kCalOut{GPIOA, 7, 5};     // SPI1_MOSI, Arduino D11
-constexpr Pin kCalMarker{GPIOA, 4, 5};  // SPI1_NSS, Arduino A2, wired to kCalCapture
-constexpr Pin kCalCapture{GPIOA, 9, 10};  // TIM2_CH3, Arduino D8
+constexpr Pin kGpsTx{GPIOB, 10, 7};     // USART3_TX
+constexpr Pin kGpsRx{GPIOB, 11, 7};     // USART3_RX
+constexpr Pin kPps{GPIOA, 1, 1};        // TIM2_CH2
+constexpr Pin kConsoleTx{GPIOA, 2, 12}; // LPUART1_TX
+constexpr Pin kLed{GPIOC, 6, 0};        // the board's LED, active high
+constexpr Pin kCalOut{GPIOA, 7, 5};     // SPI1_MOSI
+constexpr Pin kCalMarker{GPIOA, 4, 5};  // SPI1_NSS, wired to kCalCapture
+constexpr Pin kCalCapture{GPIOA, 9, 10};  // TIM2_CH3
 
 enum class Pull : uint8_t { None = 0, Up = 1, Down = 2 };
 void pin_af(const Pin& p, Pull pull = Pull::None);
@@ -67,7 +67,7 @@ bool usb_isr_active();            // inside the USB interrupt handler
 // arriving or bytes came since the line last went idle. TIM2 ISR only.
 uint32_t gps_line_idle_ms(uint64_t now_us);
 
-// Debug console on the ST-LINK virtual COM port (115200 8N1). Blocking.
+// Debug console on PA2 (115200 8N1). Blocking.
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Busy wait that keeps the watchdog fed.

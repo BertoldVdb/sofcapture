@@ -78,6 +78,39 @@ pub struct Gnss {
     pub boards: BTreeMap<String, BoardOptions>,
     /// MQTT clients allowed to act as GNSS reference, by client name. `*` allows any other.
     pub external: BTreeMap<String, External>,
+    /// Receivers on a serial port with their pulses on /dev/pps, by name.
+    pub receivers: BTreeMap<String, Receiver>,
+}
+
+/// A receiver without a sofgnss board. Unset options fall back to `gnss.defaults`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Receiver {
+    pub tty: String,
+    pub pps: String,
+    pub baud: Option<u32>,
+    pub initial_baud: Option<u32>,
+    pub configure: Option<bool>,
+    pub strict: Option<bool>,
+    pub leap_seconds: Option<i8>,
+    pub frames: Option<bool>,
+    #[serde(deserialize_with = "nullable")]
+    pub chrony: Option<Option<String>>,
+}
+
+impl Receiver {
+    fn options(&self) -> BoardOptions {
+        BoardOptions {
+            baud: self.baud,
+            initial_baud: self.initial_baud,
+            configure: self.configure,
+            strict: self.strict,
+            leap_seconds: self.leap_seconds,
+            frames: self.frames,
+            chrony: self.chrony.clone(),
+            ..BoardOptions::default()
+        }
+    }
 }
 
 /// An MQTT client that may publish SOF tags (`controllers/<id>/ref/<client>`).
@@ -134,6 +167,7 @@ pub struct BoardOptions {
     pub initial_baud: Option<u32>,
     pub configure: Option<bool>,
     pub strict: Option<bool>,
+    pub leap_seconds: Option<i8>,
     pub frames: Option<bool>,
     pub div: Option<u32>,
     pub sof_delay_ns: Option<i64>,
@@ -157,6 +191,8 @@ pub struct Board {
     pub configure: bool,
     /// Never fall back to NMEA ZDA, keep retrying the setup.
     pub strict: bool,
+    /// GPS minus UTC until the receiver knows it.
+    pub leap_seconds: Option<i8>,
     pub frames: bool,
     pub div: Option<u32>,
     pub sof_delay_ns: i64,
@@ -167,12 +203,23 @@ pub struct Board {
 
 impl Gnss {
     pub fn board(&self, serial: &str) -> Board {
-        let (d, b) = (&self.defaults, self.boards.get(serial).cloned().unwrap_or_default());
+        self.merge(serial, self.boards.get(serial).cloned().unwrap_or_default())
+    }
+
+    /// Board-only options (`div`, `sof_delay_ns`, `firmware`) don't apply.
+    pub fn receiver(&self, name: &str) -> Board {
+        let b = self.merge(name, self.receivers.get(name).map(Receiver::options).unwrap_or_default());
+        Board { div: None, sof_delay_ns: 0, firmware: None, ..b }
+    }
+
+    fn merge(&self, serial: &str, b: BoardOptions) -> Board {
+        let d = &self.defaults;
         Board {
             baud: b.baud.or(d.baud).unwrap_or(38_400),
             initial_baud: b.initial_baud.or(d.initial_baud).unwrap_or(9600),
             configure: b.configure.or(d.configure).unwrap_or(true),
             strict: b.strict.or(d.strict).unwrap_or(false),
+            leap_seconds: b.leap_seconds.or(d.leap_seconds),
             frames: b.frames.or(d.frames).unwrap_or(true),
             div: b.div.or(d.div),
             sof_delay_ns: b.sof_delay_ns.or(d.sof_delay_ns).unwrap_or(0),
@@ -225,12 +272,27 @@ impl Config {
         if s.rt_prio.is_some_and(|p| !(1..=99).contains(&p)) {
             anyhow::bail!("sampler.rt_prio must be within 1..=99");
         }
-        let boards = self.gnss.boards.iter().map(|(k, b)| (format!("gnss.boards.{k}"), b)).chain([("gnss.defaults".to_string(), &self.gnss.defaults)]);
-        for (what, b) in boards {
-            let serial = what.strip_prefix("gnss.boards.").unwrap_or("");
-            let merged = self.gnss.board(serial);
+        for (name, r) in &self.gnss.receivers {
+            if name.is_empty() || name.contains(['/', '+', '#']) {
+                anyhow::bail!("gnss.receivers: name {name:?} must be non-empty, without '/' or wildcards");
+            }
+            if self.gnss.boards.contains_key(name) {
+                anyhow::bail!("gnss.receivers.{name}: also a board in gnss.boards");
+            }
+            if r.tty.is_empty() || r.pps.is_empty() {
+                anyhow::bail!("gnss.receivers.{name}: needs tty and pps");
+            }
+        }
+        let receivers = self.gnss.receivers.iter().map(|(k, r)| (format!("gnss.receivers.{k}"), r.options(), self.gnss.receiver(k)));
+        let boards = (self.gnss.boards.iter().map(|(k, b)| (format!("gnss.boards.{k}"), b.clone(), self.gnss.board(k))))
+            .chain([("gnss.defaults".to_string(), self.gnss.defaults.clone(), self.gnss.board(""))])
+            .chain(receivers);
+        for (what, b, merged) in boards {
             if merged.strict && !merged.configure {
                 anyhow::bail!("{what}: strict needs configure");
+            }
+            if b.leap_seconds.is_some_and(|l| !(0..=60).contains(&l)) {
+                anyhow::bail!("{what}.leap_seconds must be within 0..=60");
             }
             if b.div.is_some_and(|d| !(1..=1_000_000).contains(&d)) {
                 anyhow::bail!("{what}.div must be within 1..=1000000");
@@ -343,6 +405,14 @@ mod tests {
         assert_eq!(c.gnss.external["app"].chrony.as_deref(), Some(Path::new("/run/c.sock")));
         assert_eq!((c.gnss.external["app"].sof_delay_ns, c.gnss.external["other"].chrony.is_none()), (40, true));
         assert!(c.gnss.external("sdrrx").is_none());
+        let c = Config::parse(
+            r#"{"gnss":{"defaults":{"chrony":"/run/c.{serial}.sock","div":10,"baud":115200},
+                "receivers":{"ttyS0":{"tty":"/dev/ttyS0","pps":"/dev/pps0","initial_baud":38400}}}}"#,
+        )
+        .unwrap();
+        let r = c.gnss.receiver("ttyS0");
+        assert_eq!((r.baud, r.initial_baud, r.div, r.chrony.as_deref()), (115_200, 38_400, None, Some(Path::new("/run/c.ttyS0.sock"))));
+        assert_eq!(c.gnss.receivers["ttyS0"].pps, "/dev/pps0");
         let c = Config::parse(r#"{"gnss":{"external":{"*":{"sof_delay_ns":5},"app":{}}}}"#).unwrap();
         assert_eq!((c.gnss.external("sdrrx").unwrap().sof_delay_ns, c.gnss.external("app").unwrap().sof_delay_ns), (5, 0));
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
@@ -355,6 +425,12 @@ mod tests {
             r#"{"sampler":{"window":2}}"#,
             r#"{"sampler":{"gnss_window_s":0.5}}"#,
             r#"{"gnss":{"defaults":{"strict":true,"configure":false}}}"#,
+            r#"{"gnss":{"defaults":{"leap_seconds":-1}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0"}}}}"#,
+            r#"{"gnss":{"receivers":{"a/b":{"tty":"/dev/ttyS0","pps":"/dev/pps0"}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","div":5}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","baud":1234}}}}"#,
+            r#"{"gnss":{"boards":{"a":{}},"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0"}}}}"#,
             r#"{"gnss":{"defaults":{"strict":true},"boards":{"A":{"configure":false}}}}"#,
             r#"{"sampler":{"cpu":5000}}"#,
             r#"{"sampler":{"rt_prio":0}}"#,

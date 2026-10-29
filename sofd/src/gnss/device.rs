@@ -1,16 +1,20 @@
 //! The tty of a sofgnss board and the thread that runs its session.
 
+use super::pps::Pps;
 use super::session::{Config, Output, Port, Session};
+use super::timing::MIN_IDLE_MS;
 use super::{Feed, Hub};
-use crate::clock;
+use crate::clock::{self, Ns};
 use crate::daemon::{BoardOut, Msg};
 use anyhow::{Context, Result};
 use log::info;
+use serde_json::json;
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -166,27 +170,14 @@ pub struct BoardInfo {
     pub port: String,
 }
 
-/// Dropping it stops the thread and closes the tty.
-pub struct Board {
-    pub info: BoardInfo,
-    /// Unique per session, so late messages from an old one can be ignored.
-    pub id: u64,
-    /// Its SOF tags. The daemon puts it in the hub while the board is its
-    /// controller's GNSS reference.
-    pub feed: Arc<Feed>,
+/// A session thread. Dropping it stops the thread and closes the tty.
+struct Worker {
     stop: Arc<AtomicBool>,
     tx: Sender<Vec<u8>>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl Board {
-    /// Written as is; the device only forwards whole frames.
-    pub fn send(&self, data: Vec<u8>) {
-        let _ = self.tx.send(data);
-    }
-}
-
-impl Drop for Board {
+impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
@@ -195,76 +186,176 @@ impl Drop for Board {
     }
 }
 
+pub struct Board {
+    pub info: BoardInfo,
+    /// Unique per session, so late messages from an old one can be ignored.
+    pub id: u64,
+    /// Its SOF tags. The daemon puts it in the hub while the board is its
+    /// controller's GNSS reference.
+    pub feed: Arc<Feed>,
+    worker: Worker,
+}
+
+impl Board {
+    /// Written as is; the device only forwards whole frames.
+    pub fn send(&self, data: Vec<u8>) {
+        let _ = self.worker.tx.send(data);
+    }
+}
+
+/// A receiver on a serial port, with its pulses on a /dev/pps device.
+pub struct Receiver {
+    pub id: u64,
+    worker: Worker,
+}
+
+impl Receiver {
+    pub fn send(&self, data: Vec<u8>) {
+        let _ = self.worker.tx.send(data);
+    }
+}
+
+/// What a session thread needs besides its session.
+struct Io {
+    name: String,
+    id: u64,
+    tty: Tty,
+    pps: Option<Pps>,
+    /// Board sessions: their SOF tags.
+    feed: Option<Arc<Feed>>,
+}
+
+fn start(io: Io, cfg: Config, out: &Sender<Msg>, done: impl FnOnce() + Send + 'static) -> Result<Worker> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (s, o) = (stop.clone(), out.clone());
+    let thread = std::thread::Builder::new().name(format!("gnss-{}", io.name)).spawn(move || {
+        let (name, id) = (io.name.clone(), io.id);
+        // Clean up even on panic, or the board is never reopened.
+        let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(io, cfg, &rx, &o, &s)))
+            .unwrap_or_else(|_| Some("board session panicked".into()));
+        done();
+        if let Some(r) = reason {
+            let _ = o.send(Msg::Board { serial: name, id, out: BoardOut::Ended(r) });
+        }
+    });
+    Ok(Worker { stop, tx, thread: Some(thread.context("starting board thread")?) })
+}
+
 /// SOF tags go to `Board::feed`, everything else to `out`. The session takes
 /// its feed out of `hub` when it ends.
 pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Result<Board> {
     let tty = Tty::open(&info.tty, cfg.initial_baud).with_context(|| format!("opening {}", info.tty))?;
     let feed = Arc::new(Feed::new(info.serial.clone()));
-    let stop = Arc::new(AtomicBool::new(false));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = mpsc::channel();
-    let (s, h, o, i, fd) = (stop.clone(), hub.clone(), out.clone(), info.clone(), feed.clone());
-    let thread = std::thread::Builder::new().name(format!("gnss-{}", info.serial)).spawn(move || {
-        // Clean up even on panic, or the board is never reopened.
-        let reason = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(tty, &i, id, cfg, &fd, &rx, &o, &s)))
-            .unwrap_or_else(|_| Some("board session panicked".into()));
+    let (h, c, fd) = (hub.clone(), info.controller.clone(), feed.clone());
+    let io = Io { name: info.serial.clone(), id, tty, pps: None, feed: Some(feed.clone()) };
+    let worker = start(io, cfg, out, move || {
         let mut hub = h.lock().unwrap();
-        if hub.get(&i.controller).is_some_and(|f| Arc::ptr_eq(f, &fd)) {
-            hub.remove(&i.controller);
+        if hub.get(&c).is_some_and(|f| Arc::ptr_eq(f, &fd)) {
+            hub.remove(&c);
         }
-        drop(hub);
-        if let Some(r) = reason {
-            let _ = o.send(Msg::Board { serial: i.serial.clone(), id, out: BoardOut::Ended(r) });
-        }
-    });
-    let thread = thread.context("starting board thread")?;
+    })?;
     info!("{}: board on {} ({}), controller {}", info.serial, info.tty, info.port, info.controller);
-    Ok(Board { info, id, feed, stop, tx, thread: Some(thread) })
+    Ok(Board { info, id, feed, worker })
+}
+
+pub fn spawn_receiver(name: &str, tty: &str, pps: &str, cfg: Config, out: &Sender<Msg>) -> Result<Receiver> {
+    let t = Tty::open(tty, cfg.initial_baud).with_context(|| format!("opening {tty}"))?;
+    let p = Pps::open(pps).with_context(|| format!("opening {pps}"))?;
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let io = Io { name: name.into(), id, tty: t, pps: Some(p), feed: None };
+    let worker = start(io, Config { plain: true, ..cfg }, out, || {})?;
+    info!("{name}: receiver on {tty}, pulses from {pps}");
+    Ok(Receiver { id, worker })
+}
+
+/// Bytes read this soon after a pulse may have arrived before it.
+const PULSE_GUARD_NS: Ns = MIN_IDLE_MS as Ns * 1_000_000;
+
+/// Orders kernel PPS edges against the bytes read from the receiver.
+struct Pulses {
+    /// CLOCK_REALTIME of the last read that returned bytes.
+    last_rx: Ns,
+    /// Recent pulses: raw tick and CLOCK_REALTIME.
+    recent: VecDeque<(u64, Ns)>,
+}
+
+impl Pulses {
+    /// Raw tick and line idle time of a pulse at realtime `t`, given whether
+    /// the bytes of this read are already counted.
+    fn pulse(&mut self, t: Ns, read_at: Ns, bytes_before: bool, n: usize) -> (u64, u32) {
+        let idle = if !bytes_before && n > 0 && read_at - t < PULSE_GUARD_NS { 0 } else { t - self.last_rx };
+        let tick = (t - clock::offset_from_raw(clock::realtime)) as u64;
+        if self.recent.len() == 4 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((tick, t));
+        (tick, (idle.max(0) / 1_000_000).min(u32::MAX as Ns) as u32)
+    }
+
+    fn realtime_of(&self, tick: u64) -> Option<Ns> {
+        self.recent.iter().find(|p| p.0 == tick).map(|p| p.1)
+    }
 }
 
 /// Runs the session until stopped (None) or the device fails (Some(reason)).
-#[allow(clippy::too_many_arguments)]
-fn run(
-    mut tty: Tty,
-    info: &BoardInfo,
-    id: u64,
-    cfg: Config,
-    feed: &Feed,
-    tx: &Receiver<Vec<u8>>,
-    out: &Sender<Msg>,
-    stop: &AtomicBool,
-) -> Option<String> {
+fn run(mut io: Io, cfg: Config, tx: &mpsc::Receiver<Vec<u8>>, out: &Sender<Msg>, stop: &AtomicBool) -> Option<String> {
     let now = clock::raw();
     let nonce = format!("sofd{:08x}", (now as u64 ^ std::process::id() as u64) as u32);
     let mut session = Session::new(cfg, nonce, now);
     let mut buf = [0u8; 4096];
     let mut o = Output::default();
-    let send = |m: BoardOut| out.send(Msg::Board { serial: info.serial.clone(), id, out: m }).is_ok();
+    let mut pulses = Pulses { last_rx: clock::realtime(), recent: VecDeque::new() };
+    let send = |m: BoardOut| out.send(Msg::Board { serial: io.name.clone(), id: io.id, out: m }).is_ok();
     while !stop.load(Ordering::Relaxed) {
-        let n = match tty.read(&mut buf, POLL_MS) {
+        let n = match io.tty.read(&mut buf, POLL_MS) {
             Ok(n) => n,
             Err(e) => return Some(e.to_string()),
         };
-        let now = clock::raw();
+        let (now, read_at) = (clock::raw(), clock::realtime());
+        let edge = match io.pps.as_mut().map(|p| p.fetch()) {
+            Some(Err(e)) => return Some(format!("PPS: {e}")),
+            Some(Ok(t)) => t,
+            None => None,
+        };
+        // An edge after this read: its bytes came first.
+        let bytes_first = edge.is_none_or(|t| t >= read_at);
+        if bytes_first && n > 0 {
+            session.on_bytes(&buf[..n], now, &mut io.tty, &mut o);
+        }
+        if let Some(t) = edge {
+            let (tick, idle) = pulses.pulse(t, read_at, bytes_first, n);
+            session.on_pulse(tick, idle, now, &mut o);
+        }
+        if !bytes_first && n > 0 {
+            session.on_bytes(&buf[..n], now, &mut io.tty, &mut o);
+        }
         if n > 0 {
-            session.on_bytes(&buf[..n], now, &mut tty, &mut o);
+            pulses.last_rx = read_at;
         }
         while let Ok(data) = tx.try_recv() {
             if session.accepts_tx() {
-                tty.write(&data);
+                io.tty.write(&data);
             }
         }
-        session.on_tick(now, &mut tty, &mut o);
+        session.on_tick(now, &mut io.tty, &mut o);
         for t in o.tags.drain(..) {
-            feed.push(t);
+            if let Some(f) = &io.feed {
+                f.push(t);
+            }
         }
-        for ev in o.events.drain(..) {
+        for mut ev in o.events.drain(..) {
             let m = if ev["event"] == "gnss_status" {
                 let lock = if ev["locked"] == true { " locked" } else { "" };
                 let msg = ev.get("message").map_or(String::new(), |m| format!(" {m}"));
-                info!("{}: {}{lock}{msg}", info.serial, ev["state"]);
+                info!("{}: {}{lock}{msg}", io.name, ev["state"]);
                 BoardOut::Status(ev)
             } else {
+                if io.pps.is_some() {
+                    let t = ev["tick"].as_u64().and_then(|t| pulses.realtime_of(t));
+                    ev["t_realtime_ns"] = json!(t);
+                }
                 BoardOut::Pps(ev)
             };
             if !send(m) {
@@ -283,4 +374,23 @@ fn run(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pulse_idle_time() {
+        let ms = 1_000_000;
+        let mut p = Pulses { last_rx: 1000 * ms, recent: VecDeque::new() };
+        // Edge after the read: idle since the last bytes.
+        assert_eq!(p.pulse(1700 * ms, 1690 * ms, true, 0).1, 700);
+        // Bytes read just after the edge may have come before it.
+        assert_eq!(p.pulse(2700 * ms, 2705 * ms, false, 20).1, 0);
+        // Read well after the edge: the bytes came later.
+        let (tick, idle) = p.pulse(3700 * ms, 3750 * ms, false, 20);
+        assert_eq!(idle, 2700);
+        assert_eq!(p.realtime_of(tick), Some(3700 * ms));
+    }
 }

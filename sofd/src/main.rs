@@ -165,6 +165,7 @@ fn main() -> Result<()> {
                 Some(spec) => Attach::Serials(vec![daemon::board_serial(spec, controller, cli.simulate)?]),
                 None => Attach::None,
             };
+            cfg.gnss.receivers.clear();
             lock_memory(cfg.sampler.rt_prio);
             install_signal_handlers();
             let (tx, rx) = std::sync::mpsc::channel();

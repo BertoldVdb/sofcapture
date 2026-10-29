@@ -1,5 +1,6 @@
 # STM32G474 firmware (bare metal, TinyUSB).
 #   cmake -S stm32g4 -B stm32g4/build && cmake --build stm32g4/build
+#   cmake --build stm32g4/build --target dfu       # over USB, board in DFU mode
 #   cmake --build stm32g4/build --target flash     # over ST-LINK
 cmake_minimum_required(VERSION 3.16)
 set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/arm-none-eabi.cmake)
@@ -30,9 +31,12 @@ endforeach()
 set(CORE ${CMAKE_CURRENT_SOURCE_DIR}/../core)
 set(TUSB ${tinyusb_SOURCE_DIR}/src)
 
-execute_process(COMMAND git describe --always --tags --dirty
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE SOFGNSS_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE)
+# At every build, not just at configure time.
+set(VERSION_H ${CMAKE_CURRENT_BINARY_DIR}/sofgnss_version.h)
+add_custom_target(sofgnss_version
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${VERSION_H}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/version.cmake
+    BYPRODUCTS ${VERSION_H})
 
 add_executable(sofgnss.elf
     src/cal.cpp
@@ -56,15 +60,16 @@ add_executable(sofgnss.elf
     ${TUSB}/portable/st/stm32_fsdev/dcd_stm32_fsdev.c
     ${cmsis_device_g4_SOURCE_DIR}/Source/Templates/gcc/startup_stm32g474xx.s
 )
+add_dependencies(sofgnss.elf sofgnss_version)
 target_include_directories(sofgnss.elf PRIVATE
     include
+    ${CMAKE_CURRENT_BINARY_DIR}
     ${CORE}/include
     ${TUSB}
     ${cmsis_device_g4_SOURCE_DIR}/Include
     ${cmsis_SOURCE_DIR}/CMSIS/Core/Include)
 target_compile_definitions(sofgnss.elf PRIVATE
-    STM32G474xx
-    SOFGNSS_VERSION="${SOFGNSS_VERSION}")
+    STM32G474xx)
 
 set(CPU -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard)
 target_compile_options(sofgnss.elf PRIVATE
@@ -82,6 +87,13 @@ add_custom_command(TARGET sofgnss.elf POST_BUILD
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/app_desc.py sofgnss.elf sofgnss.bin
     COMMAND ${CMAKE_SIZE} sofgnss.elf
     BYPRODUCTS sofgnss.bin)
+
+# dfu-util fails the status request after :leave because the chip has already
+# started the app, so a completed download counts as success.
+add_custom_target(dfu
+    COMMAND sh -c "dfu-util -a 0 -s 0x08000000:leave -D sofgnss.bin 2>&1 | tee /dev/stderr | grep -q 'File downloaded successfully'"
+    DEPENDS sofgnss.elf
+    USES_TERMINAL)
 
 add_custom_target(flash
     COMMAND openocd -f interface/stlink.cfg -f target/stm32g4x.cfg
