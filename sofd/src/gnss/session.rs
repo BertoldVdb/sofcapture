@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 const MS: Ns = 1_000_000;
 const PING_EVERY: Ns = 10_000 * MS;
+/// VER platform of the STM32 bootloader.
+pub const BOOTLOADER: &str = "stm32g4-boot";
 const HANDSHAKE_RETRY: Ns = 1_000 * MS;
 const HANDSHAKE_WARN: Ns = 5_000 * MS;
 /// Frames this soon after a baud change may be from before it.
@@ -106,8 +108,11 @@ pub struct Output {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceFirmware {
     pub version: String,
-    /// The ESP-IDF version on ESP32 boards, "stm32g4" on STM32 boards.
+    /// The ESP-IDF version on ESP32 boards, "stm32g4" on STM32 boards, "stm32g4-boot"
+    /// in the STM32 bootloader.
     pub platform: String,
+    /// The OTA slot on ESP32 boards. In the bootloader the app's state: valid, invalid or empty.
+    pub partition: String,
     pub elf_sha256: String,
     pub reset_reason: String,
 }
@@ -295,7 +300,7 @@ impl Session {
         }
     }
 
-    /// Firmware written; the device is about to restart.
+    /// Firmware written, or START or BOOT sent: the device is about to restart.
     pub fn restarting(&self) -> bool {
         matches!(self.rx, Rx::OtaDone { .. })
     }
@@ -351,10 +356,11 @@ impl Session {
                 }
             }
             _ if !self.ready => {}
-            Pvdb::Ver { version, platform, elf_sha256, reset_reason } => {
+            Pvdb::Ver { version, platform, partition, elf_sha256, reset_reason } => {
                 self.firmware = Some(DeviceFirmware {
                     version: version.into(),
                     platform: platform.into(),
+                    partition: partition.into(),
                     elf_sha256: elf_sha256.into(),
                     reset_reason: reset_reason.into(),
                 });
@@ -362,7 +368,7 @@ impl Session {
                     self.after_version(now, port, out);
                 }
             }
-            Pvdb::Ota(m) => self.on_ota(m, now, out),
+            Pvdb::Ota(m) => self.on_ota(m, now, port, out),
             Pvdb::Err(code) if code.starts_with("OTA") && matches!(self.rx, Rx::OtaStart { .. } | Rx::OtaSend { .. }) => {
                 self.ota_failed(&format!("device error {code}"), now, port, out);
             }
@@ -376,6 +382,10 @@ impl Session {
                 if let Some(l) = &mut self.labeler {
                     l.on_sof(tick, frame, now);
                 }
+            }
+            Pvdb::Err(code @ ("NOAPP" | "BADAPP")) if matches!(self.rx, Rx::OtaDone { .. }) => {
+                self.rx = Rx::Idle;
+                self.status("no_app", Some(format!("bootloader did not start the app ({code})")), out);
             }
             Pvdb::Err(code) => {
                 let state = self.state;
@@ -468,20 +478,40 @@ impl Session {
 
     /// Called on VER, or after giving up on it.
     fn after_version(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
-        let running = self.firmware.as_ref().map(|f| f.elf_sha256.clone());
-        if let Some(img) = self.cfg.firmware.clone() {
-            // Images are ESP-IDF apps. STM32 boards are flashed over SWD for now.
-            let stm32 = self.firmware.as_ref().filter(|f| f.platform.starts_with("stm32"));
-            if let Some(f) = stm32 {
-                let why = format!("firmware is an ESP32 image, the board is {}", f.platform);
-                self.status("update_failed", Some(why), out);
-            } else if running.as_ref().is_some_and(|r| *r != img.elf_sha256) {
+        let fw = self.firmware.clone();
+        let boot = fw.as_ref().is_some_and(|f| f.platform == BOOTLOADER);
+        // The STM32 bootloader starts the app only when asked. It checks the app again first.
+        let start = boot && fw.as_ref().is_some_and(|f| f.partition == "valid");
+        if let (Some(img), Some(f)) = (self.cfg.firmware.clone(), &fw) {
+            let stm32 = f.platform.starts_with("stm32");
+            let app_differs = f.elf_sha256 != img.elf_sha256 || (boot && !start);
+            if stm32 != img.stm32 {
+                let kind = if img.stm32 { "an STM32" } else { "an ESP32" };
+                self.status("update_failed", Some(format!("firmware is {kind} image, the board is {}", f.platform)), out);
+            } else if app_differs && stm32 && !boot {
+                // Updates go through the bootloader.
+                port.write(&nmea::command("BOOT"));
+                self.rx = Rx::OtaDone { since: now };
+                self.status("restarting", Some(format!("into the bootloader for firmware {}", img.version)), out);
+                return;
+            } else if app_differs {
                 port.write(&nmea::command(&format!("OTA,{},{}", img.data.len(), img.sha256)));
                 self.rx = Rx::OtaStart { since: now };
-                let from = self.firmware.as_ref().map_or("?", |f| f.version.as_str()).to_string();
+                let from = if boot && !start { "none" } else { f.version.as_str() };
                 self.status("updating", Some(format!("firmware {from} -> {}", img.version)), out);
                 return;
             }
+        }
+        if start {
+            port.write(&nmea::command("START"));
+            self.rx = Rx::OtaDone { since: now };
+            self.status("restarting", Some("starting the app".into()), out);
+            return;
+        }
+        if boot {
+            self.rx = Rx::Idle;
+            self.status("no_app", Some("bootloader has no valid app and no firmware to install".into()), out);
+            return;
         }
         if self.cfg.configure {
             self.start_probe(now, port, out);
@@ -492,7 +522,7 @@ impl Session {
         }
     }
 
-    fn on_ota(&mut self, m: OtaMsg, now: Ns, out: &mut Output) {
+    fn on_ota(&mut self, m: OtaMsg, now: Ns, port: &mut dyn Port, out: &mut Output) {
         match (&mut self.rx, m) {
             (Rx::OtaStart { .. }, OtaMsg::Ready) => {
                 self.rx = Rx::OtaSend { sent: 0, acked: 0, since: now, reported: 0 };
@@ -502,6 +532,9 @@ impl Session {
                 *since = now;
             }
             (Rx::OtaSend { .. }, OtaMsg::Ok) => {
+                if self.firmware.as_ref().is_some_and(|f| f.platform == BOOTLOADER) {
+                    port.write(&nmea::command("START"));
+                }
                 self.rx = Rx::OtaDone { since: now };
                 self.status("restarting", Some("firmware written, device restarting".into()), out);
             }
@@ -876,6 +909,9 @@ mod tests {
         from_host: Framer,
         elf: String,
         platform: &'static str,
+        partition: &'static str,
+        /// START and BOOT received.
+        boot_cmds: Vec<String>,
         /// Image bytes still expected, and those received.
         ota_left: usize,
         ota_image: Vec<u8>,
@@ -923,6 +959,8 @@ mod tests {
                 from_host: Framer::new(),
                 elf: "00".repeat(32),
                 platform: "v5.5.1",
+                partition: "ota_0",
+                boot_cmds: vec![],
                 ota_left: 0,
                 ota_image: vec![],
                 ota_last_ms: 0,
@@ -1137,7 +1175,10 @@ mod tests {
                     if fl[2] == "INFO" && fl.len() > 3 {
                         self.to_host.extend(nmea::command(&format!("INFO,80000000,100,0,0,0,0,0,{}", fl[3])));
                     } else if fl[2] == "VER" {
-                        self.to_host.extend(nmea::command(&format!("VER,v1,{},ota_0,0,{},POWERON", self.platform, self.elf)));
+                        let (p, part, elf) = (self.platform, self.partition, &self.elf);
+                        self.to_host.extend(nmea::command(&format!("VER,v1,{p},{part},0,{elf},POWERON")));
+                    } else if fl[2] == "START" || fl[2] == "BOOT" {
+                        self.boot_cmds.push(fl[2].to_string());
                     } else if fl[2] == "OTA" {
                         self.ota_left = fl[3].parse().unwrap();
                         self.ota_ready_at = Some(self.now_ms + self.ota_erase_ms);
@@ -1558,6 +1599,66 @@ mod tests {
         assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
         assert!(r.fake.ota_image.is_empty());
         let msg = "firmware is an ESP32 image, the board is stm32g4";
+        assert!(r.out.events.iter().any(|e| e["state"] == "update_failed" && e["message"] == msg));
+    }
+
+    fn stm32_image() -> Arc<super::super::firmware::Image> {
+        let mut img = super::super::firmware::test_image("v2", 0xcd, 50_000);
+        img.stm32 = true;
+        Arc::new(img)
+    }
+
+    #[test]
+    fn stm32_app_updates_through_the_bootloader() {
+        let mut f = Fake::new(9600, false, true);
+        f.platform = "stm32g4";
+        let mut r = Run::with(Config { firmware: Some(stm32_image()), ..Config::default() }, f);
+        r.for_secs(5);
+        assert_eq!(r.fake.boot_cmds, ["BOOT"]);
+        assert!(r.session.restarting());
+        assert!(r.fake.ota_image.is_empty());
+        assert!(!r.states().contains(&"updating".to_string()), "{:?}", r.states());
+    }
+
+    #[test]
+    fn bootloader_installs_the_image_then_starts_it() {
+        let img = stm32_image();
+        let mut f = Fake::new(9600, false, true);
+        (f.platform, f.partition, f.elf) = (BOOTLOADER, "empty", String::new());
+        let mut r = Run::with(Config { firmware: Some(img.clone()), ..Config::default() }, f);
+        r.for_secs(5);
+        assert!(r.fake.ota_image == img.data);
+        assert_eq!(r.fake.boot_cmds, ["START"]);
+        assert!(r.session.restarting());
+        assert!(r.out.events.iter().any(|e| e["state"] == "updating" && e["message"] == "firmware none -> v2"));
+    }
+
+    #[test]
+    fn bootloader_starts_a_valid_app() {
+        let img = stm32_image();
+        for (firmware, partition, elf, start) in [
+            (Some(img.clone()), "valid", img.elf_sha256.clone(), true),
+            (None, "valid", "ab".repeat(32), true),
+            (None, "invalid", "ab".repeat(32), false),
+            (None, "empty", String::new(), false),
+        ] {
+            let mut f = Fake::new(9600, false, true);
+            (f.platform, f.partition, f.elf) = (BOOTLOADER, partition, elf);
+            let mut r = Run::with(Config { firmware, ..Config::default() }, f);
+            r.for_secs(5);
+            assert!(r.fake.ota_image.is_empty());
+            assert_eq!(r.fake.boot_cmds.len(), start as usize, "{partition}");
+            assert_eq!(r.session.state(), if start { "restarting" } else { "no_app" }, "{partition}");
+        }
+    }
+
+    #[test]
+    fn stm32_image_is_not_sent_to_esp32() {
+        let mut r = Run::with(Config { firmware: Some(stm32_image()), ..Config::default() }, Fake::new(9600, false, true));
+        r.for_secs(15);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.fake.ota_image.is_empty());
+        let msg = "firmware is an STM32 image, the board is v5.5.1";
         assert!(r.out.events.iter().any(|e| e["state"] == "update_failed" && e["message"] == msg));
     }
 

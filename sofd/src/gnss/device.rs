@@ -404,10 +404,10 @@ fn run(mut io: Io, cfg: Config, tx: &mpsc::Receiver<Vec<u8>>, out: &Sender<Msg>,
                 return None;
             }
         }
-        // Close the port before the device restarts after OTA,OK: transfers cancelled
-        // when it drops off the bus can lock up the Raspberry Pi's dwc_otg.
+        // Close the port before the device restarts (OTA,OK, START, BOOT): transfers
+        // cancelled when it drops off the bus can lock up the Raspberry Pi's dwc_otg.
         if session.restarting() {
-            return Some("device restarting after the update".into());
+            return Some("device restarting".into());
         }
     }
     None

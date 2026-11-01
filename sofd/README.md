@@ -175,7 +175,7 @@ Board options:
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
 | `sof_delay_ns` | 0, 1300 on STM32 boards | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. The STM32 port captures a little into the SOF packet: 1.12 µs behind a Raspberry Pi 4's hub and 1.44 to 1.52 µs directly on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO. Its default puts either within about 0.2 µs. The value in use is in the board's status. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
-| `firmware` | none | The sofgnss image (`sofgnss/esp32s3/build/sofgnss.bin`) the board should run. Boards running another image are updated. `null` in `boards` turns updates off for one board. |
+| `firmware` | none | The sofgnss image the board should run: `sofgnss/esp32s3/build/sofgnss.bin` for ESP32-S3 boards, `sofgnss/stm32g4/build/sofgnss-signed.bin` for STM32 boards. Boards running another image are updated, boards of the other kind are left alone. `null` in `boards` turns updates off for one board. |
 
 A controller sampled for a board runs at `sampler.default_rate_hz` (50). That
 is also the rate of the samples sent to chrony, and of MQTT requests that do
@@ -362,12 +362,13 @@ to the controller's by their low 11 bits, which are identical on the wire, and
 by the time each tag was received. The match is checked on every tag and
 redone after three misses.
 
-The states on `gnss/<serial>/status` are `opening`, `updating`, `restarting`
-and `update_failed` for firmware, then `probing`, `identifying`,
+The states on `gnss/<serial>/status` are `opening`, `updating`, `restarting`,
+`update_failed` and `no_app` (an STM32 bootloader without a valid app and no
+image to install) for firmware, then `probing`, `identifying`,
 `configuring`, `verifying`, `ubx` (running), `nmea_fallback`, `passive`,
 `detached`, `absent` and `error`. The status also carries `locked`,
 `controller`, `tty`, `port`, `baud`, `sof_delay_ns` (the delay in use),
-`receiver` (MON-VER), `firmware` (`version`, `elf_sha256`, `reset_reason`)
+`receiver` (MON-VER), `firmware` (`version`, `platform`, `partition`, `elf_sha256`, `reset_reason`)
 and `message`.
 
 ### Receiver setup
@@ -468,6 +469,14 @@ attempts with the same file, sofd leaves it alone (`firmware_failed`) until
 the file changes or sofd restarts. The board confirms the new image on the
 first command after its restart, so its bootloader rolls back a broken image
 that never reaches the USB handshake.
+
+STM32 boards update through their bootloader, which only starts the app when
+asked (see the sofgnss README). A board whose app differs from the image is
+sent `BOOT`. In the bootloader sofd sends the image if the installed app
+differs or is not `valid`, then `START`. A bootloader with the right app gets
+`START` alone, also without `firmware` set. Each step restarts the board, and
+sofd reopens it as after an update, so an update takes three sessions and
+about 20 s.
 
 ### Frame counter lead
 

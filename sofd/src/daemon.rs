@@ -735,7 +735,8 @@ impl Daemon {
             }
             t.1 += 1;
         }
-        if elf.as_deref() == Some(img.elf_sha256.as_str()) && self.update_tries.remove(serial).is_some() {
+        let in_app = ev["firmware"]["platform"].as_str() != Some(session::BOOTLOADER);
+        if in_app && elf.as_deref() == Some(img.elf_sha256.as_str()) && self.update_tries.remove(serial).is_some() {
             info!("{serial}: now runs firmware {}", img.version);
             self.board_event(serial, json!({"event": "firmware_updated", "version": img.version}));
         }
