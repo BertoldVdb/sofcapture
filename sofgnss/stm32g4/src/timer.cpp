@@ -61,7 +61,7 @@ void timer_init() {
   RCC->APB1ENR1 |= RCC_APB1ENR1_TIM2EN;
   (void)RCC->APB1ENR1;
   pin_af(kPps, Pull::None);
-  TIM2->CR1 = 0;
+  TIM2->CR1 = TIM_CR1_URS;  // so UG below doesn't count as a wrap
   TIM2->PSC = 0;
   TIM2->ARR = 0xFFFFFFFF;
   TIM2->SMCR = kSmcrTsItr11;  // trigger input only, slave mode off
@@ -72,7 +72,7 @@ void timer_init() {
   TIM2->DIER = TIM_DIER_UIE;
   NVIC_SetPriority(TIM2_IRQn, kPrioTim2);
   NVIC_EnableIRQ(TIM2_IRQn);
-  TIM2->CR1 = TIM_CR1_CEN;
+  TIM2->CR1 = TIM_CR1_URS | TIM_CR1_CEN;
 }
 
 uint64_t ticks64() {
