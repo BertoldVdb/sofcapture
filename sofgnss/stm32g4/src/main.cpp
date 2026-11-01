@@ -301,10 +301,9 @@ void on_line_coding(const hal::LineCoding& lc, void*) {
 
 void on_command(const char* fields, size_t len) {
   if (len > 4 && memcmp(fields, "DIV,", 4) == 0) {
-    char* end;
-    unsigned long d = strtoul(fields + 4, &end, 10);
-    if (end == fields + len && d >= 1 && d <= 1000000) {
-      s_reporter.set_divider(static_cast<uint32_t>(d));
+    uint32_t d;
+    if (pvdb::parse_u32(fields + 4, len - 4, &d) && d >= 1 && d <= 1000000) {
+      s_reporter.set_divider(d);
       s_sof_divider = s_reporter.divider();
       send_info();
     } else {
@@ -500,15 +499,12 @@ void housekeeping(uint64_t now) {
     }
     s_info_countdown--;
   }
-#if CONFIG_SOFGNSS_HOST_WDT
+  // Also while suspended or never attached: the restart puts us back on the bus.
   uint32_t now_s = static_cast<uint32_t>(now / 1000000);
-  // A suspended bus is supposed to be quiet.
-  if (hal::usb_stats().suspended) s_host_activity_s = now_s;
   if (now_s - s_host_activity_s > kHostSilenceS) {
     port::log("no host activity for %lus, restarting", static_cast<unsigned long>(kHostSilenceS));
     hal::restart();
   }
-#endif
 }
 
 }  // namespace

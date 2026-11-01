@@ -1,7 +1,5 @@
 #include "sofgnss/ota_receiver.h"
 
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 #include "sofgnss/hal.h"
@@ -69,9 +67,8 @@ void OtaReceiver::start(const char* args, size_t len) {
     return;
   }
   *comma = '\0';
-  char* end;
-  unsigned long size = strtoul(buf, &end, 10);
-  if (*end != '\0' || size == 0 || size > 0xFFFFFFFFul) {
+  uint32_t size;
+  if (!pvdb::parse_u32(buf, static_cast<size_t>(comma - buf), &size) || size == 0) {
     fail("OTAARGS");
     return;
   }

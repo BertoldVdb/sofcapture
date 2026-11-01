@@ -1,5 +1,4 @@
 // USB descriptors: one CDC-ACM device, serial number from the chip UID.
-#include <stdio.h>
 #include <string.h>
 
 #include "config.h"
@@ -68,8 +67,9 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     if (index == STRID_SERIAL) {
       if (serial[0] == '\0') {
         const volatile uint32_t* uid = (const volatile uint32_t*)UID_BASE;
-        snprintf(serial, sizeof serial, "%08lX%08lX%08lX", (unsigned long)uid[0],
-                 (unsigned long)uid[1], (unsigned long)uid[2]);
+        for (int w = 0; w < 3; w++) {
+          for (int i = 0; i < 8; i++) serial[8 * w + i] = "0123456789ABCDEF"[(uid[w] >> (28 - 4 * i)) & 15];
+        }
       }
       str = serial;
     }

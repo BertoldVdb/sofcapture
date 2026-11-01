@@ -67,8 +67,12 @@ bool usb_isr_active();            // inside the USB interrupt handler
 // arriving or bytes came since the line last went idle. TIM2 ISR only.
 uint32_t gps_line_idle_ms(uint64_t now_us);
 
-// Debug console on PA2 (115200 8N1). Blocking.
+// Debug console on PA2 (115200 8N1). Blocking. Gone without CONFIG_SOFGNSS_CONSOLE.
+#if CONFIG_SOFGNSS_CONSOLE
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#else
+inline void log(const char*, ...) {}
+#endif
 
 // Busy wait that keeps the watchdog fed.
 void delay_ms(uint32_t ms);

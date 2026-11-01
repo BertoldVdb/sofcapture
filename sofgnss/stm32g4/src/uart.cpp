@@ -16,7 +16,9 @@ constexpr uint32_t kRxRing = 16384;
 // Room for one whole host frame (2048) and a USB chunk on top of what's queued.
 constexpr uint32_t kTxRing = 3072;
 constexpr uint32_t kDmaReqUsart3Rx = 28;
+#if CONFIG_SOFGNSS_CONSOLE
 constexpr uint32_t kConsoleBaud = 115200;
+#endif
 
 uint8_t s_rx[kRxRing];
 uint32_t s_rx_rd;
@@ -71,8 +73,7 @@ namespace sofgnss::port {
 void uart_init() {
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA1EN | RCC_AHB1ENR_DMAMUX1EN;
   RCC->APB1ENR1 |= RCC_APB1ENR1_USART3EN;
-  RCC->APB1ENR2 |= RCC_APB1ENR2_LPUART1EN;
-  (void)RCC->APB1ENR2;
+  (void)RCC->APB1ENR1;
 
   pin_af(kGpsTx);
   pin_af(kGpsRx, Pull::Up);
@@ -89,9 +90,13 @@ void uart_init() {
   NVIC_SetPriority(USART3_IRQn, kPrioUart);
   NVIC_EnableIRQ(USART3_IRQn);
 
+#if CONFIG_SOFGNSS_CONSOLE
+  RCC->APB1ENR2 |= RCC_APB1ENR2_LPUART1EN;
+  (void)RCC->APB1ENR2;
   pin_af(kConsoleTx);
   LPUART1->BRR = static_cast<uint32_t>((uint64_t{kCoreHz} * 256 + kConsoleBaud / 2) / kConsoleBaud);
   LPUART1->CR1 = USART_CR1_TE | USART_CR1_UE;
+#endif
 }
 
 uint32_t gps_line_idle_ms(uint64_t now_us) {
@@ -101,6 +106,7 @@ uint32_t gps_line_idle_ms(uint64_t now_us) {
   return now_us > idle ? static_cast<uint32_t>((now_us - idle) / 1000) : 0;
 }
 
+#if CONFIG_SOFGNSS_CONSOLE
 void log(const char* fmt, ...) {
   char buf[160];
   va_list ap;
@@ -117,6 +123,7 @@ void log(const char* fmt, ...) {
     LPUART1->TDR = static_cast<uint8_t>(buf[i]);
   }
 }
+#endif
 
 }  // namespace sofgnss::port
 

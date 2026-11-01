@@ -107,3 +107,27 @@ TEST(pvdb_command_fields) {
   s = with_checksum("PUBX,00");
   CHECK(!pvdb::command_fields(reinterpret_cast<const uint8_t*>(s.data()), s.size(), &f, &n));
 }
+
+TEST(pvdb_parse_u32) {
+  uint32_t v = 0;
+  CHECK(pvdb::parse_u32("0", 1, &v) && v == 0);
+  CHECK(pvdb::parse_u32("4294967295", 10, &v) && v == 4294967295u);
+  CHECK(pvdb::parse_u32("1234,5", 4, &v) && v == 1234);
+  CHECK(!pvdb::parse_u32("4294967296", 10, &v));
+  CHECK(!pvdb::parse_u32("", 0, &v));
+  CHECK(!pvdb::parse_u32("+1", 2, &v));
+  CHECK(!pvdb::parse_u32(" 1", 2, &v));
+  CHECK(!pvdb::parse_u32("1a", 2, &v));
+}
+
+TEST(pvdb_hex_and_full_buffer) {
+  const uint8_t b[] = {0x00, 0x9f, 0xab, 0xff};
+  char h[9];
+  pvdb::hex(h, b, sizeof b);
+  CHECK(std::string(h) == "009fabff");
+  // The sentence and its NUL must fit, else nothing is written.
+  char s[23];
+  CHECK_EQ(pvdb::format(s, 22, "PVDB,SOFPPS,PING"), 0u);
+  CHECK_EQ(pvdb::format(s, 23, "PVDB,SOFPPS,PING"), 22u);
+  CHECK(std::string(s) == "$PVDB,SOFPPS,PING*19\r\n");
+}

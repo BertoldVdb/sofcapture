@@ -29,6 +29,11 @@ constexpr size_t kMaxSentence = 192;
 
 uint8_t checksum(const char* body, size_t len);  // XOR between '$' and '*'
 
+// Decimal digits only, no sign or spaces; false if empty or over 32 bits.
+bool parse_u32(const char* s, size_t len, uint32_t* out);
+// Lowercase, 2 * len chars and a NUL.
+void hex(char* out, const uint8_t* data, size_t len);
+
 // Writes "$<body>*hh\r\n". Returns the length, or 0 if it does not fit.
 size_t format(char* out, size_t cap, const char* body);
 // rx_idle_ms: how long the GPS line was quiet before the edge (see README).

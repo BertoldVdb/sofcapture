@@ -1,11 +1,11 @@
 // Clocks, watchdog, reset handling, app descriptor and the HAL parts this port
 // doesn't have (OTA, SOF spin).
-#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 
 #include "port.h"
 #include "sofgnss/hal.h"
+#include "sofgnss/pvdb.h"
 #include "sofgnss_version.h"
 
 namespace {
@@ -271,8 +271,10 @@ AppInfo app_info() {
   strncpy(info.idf, g_app_desc.idf_ver, sizeof info.idf - 1);
   strncpy(info.partition, "flash", sizeof info.partition - 1);
   // Patched after linking, so the compiler must not fold it to zeros.
-  const volatile uint8_t* sha = g_app_desc.app_elf_sha256;
-  for (int i = 0; i < 32; ++i) snprintf(info.elf_sha256 + 2 * i, 3, "%02x", sha[i]);
+  const volatile uint8_t* p = g_app_desc.app_elf_sha256;
+  uint8_t sha[32];
+  for (int i = 0; i < 32; ++i) sha[i] = p[i];
+  pvdb::hex(info.elf_sha256, sha, sizeof sha);
   return info;
 }
 

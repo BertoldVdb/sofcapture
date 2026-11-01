@@ -1,7 +1,5 @@
 #include "sofgnss/pvdb.h"
 
-#include <cinttypes>
-#include <cstdio>
 #include <cstring>
 
 namespace sofgnss::pvdb {
@@ -10,27 +8,62 @@ namespace {
 
 constexpr char kPrefix[] = "$PVDB,SOFPPS,";
 constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-
-// newlib-nano's printf has no 64-bit conversions.
-struct U64 {
-  char buf[21];
-  const char* str;
-  explicit U64(uint64_t v) {
-    char* p = buf + sizeof buf - 1;
-    *p = '\0';
-    do {
-      *--p = static_cast<char>('0' + v % 10);
-      v /= 10;
-    } while (v);
-    str = p;
-  }
-};
+constexpr char kHex[] = "0123456789ABCDEF";
 
 int hex_value(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   return -1;
+}
+
+// Builds a sentence in place, without printf. Text that does not fit makes
+// finish() return 0.
+class Builder {
+ public:
+  Builder(char* out, size_t cap) : out_(out), cap_(cap) {}
+
+  Builder& put(char c) {
+    if (len_ < cap_) out_[len_] = c;
+    len_++;
+    return *this;
+  }
+  Builder& str(const char* s) {
+    while (*s) put(*s++);
+    return *this;
+  }
+  Builder& num(uint64_t v) {
+    char digits[20];
+    int n = 0;
+    do {
+      digits[n++] = static_cast<char>('0' + v % 10);
+      v /= 10;
+    } while (v);
+    while (n) put(digits[--n]);
+    return *this;
+  }
+  Builder& field(const char* s) { return put(',').str(s); }
+  Builder& field(uint64_t v) { return put(',').num(v); }
+
+  // Appends "*hh\r\n" and a NUL. Returns the length without the NUL.
+  size_t finish() {
+    if (len_ + 5 + 1 > cap_) return 0;
+    uint8_t sum = checksum(out_ + 1, len_ - 1);
+    put('*').put(kHex[sum >> 4]).put(kHex[sum & 15]).put('\r').put('\n');
+    out_[len_] = '\0';
+    return len_;
+  }
+
+ private:
+  char* out_;
+  size_t cap_;
+  size_t len_ = 0;
+};
+
+Builder sentence(char* out, size_t cap, const char* type) {
+  Builder b(out, cap);
+  b.str(kPrefix).str(type);
+  return b;
 }
 
 }  // namespace
@@ -42,41 +75,33 @@ uint8_t checksum(const char* body, size_t len) {
 }
 
 size_t format(char* out, size_t cap, const char* body) {
-  size_t body_len = strlen(body);
-  size_t total = 1 + body_len + 3 + 2;  // '$' body "*hh" "\r\n"
-  if (total + 1 > cap) return 0;
-  out[0] = '$';
-  memcpy(out + 1, body, body_len);
-  snprintf(out + 1 + body_len, cap - 1 - body_len, "*%02X\r\n", checksum(body, body_len));
-  return total;
+  return Builder(out, cap).put('$').str(body).finish();
 }
 
 size_t format_pps(char* out, size_t cap, uint64_t tick, uint32_t rx_idle_ms) {
-  char body[64];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,PPS,%s,%" PRIu32, U64(tick).str, rx_idle_ms);
-  return format(out, cap, body);
+  return sentence(out, cap, "PPS").field(tick).field(rx_idle_ms).finish();
 }
 
 size_t format_sof(char* out, size_t cap, uint64_t tick, uint64_t frame) {
-  char body[96];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,SOF,%s,%s", U64(tick).str, U64(frame).str);
-  return format(out, cap, body);
+  return sentence(out, cap, "SOF").field(tick).field(frame).finish();
 }
 
 size_t format_err(char* out, size_t cap, const char* text) {
-  char body[96];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,ERR,%s", text);
-  return format(out, cap, body);
+  return sentence(out, cap, "ERR").field(text).finish();
 }
 
 size_t format_info(char* out, size_t cap, const Info& info) {
-  char body[140];
-  snprintf(body, sizeof body,
-           "PVDB,SOFPPS,INFO,%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32
-           ",%" PRIu32 ",%s,%" PRIu32,
-           info.tick_hz, info.divider, info.pps, info.sof_tags, info.sof_missed, info.dropped,
-           info.parse_errors, info.tag ? info.tag : "", info.pps_rejected);
-  return format(out, cap, body);
+  return sentence(out, cap, "INFO")
+      .field(info.tick_hz)
+      .field(info.divider)
+      .field(info.pps)
+      .field(info.sof_tags)
+      .field(info.sof_missed)
+      .field(info.dropped)
+      .field(info.parse_errors)
+      .field(info.tag ? info.tag : "")
+      .field(info.pps_rejected)
+      .finish();
 }
 
 bool valid_tag(const char* tag, size_t len) {
@@ -91,39 +116,68 @@ bool valid_tag(const char* tag, size_t len) {
 }
 
 size_t format_usb(char* out, size_t cap, const UsbInfo& u) {
-  char body[96];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,USB,%d,%d,%d,%" PRIu32 ",%" PRIu32 ",%" PRIu32, u.mounted,
-           u.suspended, u.dtr, u.line_coding_events, u.line_state_events, u.baud);
-  return format(out, cap, body);
+  return sentence(out, cap, "USB")
+      .field(uint64_t{u.mounted})
+      .field(uint64_t{u.suspended})
+      .field(uint64_t{u.dtr})
+      .field(u.line_coding_events)
+      .field(u.line_state_events)
+      .field(u.baud)
+      .finish();
 }
 
 size_t format_cal(char* out, size_t cap, uint64_t tick, const char* mode, bool pps_synced,
                   uint32_t n, uint32_t chip_rate, uint32_t length) {
-  char body[112];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,CAL,%s,%s,%d,%" PRIu32 ",%" PRIu32 ",%" PRIu32,
-           U64(tick).str, mode, pps_synced, n, chip_rate, length);
-  return format(out, cap, body);
+  return sentence(out, cap, "CAL")
+      .field(tick)
+      .field(mode)
+      .field(uint64_t{pps_synced})
+      .field(n)
+      .field(chip_rate)
+      .field(length)
+      .finish();
 }
 
 size_t format_ver(char* out, size_t cap, const char* version, const char* idf,
                   const char* partition, bool pending_verify, const char* elf_sha256,
                   const char* reset_reason) {
-  char body[180];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,VER,%s,%s,%s,%d,%s,%s", version, idf, partition,
-           pending_verify, elf_sha256, reset_reason);
-  return format(out, cap, body);
+  return sentence(out, cap, "VER")
+      .field(version)
+      .field(idf)
+      .field(partition)
+      .field(uint64_t{pending_verify})
+      .field(elf_sha256)
+      .field(reset_reason)
+      .finish();
 }
 
 size_t format_ota(char* out, size_t cap, const char* status) {
-  char body[64];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,OTA,%s", status);
-  return format(out, cap, body);
+  return sentence(out, cap, "OTA").field(status).finish();
 }
 
 size_t format_ota(char* out, size_t cap, const char* status, uint32_t value) {
-  char body[64];
-  snprintf(body, sizeof body, "PVDB,SOFPPS,OTA,%s,%" PRIu32, status, value);
-  return format(out, cap, body);
+  return sentence(out, cap, "OTA").field(status).field(value).finish();
+}
+
+bool parse_u32(const char* s, size_t len, uint32_t* out) {
+  if (len == 0) return false;
+  uint64_t v = 0;
+  for (size_t i = 0; i < len; ++i) {
+    if (s[i] < '0' || s[i] > '9') return false;
+    v = v * 10 + static_cast<uint64_t>(s[i] - '0');
+    if (v > 0xFFFFFFFFu) return false;
+  }
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
+void hex(char* out, const uint8_t* data, size_t len) {
+  static constexpr char kLower[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; ++i) {
+    out[2 * i] = kLower[data[i] >> 4];
+    out[2 * i + 1] = kLower[data[i] & 15];
+  }
+  out[2 * len] = '\0';
 }
 
 bool verify(const char* s, size_t len) {
