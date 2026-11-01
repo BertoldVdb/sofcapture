@@ -6,6 +6,10 @@
 Sends the image (protocol in README), waits for the restart, then sends VER,
 which confirms the new image so the next reset doesn't roll back.
 
+STM32 boards take signed images (stm32g4/build/sofgnss-signed.bin) in their
+bootloader: a running app is sent BOOT first, and the bootloader START after the
+update. A board waiting in its bootloader with the image installed is just started.
+
 The board is found again by the serial in its /dev/serial/by-id link. The port keeps
 its current line coding, since changing it would also change the GPS UART.
 """
@@ -23,6 +27,9 @@ import serial
 
 APP_DESC_OFFSET = 32  # esp_image_header_t + first esp_image_segment_header_t
 APP_DESC_MAGIC = 0xABCD5432
+STM32_MAGIC = b"SGFW"
+STM32_HEADER = 128
+BOOTLOADER = "stm32g4-boot"
 BY_ID = "/dev/serial/by-id"
 BY_ID_PATTERN = "usb-BertoldVdb_GNSS_SOF_PPS_Bridge_*"
 CMSPAR = getattr(termios, "CMSPAR", 0o10000000000)
@@ -30,10 +37,13 @@ CMSPAR = getattr(termios, "CMSPAR", 0o10000000000)
 
 def image_descriptor(image):
     """(version, project, elf_sha256_hex) from the image's esp_app_desc_t."""
-    d = image[APP_DESC_OFFSET:APP_DESC_OFFSET + 256]
-    magic, = struct.unpack_from("<I", d, 0)
+    off = APP_DESC_OFFSET
+    if image.startswith(STM32_MAGIC):
+        off = STM32_HEADER + struct.unpack_from("<I", image, 12)[0]
+    d = image[off:off + 256]
+    magic, = struct.unpack_from("<I", d, 0) if len(d) == 256 else (0,)
     if magic != APP_DESC_MAGIC:
-        sys.exit("not an ESP-IDF application image (no app descriptor)")
+        sys.exit("not a sofgnss image (no app descriptor)")
     version = d[16:48].split(b"\0")[0].decode()
     project = d[48:80].split(b"\0")[0].decode()
     sha = d[144:176].hex()
@@ -113,6 +123,11 @@ def last_ver(port, wait=1.5):
     return found
 
 
+def last_ver_asked(port):
+    port.write(sentence("PVDB,SOFPPS,VER"))
+    return last_ver(port)
+
+
 def wait_for(cond, timeout):
     end = time.time() + timeout
     while time.time() < end:
@@ -163,6 +178,28 @@ def ver_fields(ver):
     return (f[6] if len(f) > 6 else ""), (f[7] if len(f) > 7 else "")
 
 
+def ver_platform(ver):
+    """(platform, partition) of a VER sentence. In the STM32 bootloader the
+    partition is the app's state: valid, invalid or empty."""
+    f = (ver or "").split("*")[0].split(",")
+    return (f[4] if len(f) > 4 else ""), (f[5] if len(f) > 5 else "")
+
+
+def restart_and_reopen(p, stable, command, why):
+    """Sends `command` (or nothing), then waits for the board to come back."""
+    if command:
+        p.write(sentence(f"PVDB,SOFPPS,{command}"))
+        p.flush()
+    p.close()
+    print(why)
+    if not wait_for(lambda: not os.path.exists(stable), 10):
+        print("warning: port did not go away; continuing")
+    if not wait_for(lambda: same_serial(stable), 20):
+        sys.exit(f"{stable} did not come back; reset the board (a bad image rolls back)")
+    stable = same_serial(stable)
+    return open_port(stable), stable
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?", default=os.path.join(
@@ -184,13 +221,28 @@ def main():
     print(f"{args.image}: {project} {version}, {len(image)} bytes, elf sha256 {elf_sha[:16]}...")
     print(f"device: {stable}")
 
+    stm32 = image.startswith(STM32_MAGIC)
     p = open_port(port_name)
     p.write(sentence("PVDB,SOFPPS,VER"))
     ver = last_ver(p)
     print(f"running: {ver or 'no VER reply (old firmware?)'}")
-    if ver and ver_fields(ver)[1] == elf_sha and not args.force:
+    platform, state = ver_platform(ver)
+    if ver and stm32 != platform.startswith("stm32"):
+        sys.exit(f"the image is for {'STM32' if stm32 else 'ESP32'}, the board reports {platform}")
+    same = ver and ver_fields(ver)[1] == elf_sha and (platform != BOOTLOADER or state == "valid")
+    if same and not args.force:
+        if platform == BOOTLOADER:
+            p, stable = restart_and_reopen(p, stable, "START", "image already installed, starting it")
+            print(f"now running: {last_ver_asked(p)}")
+            p.close()
+            return
         print("device already runs this image; nothing to do (--force to update anyway)")
         return
+    if stm32 and platform != BOOTLOADER:
+        p, stable = restart_and_reopen(p, stable, "BOOT", "restarting into the bootloader")
+        ver = last_ver_asked(p)
+        if ver_platform(ver)[0] != BOOTLOADER:
+            sys.exit(f"the board did not come back in its bootloader: {ver}")
 
     p.write(sentence(f"PVDB,SOFPPS,OTA,{len(image)},{digest}"))
     ready = read_until(p, ",OTA,READY", 15)  # erasing the slot takes a moment
@@ -220,16 +272,8 @@ def main():
     print(f"\r  100%  {len(image) / 1024 / (time.time() - t0):.0f} KB/s")
     if not result or ",ERR," in result:
         sys.exit(f"update failed: {result}")
-    print("image accepted, device restarting")
-    p.close()
-
-    # Wait for the board to re-enumerate.
-    if not wait_for(lambda: not os.path.exists(stable), 10):
-        print("warning: port did not go away; continuing")
-    if not wait_for(lambda: same_serial(stable), 20):
-        sys.exit(f"{stable} did not come back; reset the board (a bad image rolls back)")
-    stable = same_serial(stable)
-    p = open_port(stable)
+    # The STM32 bootloader starts the app only when asked.
+    p, stable = restart_and_reopen(p, stable, "START" if stm32 else None, "image accepted, device restarting")
     # The first VER may be from before the confirm; ask until it shows confirmed.
     ver = None
     for _ in range(5):
@@ -242,6 +286,8 @@ def main():
         sys.exit("no VER reply from the new image; it is not confirmed and a reset rolls back")
     print(f"now running: {ver}")
     pending, running_sha = ver_fields(ver)
+    if ver_platform(ver)[0] == BOOTLOADER:
+        sys.exit("the bootloader did not start the app")
     if running_sha != elf_sha:
         sys.exit("the device does not run the new image (rolled back?)")
     if pending != "0":
