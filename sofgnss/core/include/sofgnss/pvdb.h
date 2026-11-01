@@ -17,6 +17,8 @@
 //   $PVDB,SOFPPS,SIMPPS*hh       test hook: act as if a PPS edge arrived now
 //   $PVDB,SOFPPS,CAL,<NOISE|SQ2|SQ20|SQ40|OFF>*hh   calibration bursts, one per PPS
 //   $PVDB,SOFPPS,OTA,<size>,<sha256hex>*hh   then, after READY, the raw image
+//   $PVDB,SOFPPS,BOOT*hh         STM32: restart into the bootloader
+//   $PVDB,SOFPPS,START*hh        STM32 bootloader: check the app and start it
 #pragma once
 
 #include <cstddef>

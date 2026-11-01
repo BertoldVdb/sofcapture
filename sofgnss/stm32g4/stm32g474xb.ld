@@ -1,9 +1,10 @@
-/* STM32G474xB, the smallest G474: 128 KB flash, SRAM1+SRAM2 contiguous, then CCM SRAM. */
+/* STM32G474xB, the smallest G474: 128 KB flash, SRAM1+SRAM2 contiguous, then CCM SRAM.
+   The app follows the bootloader (24 KB) and the image header page (4 KB). */
 ENTRY(Reset_Handler)
 
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 128K
+  FLASH (rx)  : ORIGIN = 0x08007000, LENGTH = 100K
   RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 96K
   CCM   (rw)  : ORIGIN = 0x20018000, LENGTH = 32K  /* CCM SRAM alias, reachable by DMA */
 }

@@ -8,7 +8,6 @@
 #include "sofgnss/frame_parser.h"
 #include "sofgnss/hal.h"
 #include "sofgnss/msg_queue.h"
-#include "sofgnss/ota_receiver.h"
 #include "sofgnss/pps_filter.h"
 #include "sofgnss/pvdb.h"
 #include "sofgnss/timing_reporter.h"
@@ -180,7 +179,6 @@ void on_frame(FrameType, const uint8_t* data, size_t len, void*) {
 
 uint8_t s_parser_buf[CONFIG_SOFGNSS_PARSER_BYTES];
 FrameParser s_parser{s_parser_buf, sizeof s_parser_buf, on_frame, nullptr};
-OtaReceiver s_ota{emit_sentence, nullptr};
 TimingReporter s_reporter{CONFIG_SOFGNSS_SOF_DIVIDER, CONFIG_SOFGNSS_SOF_DITHER, emit_sentence,
                           nullptr};
 
@@ -346,8 +344,10 @@ void on_command(const char* fields, size_t len) {
     }
   } else if (len == 6 && memcmp(fields, "SIMPPS", 6) == 0) {
     hal::pps_inject();  // test hook: fake a PPS edge
+  } else if (len == 4 && memcmp(fields, "BOOT", 4) == 0) {
+    hal::restart();  // into the bootloader, which takes OTA
   } else if (len > 4 && memcmp(fields, "OTA,", 4) == 0) {
-    s_ota.start(fields + 4, len - 4);  // answers ERR,OTABEGIN: flash over SWD
+    send_error("OTABOOT");
   } else {
     send_error("UNKNOWN");
   }
@@ -377,8 +377,6 @@ void host_poll(uint64_t now) {
       now - s_last_host_byte_us > uint64_t{CONFIG_SOFGNSS_FRAME_TIMEOUT_MS} * 1000) {
     s_host_frames.abort_partial();
   }
-  if (s_ota.receiving() && !host_listening()) s_ota.cancel("OTALINK");
-  s_ota.poll(now);
   // A chunk completes at most the partial frame plus itself: read only when
   // that fits the GPS TX ring, and let USB hold the rest meanwhile.
   while (hal::cdc_read_available() &&
@@ -388,8 +386,7 @@ void host_poll(uint64_t now) {
     if (n == 0) break;
     s_last_host_byte_us = now;
     s_host_activity_s = static_cast<uint32_t>(now / 1000000);
-    size_t taken = s_ota.receiving() ? s_ota.feed(buf, n, now) : 0;
-    if (taken < n) s_host_frames.feed(buf + taken, n - taken);
+    s_host_frames.feed(buf, n);
   }
 }
 

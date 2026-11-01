@@ -125,13 +125,15 @@ uint32_t s_hse_measured[2];  // crystal, external clock
 
 extern "C" {
 
+extern const uint32_t g_pfnVectors[];
+
 __attribute__((section(".app_desc"), used)) const AppDesc g_app_desc = {
     0xABCD5432, 0, {}, SOFGNSS_VERSION, "sofgnss", __TIME__, __DATE__, "stm32g4", {}, {}};
 
 // Runs before .data and .bss are set up.
 void SystemInit() {
   SCB->CPACR |= (3u << 20) | (3u << 22);  // FPU
-  SCB->VTOR = FLASH_BASE;
+  SCB->VTOR = reinterpret_cast<uint32_t>(g_pfnVectors);  // after the bootloader
 }
 
 void SysTick_Handler() {}  // only wakes the main loop
@@ -278,7 +280,7 @@ AppInfo app_info() {
   return info;
 }
 
-// No firmware update yet: flash over SWD.
+// The bootloader takes updates (BOOT, then OTA there).
 bool ota_begin(uint32_t) { return false; }
 bool ota_write(const uint8_t*, size_t) { return false; }
 bool ota_end(const uint8_t*) { return false; }

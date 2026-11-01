@@ -161,10 +161,10 @@ Device to host:
 | `$PVDB,SOFPPS,PPS,<tick>,<rx_idle_ms>` | PPS edge captured at `<tick>`. `<rx_idle_ms>` is how long the GPS line had been quiet at the edge, at least. It is 0 if GPS bytes were still on their way (see below). |
 | `$PVDB,SOFPPS,SOF,<tick>,<frame>` | SOF of USB frame `<frame>` (64-bit unwrapped) received at `<tick>` |
 | `$PVDB,SOFPPS,INFO,<tick_hz>,<divider>,<pps>,<sof_tags>,<sof_missed>,<dropped>,<parse_errors>,<tag>,<pps_rejected>` | Sent with an empty `<tag>` when the host connects and every `SOFGNSS_INFO_INTERVAL_S` seconds (default 1). A requested INFO echoes the request's tag. `<pps_rejected>` counts PPS edges dropped as glitches since boot. It comes after `<tag>` so older parsers keep working. |
-| `$PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, ESP-IDF version (`stm32g4` on the STM32 port), running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted (`POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT`, ...). The SHA-256 is the value in the `.bin`'s app descriptor at offset 32, so a host can tell whether an update is needed. Sent when the host connects and on request. |
+| `$PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, ESP-IDF version (`stm32g4` on the STM32 port, `stm32g4-boot` from its bootloader, see [Bootloader](#bootloader)), running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted (`POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT`, ...). The SHA-256 is the value in the `.bin`'s app descriptor at offset 32, so a host can tell whether an update is needed. Sent when the host connects and on request. |
 | `$PVDB,SOFPPS,USB,<mounted>,<suspended>,<dtr>,<lc_events>,<ls_events>,<baud>` | USB control-path diagnostics, sent with every INFO |
 | `$PVDB,SOFPPS,OTA,READY` / `OTA,ACK,<bytes>` / `OTA,OK` | Firmware update progress |
-| `$PVDB,SOFPPS,ERR,<code>` | Reply to a malformed command or a failed update (`BADDIV`, `BADTAG`, `BADCAL`, `NOCAL` (a mode the board can't send: `SQ40` on the STM32), `UNKNOWN`, `OTAARGS`, `OTABUSY`, `OTABEGIN`, `OTAWRITE`, `OTAVERIFY`, `OTATIMEOUT`, `OTALINK`). `OTABUSY` means an `OTA` command came in while an update was running or waiting for its restart, and that update is left alone. `OTALINK` means the update was aborted because the host went away. That happens when USB is unconfigured, reset or suspended, and with `SOFGNSS_REQUIRE_DTR` also when DTR drops. |
+| `$PVDB,SOFPPS,ERR,<code>` | Reply to a malformed command or a failed update (`BADDIV`, `BADTAG`, `BADCAL`, `NOCAL` (a mode the board can't send: `SQ40` on the STM32), `UNKNOWN`, `OTAARGS`, `OTABUSY`, `OTABEGIN`, `OTAWRITE`, `OTAVERIFY`, `OTATIMEOUT`, `OTALINK`, and on the STM32 `OTABOOT`, `NOAPP`, `BADAPP`). `OTABUSY` means an `OTA` command came in while an update was running or waiting for its restart, and that update is left alone. `OTALINK` means the update was aborted because the host went away. That happens when USB is unconfigured, reset or suspended, and with `SOFGNSS_REQUIRE_DTR` also when DTR drops. |
 
 Host to device. The host's stream is framed like the receiver's. Only whole,
 checksum-valid NMEA, UBX and RTCM3 frames are forwarded to the GPS. Everything
@@ -182,7 +182,9 @@ GPS whole. The board waits for UART space rather than cutting one.
 | `$PVDB,SOFPPS,PING` | No reply. It counts as host activity for the host-silence watchdog. |
 | `$PVDB,SOFPPS,VER` | Request a VER sentence. This also confirms a freshly installed image. |
 | `$PVDB,SOFPPS,SIMPPS` | Test hook that fires the PPS capture in software. It takes the real path through the ISR, sentence, LED and DCD. Within 0.5 s of another edge it is dropped as a glitch. |
-| `$PVDB,SOFPPS,OTA,<size>,<sha256hex>` | Start a firmware update. Wait for `OTA,READY`, then send exactly `<size>` raw image bytes. Nothing else may be sent until `OTA,OK` or `ERR`. The transfer aborts after 5 s without data (counted from `READY`, after the slot erase) or when the host goes away. |
+| `$PVDB,SOFPPS,OTA,<size>,<sha256hex>` | Start a firmware update. Wait for `OTA,READY`, then send exactly `<size>` raw image bytes. Nothing else may be sent until `OTA,OK` or `ERR`. The transfer aborts after 5 s without data (counted from `READY`, after the slot erase) or when the host goes away. On the STM32 only the bootloader takes it, the app answers `ERR,OTABOOT`. |
+| `$PVDB,SOFPPS,BOOT` | STM32 only: restart into the bootloader. |
+| `$PVDB,SOFPPS,START` | STM32 bootloader only: check the installed app and start it, or answer `ERR,NOAPP` (none installed) or `ERR,BADAPP` (hash or signature wrong). |
 
 Any valid command confirms a newly installed image and so cancels the
 rollback.
@@ -483,19 +485,53 @@ Without a usable HSE the core runs from HSI16 (about 1 % off) and USB from
 HSI48 trimmed by the CRS, so SOF captures are unreliable. USB runs from HSI48, trimmed to the host's SOF by the CRS.
 
 ```sh
-cmake -S stm32g4 -B stm32g4/build          # fetches TinyUSB and CMSIS
-cmake --build stm32g4/build                # stm32g4/build/sofgnss.bin
-cmake --build stm32g4/build --target dfu   # over USB (dfu-util)
+cmake -S stm32g4 -B stm32g4/build          # fetches TinyUSB, CMSIS and micro-ecc
+cmake --build stm32g4/build                # bootloader, app and the images below
+cmake --build stm32g4/build --target dfu   # everything over USB (dfu-util)
 cmake --build stm32g4/build --target flash # or over ST-LINK (OpenOCD)
+tools/ota.py stm32g4/build/sofgnss-signed.bin   # app update over the CDC port
 ```
 
-For DFU, hold BOOT0, press and release NRST, then release BOOT0. The chip's
-ROM bootloader then shows up as `0483:df11`, and the app starts after the
-download.
+The build writes `sofgnss-signed.bin`, the app with its signed header, which
+is what OTA sends, and `sofgnss-full.bin`, bootloader, header and app for an
+empty chip. For DFU, hold BOOT0, press and release NRST, then release BOOT0.
+The chip's ROM bootloader then shows up as `0483:df11`. After the download it
+jumps to our bootloader, which resets itself to start clean.
 
-There is no OTA yet (a bootloader will do it later): `OTA` answers
-`ERR,OTABEGIN`, and sofd doesn't send ESP32 images to boards whose VER reports
-`stm32g4`. The calibration output is described under
+### Bootloader
+
+Flash layout: the bootloader in the first 24 KB, the image header in the next
+4 KB, the app from 0x08007000. The bootloader uses only CCM SRAM, so the app's
+panic flag survives, and it leaves the reset flags for the app to read.
+
+The bootloader never starts the app by itself, because the board is of no use
+without a host. It enumerates with the same USB identity and answers `INFO`,
+`VER`, `PING`, `OTA` and `START`. Its VER reports platform `stm32g4-boot`, the
+installed app's version and ELF SHA-256, and in the partition field the app's
+state: `valid`, `invalid` or `empty`. The host then sends `START`, or `OTA`
+with a new image followed by `START`. A running app is sent `BOOT` first.
+sofd and `tools/ota.py` do all of this.
+
+`START` checks the app's SHA-256 and signature every time (about 1 s), then
+puts USB, clocks and interrupts back to reset state and jumps to the app. An
+update erases the header first, writes the app, checks it and writes the
+header last, so an interrupted or bad update leaves the state `empty`, and the
+bootloader stays reachable for the next try.
+
+The watchdog starts at the bootloader's first instruction, and the bootloader
+also restarts after 60 s without host data, in case USB came up wrong. The
+bootloader itself is only written over DFU or SWD.
+
+Images are signed with ECDSA P-256 (micro-ecc). The key is
+`keys/stm32_signing_key.pem`, not in git. Create it once and keep a backup.
+The bootloader build embeds its public key, so boards only take images signed
+with the key of the bootloader they run:
+
+```sh
+stm32g4/sign.py keygen keys/stm32_signing_key.pem
+```
+
+The calibration output is described under
 [SDR calibration output](#on-the-stm32g474). The independent watchdog (about 4 s) replaces the task watchdog, and VER's reset
 reasons are `POWERON`, `EXT`, `SW`, `PANIC` (a fault handler), `WDT`.
 
@@ -515,6 +551,8 @@ esp32s3/                 ESP-IDF project (idf.py)
   main/app_main.cpp      task wiring (FreeRTOS), Kconfig menus
   components/port_esp32s3/  HAL: TinyUSB glue, MCPWM capture, UART, OTA, calibration
 stm32g4/                 bare-metal CMake project
+  boot/                  bootloader: USB, OTA into flash, signature check
+  sign.py                signing key, signed and full images
   src/main.cpp           main loop
   src/*.cpp              HAL: clocks, TIM2 capture, UART, USB, calibration
   include/               pins and settings (port.h, config.h), TinyUSB config
