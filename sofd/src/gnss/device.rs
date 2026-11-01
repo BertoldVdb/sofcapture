@@ -1,5 +1,6 @@
 //! The tty of a sofgnss board and the thread that runs its session.
 
+use super::gpio::Poller;
 use super::pps::Pps;
 use super::session::{Config, Output, Port, Session};
 use super::timing::MIN_IDLE_MS;
@@ -203,7 +204,38 @@ impl Board {
     }
 }
 
-/// A receiver on a serial port, with its pulses on a /dev/pps device.
+/// Where a receiver's pulses come from.
+#[derive(Debug, Clone)]
+pub enum PpsSpec {
+    Device(String),
+    Gpio(u8),
+}
+
+impl std::fmt::Display for PpsSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PpsSpec::Device(p) => write!(f, "{p}"),
+            PpsSpec::Gpio(n) => write!(f, "GPIO {n} (polled)"),
+        }
+    }
+}
+
+enum PulseSource {
+    Device(Pps),
+    Gpio(Poller),
+}
+
+impl PulseSource {
+    /// A new edge: CLOCK_REALTIME, and CLOCK_MONOTONIC_RAW where it was read directly.
+    fn fetch(&mut self) -> std::io::Result<Option<(Ns, Option<Ns>)>> {
+        match self {
+            PulseSource::Device(p) => Ok(p.fetch()?.map(|t| (t, None))),
+            PulseSource::Gpio(g) => Ok(g.fetch()?.map(|e| (e.realtime_ns, Some(e.raw_ns)))),
+        }
+    }
+}
+
+/// A receiver on a serial port, with its pulses on a /dev/pps device or a polled GPIO.
 pub struct Receiver {
     pub id: u64,
     worker: Worker,
@@ -220,7 +252,7 @@ struct Io {
     name: String,
     id: u64,
     tty: Tty,
-    pps: Option<Pps>,
+    pps: Option<PulseSource>,
     /// Board sessions: their SOF tags.
     feed: Option<Arc<Feed>>,
 }
@@ -260,9 +292,12 @@ pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Resu
     Ok(Board { info, id, feed, worker })
 }
 
-pub fn spawn_receiver(name: &str, tty: &str, pps: &str, cfg: Config, out: &Sender<Msg>) -> Result<Receiver> {
+pub fn spawn_receiver(name: &str, tty: &str, pps: &PpsSpec, cfg: Config, out: &Sender<Msg>) -> Result<Receiver> {
     let t = Tty::open(tty, cfg.initial_baud).with_context(|| format!("opening {tty}"))?;
-    let p = Pps::open(pps).with_context(|| format!("opening {pps}"))?;
+    let p = match pps {
+        PpsSpec::Device(path) => PulseSource::Device(Pps::open(path).with_context(|| format!("opening {path}"))?),
+        PpsSpec::Gpio(n) => PulseSource::Gpio(Poller::start(*n).with_context(|| format!("polling GPIO {n}"))?),
+    };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let io = Io { name: name.into(), id, tty: t, pps: Some(p), feed: None };
     let worker = start(io, Config { plain: true, ..cfg }, out, || {})?;
@@ -282,11 +317,11 @@ struct Pulses {
 }
 
 impl Pulses {
-    /// Raw tick and line idle time of a pulse at realtime `t`, given whether
-    /// the bytes of this read are already counted.
-    fn pulse(&mut self, t: Ns, read_at: Ns, bytes_before: bool, n: usize) -> (u64, u32) {
+    /// Raw tick and line idle time of a pulse at realtime `t` (raw `raw` if read
+    /// directly), given whether the bytes of this read are already counted.
+    fn pulse(&mut self, t: Ns, raw: Option<Ns>, read_at: Ns, bytes_before: bool, n: usize) -> (u64, u32) {
         let idle = if !bytes_before && n > 0 && read_at - t < PULSE_GUARD_NS { 0 } else { t - self.last_rx };
-        let tick = (t - clock::offset_from_raw(clock::realtime)) as u64;
+        let tick = raw.unwrap_or_else(|| t - clock::offset_from_raw(clock::realtime)) as u64;
         if self.recent.len() == 4 {
             self.recent.pop_front();
         }
@@ -320,12 +355,12 @@ fn run(mut io: Io, cfg: Config, tx: &mpsc::Receiver<Vec<u8>>, out: &Sender<Msg>,
             None => None,
         };
         // An edge after this read: its bytes came first.
-        let bytes_first = edge.is_none_or(|t| t >= read_at);
+        let bytes_first = edge.is_none_or(|(t, _)| t >= read_at);
         if bytes_first && n > 0 {
             session.on_bytes(&buf[..n], now, &mut io.tty, &mut o);
         }
-        if let Some(t) = edge {
-            let (tick, idle) = pulses.pulse(t, read_at, bytes_first, n);
+        if let Some((t, raw)) = edge {
+            let (tick, idle) = pulses.pulse(t, raw, read_at, bytes_first, n);
             session.on_pulse(tick, idle, now, &mut o);
         }
         if !bytes_first && n > 0 {
@@ -351,6 +386,8 @@ fn run(mut io: Io, cfg: Config, tx: &mpsc::Receiver<Vec<u8>>, out: &Sender<Msg>,
                 let msg = ev.get("message").map_or(String::new(), |m| format!(" {m}"));
                 info!("{}: {}{lock}{msg}", io.name, ev["state"]);
                 BoardOut::Status(ev)
+            } else if ev["event"] == "gnss_cal" {
+                BoardOut::Cal(ev)
             } else {
                 if io.pps.is_some() {
                     let t = ev["tick"].as_u64().and_then(|t| pulses.realtime_of(t));
@@ -385,12 +422,14 @@ mod tests {
         let ms = 1_000_000;
         let mut p = Pulses { last_rx: 1000 * ms, recent: VecDeque::new() };
         // Edge after the read: idle since the last bytes.
-        assert_eq!(p.pulse(1700 * ms, 1690 * ms, true, 0).1, 700);
+        assert_eq!(p.pulse(1700 * ms, None, 1690 * ms, true, 0).1, 700);
         // Bytes read just after the edge may have come before it.
-        assert_eq!(p.pulse(2700 * ms, 2705 * ms, false, 20).1, 0);
+        assert_eq!(p.pulse(2700 * ms, None, 2705 * ms, false, 20).1, 0);
         // Read well after the edge: the bytes came later.
-        let (tick, idle) = p.pulse(3700 * ms, 3750 * ms, false, 20);
+        let (tick, idle) = p.pulse(3700 * ms, None, 3750 * ms, false, 20);
         assert_eq!(idle, 2700);
         assert_eq!(p.realtime_of(tick), Some(3700 * ms));
+        // A polled edge brings its raw time.
+        assert_eq!(p.pulse(4700 * ms, Some(42), 4690 * ms, true, 0).0, 42);
     }
 }

@@ -35,6 +35,13 @@ const MAX_FAILURES: u32 = 3;
 const PASSIVE_TP_WINDOW: Ns = 3_000 * MS;
 /// The receiver counts as working while a pulse was accepted this recently.
 const LOCK_TIMEOUT: Ns = 5_000 * MS;
+/// From the bus frame start to the board's SOF capture, unless configured. The STM32
+/// captures after the SOF packet's start: 1.12 us behind a Pi 4's hub, 1.44 to 1.52 us
+/// on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO.
+pub fn default_sof_delay(platform: &str) -> Ns {
+    if platform.starts_with("stm32") { 1300 } else { 0 }
+}
+
 /// Plain mode pulse ticks are ns.
 pub const PLAIN_TICK_HZ: u32 = 1_000_000_000;
 const VER_WAIT: Ns = 1_000 * MS;
@@ -64,18 +71,21 @@ pub struct Config {
     pub leap_seconds: Option<i8>,
     /// No sofgnss board: the port is the receiver's own, pulses come in through `on_pulse`.
     pub plain: bool,
+    /// The GNSS to track, all others off. u-blox 9 and later only.
+    pub constellations: Option<Vec<ubx::Constellation>>,
     /// Emit every GPS frame.
     pub frames: bool,
     pub div: Option<u32>,
     /// From bus frame start to the device's SOF capture.
-    pub sof_delay_ns: Ns,
+    /// None: the board platform's default (`default_sof_delay`).
+    pub sof_delay_ns: Option<Ns>,
     /// Sent if VER reports a different image.
     pub firmware: Option<Arc<Image>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, leap_seconds: None, plain: false, frames: true, div: None, sof_delay_ns: 0, firmware: None }
+        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, leap_seconds: None, plain: false, constellations: None, frames: true, div: None, sof_delay_ns: None, firmware: None }
     }
 }
 
@@ -108,15 +118,17 @@ struct Step {
     ack: Option<ubx::Id>,
     /// Diagnostics: skipped if rejected or unanswered.
     optional: Option<String>,
+    /// Wait POLL_WAIT after its ACK: a signal change restarts the receiver's GNSS.
+    pause: bool,
 }
 
 impl Step {
     fn required(frame: Vec<u8>, ack: Option<ubx::Id>) -> Self {
-        Self { frame, ack, optional: None }
+        Self { frame, ack, optional: None, pause: false }
     }
 
     fn optional(frame: Vec<u8>, ack: ubx::Id, what: String) -> Self {
-        Self { frame, ack: Some(ack), optional: Some(what) }
+        Self { frame, ack: Some(ack), optional: Some(what), pause: false }
     }
 }
 
@@ -144,8 +156,9 @@ enum Rx {
     Probe { idx: usize, since: Ns },
     Identify { since: Ns, tries: u32 },
     PortPoll { since: Ns, tries: u32 },
-    /// `sends` 0: a retried step was ACKed, wait for late ACKs of its other sends before
-    /// the next. All CFG-MSG steps get the same ACK, so a late one must not count for it.
+    /// `sends` 0: waiting before the next step, for late ACKs of a retried step (all
+    /// CFG-MSG steps get the same ACK, so a late one must not count for the next) or
+    /// for a GNSS restart.
     Configure { steps: Vec<Step>, since: Ns, tries: u32, sends: u32 },
     Switch { since: Ns },
     Verify { since: Ns },
@@ -220,10 +233,19 @@ impl Session {
         self.state
     }
 
+    /// The configured delay, else the platform's once VER told it.
+    fn sof_delay(&self) -> Ns {
+        let platform = self.firmware.as_ref().map_or("", |f| f.platform.as_str());
+        self.cfg.sof_delay_ns.unwrap_or_else(|| default_sof_delay(platform))
+    }
+
     fn status(&mut self, state: &'static str, message: Option<String>, out: &mut Output) {
         self.state = state;
         self.message = message.clone();
         let mut ev = json!({"event": "gnss_status", "state": state, "baud": self.baud, "locked": self.locked});
+        if !self.cfg.plain {
+            ev["sof_delay_ns"] = json!(self.sof_delay());
+        }
         if let Some(r) = &self.receiver {
             ev["receiver"] = json!(r);
         }
@@ -345,6 +367,11 @@ impl Session {
                 self.ota_failed(&format!("device error {code}"), now, port, out);
             }
             Pvdb::Pps { tick, rx_idle_ms } => self.on_pulse(tick, rx_idle_ms, now, out),
+            Pvdb::Cal { tick, mode, synced, n, chip_rate, length } => {
+                let utc_ns = self.labeler.as_ref().and_then(|l| l.utc_of(tick));
+                out.events.push(json!({"event": "gnss_cal", "tick": tick, "mode": mode, "pps_synced": synced, "n": n,
+                    "chip_rate": chip_rate, "length_ticks": length, "utc_ns": utc_ns}));
+            }
             Pvdb::Sof { tick, frame } => {
                 if let Some(l) = &mut self.labeler {
                     l.on_sof(tick, frame, now);
@@ -374,7 +401,7 @@ impl Session {
                 out.events.push(ev);
             }
             for mut t in tags {
-                t.utc_ns -= self.cfg.sof_delay_ns;
+                t.utc_ns -= self.sof_delay();
                 out.tags.push(t);
             }
         }
@@ -580,19 +607,27 @@ impl Session {
             items.push((ubx::key::uart_out_nmea(p), 0));
             let diag_items: Vec<(u32, u32)> = diag.iter().map(|&(id, r)| (ubx::key::msgout(id, p), u32::from(r))).collect();
             let names: Vec<String> = diag.iter().map(|&(id, _)| ubx_name(id)).collect();
-            vec![
+            // First: a signal change restarts the receiver's GNSS.
+            let gnss = self.cfg.constellations.as_ref().map(|c| {
+                let items: Vec<(u32, u32)> = ubx::Constellation::ALL.iter().map(|g| (g.signal_key(), c.contains(g) as u32)).collect();
+                Step { pause: true, ..Step::optional(ubx::valset_ram(&items), ubx::CFG_VALSET, "constellations".into()) }
+            });
+            gnss.into_iter().chain([
                 Step::required(ubx::valset_ram(&items), Some(ubx::CFG_VALSET)),
                 Step::optional(ubx::valset_ram(&diag_items), ubx::CFG_VALSET, names.join(", ")),
                 Step::required(ubx::valset_ram(&[(ubx::key::uart_baud(p), target)]), None),
-            ]
+            ])
+            .collect()
         } else {
             let mut s: Vec<Step> = ubx::ENABLED.iter().map(|&id| Step::required(ubx::cfg_msg(id, 1), Some(ubx::CFG_MSG))).collect();
             s.extend(diag.iter().map(|&(id, r)| Step::optional(ubx::cfg_msg(id, r), ubx::CFG_MSG, ubx_name(id))));
             s.push(Step::required(ubx::cfg_prt(self.polled_port.as_deref(), target), None));
             s
         };
+        let ignored = (self.cfg.constellations.is_some() && !ver.uses_valset())
+            .then(|| "constellations need u-blox 9 or later; left as they are".to_string());
         self.rx = Rx::Configure { steps, since: now, tries: 0, sends: 0 };
-        self.status("configuring", None, out);
+        self.status("configuring", ignored, out);
         self.send_step(now, port);
     }
 
@@ -605,10 +640,10 @@ impl Session {
 
     fn next_step(&mut self, now: Ns, port: &mut dyn Port) {
         let Rx::Configure { steps, since, tries, sends } = &mut self.rx else { return };
-        steps.remove(0);
-        let retried = *sends > 1;
+        let pause = steps.remove(0).pause;
+        let wait = *sends > 1 || pause;
         (*since, *tries, *sends) = (now, 0, 0);
-        if !retried {
+        if !wait {
             self.send_step(now, port);
         }
     }
@@ -864,6 +899,11 @@ mod tests {
         /// No board: pulses go to `pulses` (ms), no $PVDB in either direction.
         plain: bool,
         pulses: Vec<i64>,
+        /// CFG-SIGNAL keys set, and whether VALSETs with them get a NAK.
+        signals: std::collections::BTreeMap<u32, u32>,
+        nak_signals: bool,
+        /// When each CFG-VALSET came (ms).
+        valsets: Vec<i64>,
     }
 
     impl Fake {
@@ -898,6 +938,9 @@ mod tests {
                 now_ms: 0,
                 plain: false,
                 pulses: vec![],
+                signals: Default::default(),
+                nak_signals: false,
+                valsets: vec![],
             }
         }
 
@@ -966,15 +1009,26 @@ mod tests {
                     self.ack(id, true);
                 }
                 ubx::CFG_VALSET if self.gen9 => {
-                    self.ack(id, true);
+                    self.valsets.push(self.now_ms);
+                    let mut items = vec![];
                     let mut i = 4;
                     while i < p.len() {
                         let k = u32::from_le_bytes(p[i..i + 4].try_into().unwrap());
                         let n = if k >> 28 == 4 { 4 } else { 1 };
                         let mut v = [0u8; 4];
                         v[..n].copy_from_slice(&p[i + 4..i + 4 + n]);
-                        let v = u32::from_le_bytes(v);
+                        items.push((k, u32::from_le_bytes(v)));
                         i += 4 + n;
+                    }
+                    let signal = |k: u32| k >> 16 == 0x1031;
+                    if self.nak_signals && items.iter().any(|&(k, _)| signal(k)) {
+                        return self.ack(id, false);
+                    }
+                    self.ack(id, true);
+                    for (k, v) in items {
+                        if signal(k) {
+                            self.signals.insert(k, v);
+                        }
                         match k {
                             0x4052_0001 => self.rx_baud = v,
                             0x1074_0001 => self.ubx_out = v != 0,
@@ -1369,6 +1423,62 @@ mod tests {
             assert_eq!(e["utc_ns"].as_i64().unwrap(), UTC0_S * 1_000_000_000 + tick - 1000, "{e}");
         }
         assert!(r.out.tags.is_empty());
+    }
+
+    #[test]
+    fn sets_constellations_on_generation_9() {
+        use ubx::Constellation::*;
+        let cfg = Config { constellations: Some(vec![Gps, Galileo, Beidou]), ..Config::default() };
+        let mut r = Run::with(cfg, Fake::new(38_400, true, true));
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        let on: Vec<u32> = r.fake.signals.iter().filter(|(_, v)| **v == 1).map(|(k, _)| *k).collect();
+        assert_eq!(on, vec![Gps.signal_key(), Galileo.signal_key(), Beidou.signal_key()]);
+        assert_eq!(r.fake.signals.len(), 6);
+        // The receiver's GNSS restarts: 0.5 s at least before the next.
+        assert!(r.fake.valsets[1] - r.fake.valsets[0] >= 500, "{:?}", r.fake.valsets);
+        r.check_tags(Source::TimTp);
+    }
+
+    #[test]
+    fn rejected_constellations_do_not_stop_the_setup() {
+        let cfg = Config { constellations: Some(vec![ubx::Constellation::Gps]), ..Config::default() };
+        let mut f = Fake::new(38_400, true, true);
+        f.nak_signals = true;
+        let mut r = Run::with(cfg, f);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.out.events.iter().any(|e| e["message"] == "receiver rejected constellations; continuing without"));
+    }
+
+    #[test]
+    fn constellations_are_left_alone_before_generation_9() {
+        let cfg = Config { constellations: Some(vec![ubx::Constellation::Gps]), ..Config::default() };
+        let mut r = Run::with(cfg, Fake::new(9600, false, true));
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.fake.signals.is_empty());
+        assert!(r.out.events.iter().any(|e| e["message"] == "constellations need u-blox 9 or later; left as they are"));
+    }
+
+    #[test]
+    fn stm32_boards_default_to_their_sof_delay() {
+        let mut f = Fake::new(9600, false, true);
+        f.platform = "stm32g4";
+        let mut r = Run::new(f);
+        r.for_secs(20);
+        assert!(r.out.tags.len() > 20);
+        for t in &r.out.tags {
+            let super::super::timing::At::Frame { frame, .. } = t.at else { panic!("{t:?}") };
+            assert_eq!(t.utc_ns, (UTC0_S * 1000 + frame as i64) * MS - 1300, "{t:?}");
+        }
+        assert_eq!(r.out.events.iter().rev().find(|e| e["event"] == "gnss_status").unwrap()["sof_delay_ns"], 1300);
+        // Configured, even 0, it wins.
+        let mut f = Fake::new(9600, false, true);
+        f.platform = "stm32g4";
+        let mut r = Run::with(Config { sof_delay_ns: Some(0), ..Config::default() }, f);
+        r.for_secs(20);
+        r.check_tags(Source::TimTp);
     }
 
     #[test]

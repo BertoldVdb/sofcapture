@@ -137,6 +137,7 @@ fn main() -> Result<()> {
         },
         default_rate_hz: cfg.sampler.default_rate_hz,
         model_hz: cfg.sampler.model_hz,
+        counter_lead: cfg.controllers.iter().filter_map(|(id, c)| c.counter_lead_ns.map(|l| (id.clone(), l))).collect(),
         power: power::Settings {
             max_cpu_latency_us: cfg.sampler.max_cpu_latency_us,
             cpu_governor: cfg.sampler.cpu_governor.clone(),

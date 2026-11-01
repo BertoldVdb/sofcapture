@@ -7,6 +7,7 @@
 namespace {
 
 constexpr uint32_t kSmcrTsItr11 = TIM_SMCR_TS_0 | TIM_SMCR_TS_1 | TIM_SMCR_TS_2 | TIM_SMCR_TS_3;
+constexpr uint32_t kFnrWait = sofgnss::port::kCoreHz / 1000000 * 8;  // 8 us
 
 volatile uint32_t s_wraps;
 volatile uint32_t s_sof_dropped;
@@ -25,7 +26,12 @@ extern "C" void TIM2_IRQHandler() {
   }
   if (sr & TIM_SR_CC1IF) {
     uint32_t tick = TIM2->CCR1;  // clears CC1IF
+    // The trigger comes as the SOF packet starts, FNR once it is decoded (about
+    // 3 us at full speed). Wait for the new number, unless it is already there.
     uint16_t frame = USB->FNR & USB_FNR_FN;
+    while ((USB->FNR & USB_FNR_FN) == frame && TIM2->CNT - tick < kFnrWait) {
+    }
+    frame = USB->FNR & USB_FNR_FN;
     if (sr & TIM_SR_CC1OF) {
       TIM2->SR = ~TIM_SR_CC1OF;
       s_sof_dropped = s_sof_dropped + 1;

@@ -1,7 +1,7 @@
 //! Frame counter register access per controller family. Each sample is a counter value
 //! and the CLOCK_MONOTONIC_RAW time its (micro)frame started.
 
-use crate::clock::{self, Ns};
+use crate::clock::{self, Ns, Ticks};
 use crate::discovery::{self, BackendKind, Controller, MmioOverride};
 use crate::kmod;
 use crate::mmio::Mmio;
@@ -83,6 +83,7 @@ pub fn open(c: &Controller, overrides: &[MmioOverride], edges: u32, irq_off_max_
 /// xHCI: MFINDEX has no sub-frame phase, so spin reading it until it steps.
 pub struct Xhci {
     regs: Mmio,
+    ticks: Ticks,
     usbsts: usize,
     mfindex: usize,
     edges: u32,
@@ -104,7 +105,7 @@ impl Xhci {
         if rtsoff + 4 > regs.len() || caplen + 8 > regs.len() {
             bail!("xHCI registers at {rtsoff:#x}/{caplen:#x} lie outside the mapped {:#x} bytes", regs.len());
         }
-        Ok(Self { usbsts: caplen + 4, mfindex: rtsoff, regs, edges })
+        Ok(Self { usbsts: caplen + 4, mfindex: rtsoff, regs, edges, ticks: Ticks::new() })
     }
 }
 
@@ -113,31 +114,33 @@ impl Backend for Xhci {
         if self.regs.read32(self.usbsts) & 1 != 0 {
             bail!("controller halted (USBSTS.HCH); MFINDEX is not running");
         }
-        let regs = &self.regs;
+        self.ticks.calibrate();
+        let (regs, tk) = (&self.regs, &self.ticks);
         let off = self.mfindex;
         let read = || regs.read32(off) & COUNTER_MASK;
 
-        let deadline = clock::raw() + 2_000_000 + self.edges as Ns * HS_UNIT_NS as Ns;
+        let deadline = tk.of_raw(clock::raw() + 2_000_000 + self.edges as Ns * HS_UNIT_NS as Ns);
+        let slack = tk.of_raw(tk.raw(0) + 1000);
         let mut best: Option<RawSample> = None;
         let mut found = 0;
         // A step seen in v happened between t_prev and t_next.
-        let mut t_prev = clock::raw();
+        let mut t_prev = tk.read();
         let mut v_prev = read();
         let v_start = v_prev;
-        let mut t_cur = clock::raw();
+        let mut t_cur = tk.read();
         let mut min_read = t_cur - t_prev;
         loop {
             let v = read();
-            let t_next = clock::raw();
+            let t_next = tk.read();
             min_read = min_read.min(t_next - t_cur);
             // Skip jumps of more than one and brackets much longer than two reads:
             // we were interrupted. Same limit as the sofclock module.
-            let clean = t_next - t_prev <= 4 * min_read + 1000;
+            let clean = t_next - t_prev <= 4 * min_read + slack;
             if v != v_prev && v == (v_prev + 1) & COUNTER_MASK && clean {
                 let s = RawSample {
                     counter: v,
-                    t_ns: t_prev + (t_next - t_prev) / 2,
-                    unc_ns: (t_next - t_prev + 1) / 2,
+                    t_ns: tk.raw(t_prev + (t_next - t_prev) / 2),
+                    unc_ns: (tk.ns(t_next - t_prev) + 1) / 2,
                     unit_ns: HS_UNIT_NS,
                 };
                 if best.as_ref().is_none_or(|b| s.unc_ns < b.unc_ns) {
@@ -173,6 +176,7 @@ const HPRT0: usize = 0x440;
 /// so no spinning: take the tightest read of a short burst.
 pub struct Dwc2 {
     regs: Mmio,
+    ticks: Ticks,
 }
 
 impl Dwc2 {
@@ -186,7 +190,7 @@ impl Dwc2 {
         if !matches!(id >> 16, 0x4f54 | 0x5531 | 0x5532) {
             bail!("registers do not look like DWC2 (GSNPSID {id:#010x})");
         }
-        Ok(Self { regs })
+        Ok(Self { regs, ticks: Ticks::new() })
     }
 }
 
@@ -208,20 +212,21 @@ impl Backend for Dwc2 {
         // At the frame boundary FrNum can change before FrRem reloads (seen as
         // samples exactly one frame early), so skip reads close to it.
         let guard = frint / 64;
-        let mut best = (Ns::MAX, 0, 0);
+        self.ticks.calibrate();
+        let mut best = (u64::MAX, 0, 0);
         for _ in 0..Self::BURST {
-            let t0 = clock::raw();
+            let t0 = self.ticks.read();
             let v = self.regs.read32(HFNUM);
-            let t1 = clock::raw();
+            let t1 = self.ticks.read();
             let rem = v >> 16;
             if rem > guard && rem < frint - guard && t1 - t0 < best.0 {
                 best = (t1 - t0, t0 + (t1 - t0) / 2, v);
             }
         }
-        let (width, mid, v) = best;
-        if width == Ns::MAX {
+        if best.0 == u64::MAX {
             return Ok(None);
         }
+        let (width, mid, v) = (self.ticks.ns(best.0), self.ticks.raw(best.1), best.2);
         let frnum = v & 0xffff;
         let frrem = v >> 16;
         // FrRem counts down from FrInt to 0 across one (micro)frame.

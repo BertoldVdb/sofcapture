@@ -10,7 +10,7 @@ use crate::gnss::firmware::Image;
 use crate::gnss::framer::Kind;
 use crate::gnss::external::{self, LOST_AFTER_S};
 use crate::gnss::timing::{Source, Tag};
-use crate::gnss::{session, Feed, Hub};
+use crate::gnss::{session, Feed, HostClock, Hub};
 use crate::mqtt::{self, Mqtt};
 use crate::power;
 use crate::sampler::{Sampler, SamplerConfig, MAX_RATE_HZ, MIN_RATE_HZ};
@@ -74,6 +74,8 @@ pub struct SampleOut {
 pub enum BoardOut {
     Status(Value),
     Pps(Value),
+    /// A calibration burst.
+    Cal(Value),
     Frame(Kind, Vec<u8>),
     Ended(String),
 }
@@ -91,6 +93,8 @@ pub struct Options {
     /// `model` publish rate unless a client asks for more.
     pub model_hz: f64,
     pub power: power::Settings,
+    /// `controllers.<id>.counter_lead_ns` from the config.
+    pub counter_lead: BTreeMap<String, i64>,
 }
 
 /// Keeps the controller out of runtime suspend so its frame counter runs.
@@ -145,6 +149,7 @@ struct Running {
     // Field order matters: stop the sampler before restoring runtime PM.
     sampler: Sampler,
     rate_hz: f64,
+    counter_lead_ns: Ns,
     _pm: Option<PmGuard>,
 }
 
@@ -165,13 +170,27 @@ struct Slot {
     ended: bool,
 }
 
-/// A receiver on a serial port with its pulses on /dev/pps.
+/// A receiver on a serial port with its pulses on /dev/pps or a polled GPIO.
 struct RecvSlot {
     rx: Option<device::Receiver>,
     retry_at: Instant,
     backoff: Duration,
     status: Value,
     chrony_busy: bool,
+    /// Its accepted pulses on the raw clock, for controllers without another reference.
+    clock: Arc<HostClock>,
+    feed: Arc<Feed>,
+}
+
+/// How exactly a receiver's pulses are timed.
+const POLLED_PPS_UNC_NS: Ns = 300;
+const KERNEL_PPS_UNC_NS: Ns = 3_000;
+
+fn pps_spec(r: &config::Receiver) -> device::PpsSpec {
+    match (&r.pps, r.pps_gpio) {
+        (Some(p), _) => device::PpsSpec::Device(p.clone()),
+        (None, n) => device::PpsSpec::Gpio(n.unwrap_or(0)),
+    }
 }
 
 /// An MQTT client acting as a controller's GNSS reference.
@@ -263,8 +282,13 @@ impl Daemon {
         let now = Instant::now();
         let receivers = gnss
             .receivers
-            .keys()
-            .map(|n| (n.clone(), RecvSlot { rx: None, retry_at: now, backoff: Duration::ZERO, status: Value::Null, chrony_busy: false }))
+            .iter()
+            .map(|(n, r)| {
+                let clock = Arc::new(HostClock::new(if r.pps_gpio.is_some() { POLLED_PPS_UNC_NS } else { KERNEL_PPS_UNC_NS }));
+                let feed = Arc::new(Feed::host(n, clock.clone()));
+                let slot = RecvSlot { rx: None, retry_at: now, backoff: Duration::ZERO, status: Value::Null, chrony_busy: false, clock, feed };
+                (n.clone(), slot)
+            })
             .collect();
         Self {
             opts,
@@ -566,6 +590,13 @@ impl Daemon {
                 }
                 self.print(&ev);
             }
+            BoardOut::Cal(mut ev) => {
+                ev["board"] = json!(serial);
+                if let Some(m) = &self.mqtt {
+                    m.publish_json(&format!("gnss/{serial}/cal"), &ev, false);
+                }
+                self.print(&ev);
+            }
             BoardOut::Frame(kind, f) => {
                 if let Some(m) = &self.mqtt {
                     m.publish(&format!("gnss/{serial}/{}", mqtt::frame_topic(kind, &f)), f.clone(), false);
@@ -646,6 +677,44 @@ impl Daemon {
                 (Some(n), None) => info!("{c}: board {n} is the GNSS reference"),
                 (None, Some(o)) => info!("{c}: board {o} is no longer the GNSS reference"),
                 (None, None) => continue,
+            }
+            self.controller_event(&c, &json!({"event": "reference", "controller": c, "board": new}));
+        }
+        self.assign_host_feeds();
+    }
+
+    /// A sampled controller without a board or MQTT reference is dated by a locked
+    /// receiver's host clock, through its own samples.
+    fn assign_host_feeds(&mut self) {
+        let locked = self
+            .receivers
+            .values()
+            .find(|r| RUNNING_STATES.contains(&r.status["state"].as_str().unwrap_or("")) && r.status["locked"] == true)
+            .map(|r| r.feed.clone());
+        let mut hub = self.hub.lock().unwrap();
+        let mut changes = vec![];
+        for c in self.samplers.keys() {
+            let current = hub.get(c).cloned();
+            match (&current, &locked) {
+                (Some(f), _) if f.host.is_none() => {}
+                (Some(f), Some(l)) if Arc::ptr_eq(f, l) => {}
+                (cur, Some(l)) => {
+                    hub.insert(c.clone(), l.clone());
+                    changes.push((c.clone(), Some(l.serial.clone()), cur.as_ref().map(|f| f.serial.clone())));
+                }
+                (Some(f), None) => {
+                    hub.remove(c);
+                    changes.push((c.clone(), None, Some(f.serial.clone())));
+                }
+                (None, None) => {}
+            }
+        }
+        drop(hub);
+        for (c, new, old) in changes {
+            match (&new, &old) {
+                (Some(n), _) => info!("{c}: {n}'s host clock is the GNSS reference"),
+                (None, Some(o)) => info!("{c}: {o}'s host clock is no longer the GNSS reference"),
+                (None, None) => {}
             }
             self.controller_event(&c, &json!({"event": "reference", "controller": c, "board": new}));
         }
@@ -767,7 +836,8 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return self.ref_problem(controller, client, json!({"event": "ref_rejected", "reason": "invalid", "message": e})),
         };
-        let attached = self.hub.lock().unwrap().get(controller).cloned();
+        // A receiver's host clock gives way.
+        let attached = self.hub.lock().unwrap().get(controller).cloned().filter(|f| f.host.is_none());
         let feed = match (attached, self.refs.get(controller)) {
             (Some(f), Some(r)) if r.client == client && Arc::ptr_eq(&f, &r.feed) => f,
             (Some(f), _) => {
@@ -866,6 +936,7 @@ impl Daemon {
         for c in v["controllers"].as_array_mut().into_iter().flatten() {
             let id = c["id"].as_str().unwrap_or("").to_string();
             c["rate_hz"] = json!(self.samplers.get(&id).map(|r| r.rate_hz));
+            c["counter_lead_ns"] = json!(self.samplers.get(&id).map(|r| r.counter_lead_ns));
             c["model_hz"] = json!(self.samplers.get(&id).map(|r| self.model_hz(&id).min(r.rate_hz)));
         }
         v["boards"] = json!(self.slots.iter().map(|(s, sl)| { let mut st = sl.status.clone(); st["board"] = json!(s); st }).collect::<Vec<_>>());
@@ -1011,8 +1082,8 @@ impl Daemon {
         let due: Vec<String> = self.receivers.iter().filter(|(_, r)| r.rx.is_none() && now >= r.retry_at).map(|(n, _)| n.clone()).collect();
         for name in due {
             let rc = &self.gnss.receivers[&name];
-            let (tty, pps) = (rc.tty.clone(), rc.pps.clone());
-            let result = device::spawn_receiver(&name, &tty, &pps, session_config(&self.gnss.receiver(&name)), &self.tx);
+            let (tty, pps) = (rc.tty.clone(), rc.pps_name());
+            let result = device::spawn_receiver(&name, &tty, &pps_spec(rc), session_config(&self.gnss.receiver(&name)), &self.tx);
             let r = self.receivers.get_mut(&name).unwrap();
             match result {
                 Ok(rx) => {
@@ -1044,7 +1115,7 @@ impl Daemon {
             BoardOut::Status(mut ev) => {
                 ev.as_object_mut().map(|o| o.remove("event"));
                 let rc = &self.gnss.receivers[name];
-                (ev["tty"], ev["pps"]) = (json!(rc.tty), json!(rc.pps));
+                (ev["tty"], ev["pps"]) = (json!(rc.tty), json!(rc.pps_name()));
                 if RUNNING_STATES.contains(&ev["state"].as_str().unwrap_or("")) {
                     self.receivers.get_mut(name).unwrap().backoff = Duration::ZERO;
                 }
@@ -1052,6 +1123,7 @@ impl Daemon {
                 (printed["event"], printed["receiver"]) = (json!("gnss_status"), json!(name));
                 self.print(&printed);
                 self.set_receiver_status(name, ev);
+                self.assign_feeds();
             }
             BoardOut::Pps(mut ev) => {
                 ev["receiver"] = json!(name);
@@ -1060,10 +1132,15 @@ impl Daemon {
                 }
                 self.print(&ev);
                 let point = (ev["accepted"] == true).then(|| ev["t_realtime_ns"].as_i64().zip(ev["utc_ns"].as_i64())).flatten();
+                if let (true, Some(tick), Some(utc)) = (ev["accepted"] == true, ev["tick"].as_i64(), ev["utc_ns"].as_i64()) {
+                    self.receivers[name].clock.push(tick, utc);
+                }
                 if let Some((t_realtime_ns, t_gnss_ns)) = point {
                     self.receiver_to_chrony(name, chrony::Point { t_realtime_ns, t_gnss_ns });
                 }
             }
+            // Receivers have no calibration output.
+            BoardOut::Cal(_) => {}
             BoardOut::Frame(kind, f) => {
                 if let Some(m) = &self.mqtt {
                     m.publish(&format!("gnss/{name}/{}", mqtt::frame_topic(kind, &f)), f.clone(), false);
@@ -1076,13 +1153,15 @@ impl Daemon {
                 warn!("{name}: {reason}");
                 let r = self.receivers.get_mut(name).unwrap();
                 r.rx = None;
+                r.clock.clear();
                 r.backoff = backoff(r.backoff);
                 r.retry_at = Instant::now() + r.backoff;
                 self.chrony.release(name);
                 self.receiver_event(name, json!({"event": "detached", "reason": reason}));
                 let rc = &self.gnss.receivers[name];
-                let st = json!({"state": "error", "message": reason, "tty": rc.tty, "pps": rc.pps});
+                let st = json!({"state": "error", "message": reason, "tty": rc.tty, "pps": rc.pps_name()});
                 self.set_receiver_status(name, st);
+                self.assign_feeds();
             }
         }
     }
@@ -1231,9 +1310,17 @@ impl Daemon {
         // A suspended controller reads all-ones and its counter stops.
         let pm = PmGuard::hold(&ctrl);
         let backend = backend::open(&ctrl, &self.opts.overrides, 2, self.opts.irq_off_max_ns)?;
-        let sampler = Sampler::spawn(id.to_string(), backend, rate, self.opts.sampler.clone(), self.tx.clone(), self.hub.clone())
+        let lead = match (self.opts.counter_lead.get(id), discovery::known_counter_lead(&ctrl)) {
+            (Some(&l), _) => l,
+            (None, Some((l, name))) => {
+                info!("{id}: {name}: its frame counter runs {} us ahead of the bus, host times corrected", l as f64 / 1e3);
+                l
+            }
+            (None, None) => 0,
+        };
+        let sampler = Sampler::spawn(id.to_string(), backend, rate, lead, self.opts.sampler.clone(), self.tx.clone(), self.hub.clone())
             .context("starting sampler thread")?;
-        Ok(Running { sampler, rate_hz: rate, _pm: pm })
+        Ok(Running { sampler, rate_hz: rate, counter_lead_ns: lead, _pm: pm })
     }
 
     fn publish_infos(&mut self) {
@@ -1348,9 +1435,10 @@ fn session_config(b: &config::Board) -> session::Config {
         strict: b.strict,
         leap_seconds: b.leap_seconds,
         plain: false,
+        constellations: b.constellations.clone(),
         frames: b.frames,
         div: b.div,
-        sof_delay_ns: b.sof_delay_ns as Ns,
+        sof_delay_ns: b.sof_delay_ns.map(|d| d as Ns),
         firmware: None,
     }
 }

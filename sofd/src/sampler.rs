@@ -1,6 +1,6 @@
 //! Per-controller sampling thread: reads the frame counter, fits it, emits events.
 
-use crate::backend::{Backend, HS_UNIT_NS};
+use crate::backend::{Backend, RawSample, HS_UNIT_NS};
 use crate::chrony;
 use crate::clock::{self, Ns, RealtimeSync};
 use crate::daemon::{Msg, SampleOut};
@@ -159,6 +159,7 @@ impl Sampler {
         controller: String,
         backend: Box<dyn Backend>,
         rate_hz: f64,
+        counter_lead_ns: Ns,
         cfg: SamplerConfig,
         out: Sender<Msg>,
         hub: Hub,
@@ -168,7 +169,7 @@ impl Sampler {
         let (s, p) = (stop.clone(), period_ns.clone());
         let thread = std::thread::Builder::new()
             .name(format!("sof-{controller}"))
-            .spawn(move || run(&controller, backend, &cfg, &s, &p, &out, &hub))?;
+            .spawn(move || run(&controller, backend, counter_lead_ns, &cfg, &s, &p, &out, &hub))?;
         Ok(Self { stop, period_ns, thread: Some(thread) })
     }
 
@@ -204,19 +205,29 @@ fn apply_scheduling(cfg: &SamplerConfig) {
         }
     }
     if let Some(prio) = cfg.rt_prio {
-        // SAFETY: sched_param is plain data (musl adds extra fields).
-        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-        param.sched_priority = prio;
-        // SAFETY: pid 0 is the calling thread; param is valid.
-        if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
-            warn!("SCHED_FIFO priority {prio}: {}", std::io::Error::last_os_error());
+        if let Err(e) = set_fifo(prio) {
+            warn!("SCHED_FIFO priority {prio}: {e}");
         }
     }
 }
 
+/// SCHED_FIFO for the calling thread. musl has no sched_setscheduler (ENOSYS).
+pub fn set_fifo(prio: i32) -> std::io::Result<()> {
+    // SAFETY: sched_param is plain data (musl adds extra fields).
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = prio;
+    // SAFETY: the calling thread and a valid param.
+    match unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) } {
+        0 => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(e)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run(
     id: &str,
     mut backend: Box<dyn Backend>,
+    counter_lead_ns: Ns,
     cfg: &SamplerConfig,
     stop: &AtomicBool,
     period_ns: &AtomicI64,
@@ -283,7 +294,8 @@ fn run(
         let mono_off = clock::offset_from_raw(clock::mono);
         let real_off = clock::offset_from_raw(clock::realtime);
         let s = match backend.sample() {
-            Ok(Some(s)) if s.unc_ns <= s.unit_ns as Ns / 4 => s,
+            // The counter steps before its frame starts on the bus.
+            Ok(Some(s)) if s.unc_ns <= s.unit_ns as Ns / 4 => RawSample { t_ns: s.t_ns + counter_lead_ns, ..s },
             Ok(miss) => {
                 // Just a stall: keep the fits, the unwrap bridges the gap.
                 if let Some(s) = miss {
@@ -415,7 +427,16 @@ fn run(
             ref_state = None;
             last_ok = false;
         }
-        if let (Some(fd), Some(f)) = (&feed, &fit) {
+        if let Some(hc) = feed.as_ref().and_then(|fd| fd.host.clone()) {
+            // A receiver's host clock: date our own sample, the counter's step on the raw clock.
+            match hc.utc_of(s.t_ns) {
+                Some(u) => {
+                    model_gnss.push(counter, u, hc.unc_ns);
+                    (gnss_source, last_tag_rx, last_ok, by_counter) = (Some(Source::HostPps), Some(s.t_ns), true, true);
+                }
+                None => last_ok = false,
+            }
+        } else if let (Some(fd), Some(f)) = (&feed, &fit) {
             let per_frame: i64 = if hs { 8 } else { 1 };
             let frame_now = counter.div_euclid(per_frame);
             let tags = fd.drain();

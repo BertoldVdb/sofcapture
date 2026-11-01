@@ -28,6 +28,8 @@ pub enum Source {
     Zda,
     /// An MQTT client's own tags.
     External,
+    /// The host clock, dated by a receiver's pulses.
+    HostPps,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +93,8 @@ pub struct Labeler {
     fix: Option<(bool, u64)>,
     leap_s: Option<i8>,
     last_ok: Option<(u64, u64, Ns)>,
+    /// ns per tick between the last two accepted pulses in a row.
+    scale: Option<f64>,
     /// SOF tags waiting for the pulse after them: (tick, frame, t_rx).
     pending: VecDeque<(u64, u64, Ns)>,
 }
@@ -107,6 +111,7 @@ impl Labeler {
             fix: None,
             leap_s: None,
             last_ok: None,
+            scale: None,
             pending: VecDeque::new(),
         }
     }
@@ -169,9 +174,9 @@ impl Labeler {
         let label: Label = match (between.len(), self.source) {
             (1, _) => between[0],
             (0, Source::TimTp) => Err("no_tim_tp"),
-            (0, Source::Zda | Source::External) => Err("no_zda"),
+            (0, Source::Zda | Source::External | Source::HostPps) => Err("no_zda"),
             (_, Source::TimTp) => Err("multiple_tim_tp"),
-            (_, Source::Zda | Source::External) => Err("multiple_zda"),
+            (_, Source::Zda | Source::External | Source::HostPps) => Err("multiple_zda"),
         };
         let fix_ok = matches!(self.fix, Some((true, i)) if self.idx - i <= FIX_MAX_AGE);
         let interval_ok =
@@ -204,8 +209,8 @@ impl Labeler {
                 self.prev = Some(Pulse { label: cand, ..cur });
                 self.decided(d, decisions, tags);
             }
-            // External tags never reach a labeler.
-            Source::Zda | Source::External => {
+            // External and host clock tags never reach a labeler.
+            Source::Zda | Source::External | Source::HostPps => {
                 // ZDA describes the previous pulse.
                 if let Some(p) = self.prev.take() {
                     let cand = label.ok().map(|l| l.0);
@@ -240,11 +245,20 @@ impl Labeler {
         }
     }
 
+    /// UTC of a device tick up to 2 s after the last accepted pulse.
+    pub fn utc_of(&self, tick: u64) -> Option<Ns> {
+        let (_, t0, u0) = self.last_ok?;
+        let scale = self.scale.unwrap_or(SECOND as f64 / self.tick_hz);
+        let dt = tick.checked_sub(t0)? as f64;
+        (dt <= 2.0 * self.tick_hz).then(|| u0 + (dt * scale).round() as Ns)
+    }
+
     fn decided(&mut self, d: PpsDecision, decisions: &mut Vec<PpsDecision>, tags: &mut Vec<Tag>) {
         if d.accepted {
             let utc = d.utc_ns.expect("accepted pulses have a label");
             if let Some((_, t0, u0)) = self.last_ok.filter(|l| l.0 + 1 == d.idx) {
                 let scale = (utc - u0) as f64 / (d.tick - t0) as f64;
+                self.scale = Some(scale);
                 for &(tick, frame, t_rx) in self.pending.iter().filter(|p| p.0 > t0 && p.0 <= d.tick) {
                     tags.push(Tag {
                         at: At::Frame { frame, microframe: 0 },
@@ -309,6 +323,26 @@ mod tests {
             }
         }
         (d, t)
+    }
+
+    #[test]
+    fn dates_ticks_after_the_last_accepted_pulse() {
+        let mut l = Labeler::new(HZ, Source::TimTp);
+        let (mut d, mut t) = (vec![], vec![]);
+        // A device clock 10 ppm fast.
+        let per_s = (HZ as f64 * (1.0 + 10e-6)) as u64;
+        for k in 0..3u64 {
+            l.on_fix(true);
+            l.on_tim_tp(&tp(UTC0 + k as Ns * SECOND));
+            l.on_pps(1_000 + k * per_s, 300, &mut d, &mut t);
+        }
+        assert!(d[2].accepted);
+        let last = 1_000 + 2 * per_s;
+        // 1 ms on: within the test labels' qErr of a few ns.
+        let t = l.utc_of(last + per_s / 1000).unwrap();
+        assert!((t - (UTC0 + 2 * SECOND + 1_000_000)).abs() < 20, "{t}");
+        assert_eq!(l.utc_of(last - 1), None);
+        assert_eq!(l.utc_of(last + 3 * per_s), None);
     }
 
     #[test]

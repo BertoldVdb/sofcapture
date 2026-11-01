@@ -1,6 +1,7 @@
 //! The configuration file: HuJSON (JSON with comments and trailing commas).
 
 use crate::gnss::session::SEARCH_BAUDS;
+use crate::gnss::ubx::Constellation;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
@@ -13,6 +14,16 @@ pub struct Config {
     pub mqtt: Option<Mqtt>,
     pub sampler: Sampler,
     pub gnss: Gnss,
+    /// Per USB controller, by sofd's id (e.g. "0000:01:00.0").
+    pub controllers: BTreeMap<String, ControllerOptions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerOptions {
+    /// How long after the host sees the frame counter step the frame starts on the bus.
+    /// Unset: the measured value for known controllers, else 0.
+    pub counter_lead_ns: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,18 +98,29 @@ pub struct Gnss {
 #[serde(default, deny_unknown_fields)]
 pub struct Receiver {
     pub tty: String,
-    pub pps: String,
+    /// A /dev/pps device, or `pps_gpio`: a Raspberry Pi GPIO polled around each pulse.
+    pub pps: Option<String>,
+    pub pps_gpio: Option<u8>,
     pub baud: Option<u32>,
     pub initial_baud: Option<u32>,
     pub configure: Option<bool>,
     pub strict: Option<bool>,
     pub leap_seconds: Option<i8>,
+    pub constellations: Option<Vec<Constellation>>,
     pub frames: Option<bool>,
     #[serde(deserialize_with = "nullable")]
     pub chrony: Option<Option<String>>,
 }
 
 impl Receiver {
+    pub fn pps_name(&self) -> String {
+        match (&self.pps, self.pps_gpio) {
+            (Some(p), _) => p.clone(),
+            (None, Some(n)) => format!("gpio{n}"),
+            (None, None) => String::new(),
+        }
+    }
+
     fn options(&self) -> BoardOptions {
         BoardOptions {
             baud: self.baud,
@@ -106,6 +128,7 @@ impl Receiver {
             configure: self.configure,
             strict: self.strict,
             leap_seconds: self.leap_seconds,
+            constellations: self.constellations.clone(),
             frames: self.frames,
             chrony: self.chrony.clone(),
             ..BoardOptions::default()
@@ -168,6 +191,7 @@ pub struct BoardOptions {
     pub configure: Option<bool>,
     pub strict: Option<bool>,
     pub leap_seconds: Option<i8>,
+    pub constellations: Option<Vec<Constellation>>,
     pub frames: Option<bool>,
     pub div: Option<u32>,
     pub sof_delay_ns: Option<i64>,
@@ -193,9 +217,10 @@ pub struct Board {
     pub strict: bool,
     /// GPS minus UTC until the receiver knows it.
     pub leap_seconds: Option<i8>,
+    pub constellations: Option<Vec<Constellation>>,
     pub frames: bool,
     pub div: Option<u32>,
-    pub sof_delay_ns: i64,
+    pub sof_delay_ns: Option<i64>,
     /// chrony SOCK refclock path, `{serial}` substituted.
     pub chrony: Option<PathBuf>,
     pub firmware: Option<PathBuf>,
@@ -209,7 +234,7 @@ impl Gnss {
     /// Board-only options (`div`, `sof_delay_ns`, `firmware`) don't apply.
     pub fn receiver(&self, name: &str) -> Board {
         let b = self.merge(name, self.receivers.get(name).map(Receiver::options).unwrap_or_default());
-        Board { div: None, sof_delay_ns: 0, firmware: None, ..b }
+        Board { div: None, sof_delay_ns: None, firmware: None, ..b }
     }
 
     fn merge(&self, serial: &str, b: BoardOptions) -> Board {
@@ -220,9 +245,10 @@ impl Gnss {
             configure: b.configure.or(d.configure).unwrap_or(true),
             strict: b.strict.or(d.strict).unwrap_or(false),
             leap_seconds: b.leap_seconds.or(d.leap_seconds),
+            constellations: b.constellations.or(d.constellations.clone()),
             frames: b.frames.or(d.frames).unwrap_or(true),
             div: b.div.or(d.div),
-            sof_delay_ns: b.sof_delay_ns.or(d.sof_delay_ns).unwrap_or(0),
+            sof_delay_ns: b.sof_delay_ns.or(d.sof_delay_ns),
             chrony: b.chrony.or(d.chrony.clone()).flatten().map(|p| PathBuf::from(p.replace("{serial}", serial))),
             firmware: b.firmware.or(d.firmware.clone()).flatten(),
         }
@@ -272,6 +298,11 @@ impl Config {
         if s.rt_prio.is_some_and(|p| !(1..=99).contains(&p)) {
             anyhow::bail!("sampler.rt_prio must be within 1..=99");
         }
+        for (id, c) in &self.controllers {
+            if c.counter_lead_ns.is_some_and(|l| l.abs() > 1_000_000) {
+                anyhow::bail!("controllers.{id}.counter_lead_ns must be within ±1 ms");
+            }
+        }
         for (name, r) in &self.gnss.receivers {
             if name.is_empty() || name.contains(['/', '+', '#']) {
                 anyhow::bail!("gnss.receivers: name {name:?} must be non-empty, without '/' or wildcards");
@@ -279,8 +310,11 @@ impl Config {
             if self.gnss.boards.contains_key(name) {
                 anyhow::bail!("gnss.receivers.{name}: also a board in gnss.boards");
             }
-            if r.tty.is_empty() || r.pps.is_empty() {
-                anyhow::bail!("gnss.receivers.{name}: needs tty and pps");
+            if r.tty.is_empty() || r.pps.is_some() == r.pps_gpio.is_some() || r.pps.as_ref().is_some_and(|p| p.is_empty()) {
+                anyhow::bail!("gnss.receivers.{name}: needs tty and one of pps or pps_gpio");
+            }
+            if r.pps_gpio.is_some_and(|n| n > 53) {
+                anyhow::bail!("gnss.receivers.{name}.pps_gpio must be a GPIO number (0-53)");
             }
         }
         let receivers = self.gnss.receivers.iter().map(|(k, r)| (format!("gnss.receivers.{k}"), r.options(), self.gnss.receiver(k)));
@@ -290,6 +324,15 @@ impl Config {
         for (what, b, merged) in boards {
             if merged.strict && !merged.configure {
                 anyhow::bail!("{what}: strict needs configure");
+            }
+            if let Some(c) = &b.constellations {
+                // Pulses are labelled on the GPS grid, with its leap seconds.
+                if !c.contains(&Constellation::Gps) {
+                    anyhow::bail!("{what}.constellations must include \"gps\"");
+                }
+                if c.iter().enumerate().any(|(i, g)| c[..i].contains(g)) {
+                    anyhow::bail!("{what}.constellations lists one twice");
+                }
             }
             if b.leap_seconds.is_some_and(|l| !(0..=60).contains(&l)) {
                 anyhow::bail!("{what}.leap_seconds must be within 0..=60");
@@ -412,7 +455,14 @@ mod tests {
         .unwrap();
         let r = c.gnss.receiver("ttyS0");
         assert_eq!((r.baud, r.initial_baud, r.div, r.chrony.as_deref()), (115_200, 38_400, None, Some(Path::new("/run/c.ttyS0.sock"))));
-        assert_eq!(c.gnss.receivers["ttyS0"].pps, "/dev/pps0");
+        assert_eq!(c.gnss.receivers["ttyS0"].pps_name(), "/dev/pps0");
+        let c = Config::parse(r#"{"gnss":{"receivers":{"g":{"tty":"/dev/ttyAMA3","pps_gpio":20}}}}"#).unwrap();
+        assert_eq!(c.gnss.receivers["g"].pps_name(), "gpio20");
+        let c = Config::parse(r#"{"controllers":{"0000:01:00.0":{"counter_lead_ns":128000}}}"#).unwrap();
+        assert_eq!(c.controllers["0000:01:00.0"].counter_lead_ns, Some(128_000));
+        let c = Config::parse(r#"{"gnss":{"defaults":{"constellations":["gps","galileo","beidou"]},"boards":{"A":{"constellations":["gps"]}}}}"#).unwrap();
+        assert_eq!(c.gnss.board("B").constellations, Some(vec![Constellation::Gps, Constellation::Galileo, Constellation::Beidou]));
+        assert_eq!(c.gnss.board("A").constellations, Some(vec![Constellation::Gps]));
         let c = Config::parse(r#"{"gnss":{"external":{"*":{"sof_delay_ns":5},"app":{}}}}"#).unwrap();
         assert_eq!((c.gnss.external("sdrrx").unwrap().sof_delay_ns, c.gnss.external("app").unwrap().sof_delay_ns), (5, 0));
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
@@ -426,7 +476,14 @@ mod tests {
             r#"{"sampler":{"gnss_window_s":0.5}}"#,
             r#"{"gnss":{"defaults":{"strict":true,"configure":false}}}"#,
             r#"{"gnss":{"defaults":{"leap_seconds":-1}}}"#,
+            r#"{"controllers":{"0000:01:00.0":{"counter_lead_ns":2000000}}}"#,
+            r#"{"gnss":{"defaults":{"constellations":["galileo"]}}}"#,
+            r#"{"gnss":{"defaults":{"constellations":["gps","gps"]}}}"#,
+            r#"{"gnss":{"defaults":{"constellations":["gps","navic"]}}}"#,
+            r#"{"gnss":{"defaults":{"constellations":[]}}}"#,
             r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0"}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","pps_gpio":20}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps_gpio":60}}}}"#,
             r#"{"gnss":{"receivers":{"a/b":{"tty":"/dev/ttyS0","pps":"/dev/pps0"}}}}"#,
             r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","div":5}}}}"#,
             r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","baud":1234}}}}"#,

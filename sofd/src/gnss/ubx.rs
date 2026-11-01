@@ -223,6 +223,34 @@ pub mod key {
     }
 }
 
+/// A GNSS for the `constellations` option (u-blox 9 and later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Constellation {
+    Gps,
+    Sbas,
+    Galileo,
+    Beidou,
+    Qzss,
+    Glonass,
+}
+
+impl Constellation {
+    pub const ALL: [Self; 6] = [Self::Gps, Self::Sbas, Self::Galileo, Self::Beidou, Self::Qzss, Self::Glonass];
+
+    /// CFG-SIGNAL-*_ENA.
+    pub fn signal_key(self) -> u32 {
+        match self {
+            Self::Gps => 0x1031_001F,
+            Self::Sbas => 0x1031_0020,
+            Self::Galileo => 0x1031_0021,
+            Self::Beidou => 0x1031_0022,
+            Self::Qzss => 0x1031_0024,
+            Self::Glonass => 0x1031_0025,
+        }
+    }
+}
+
 /// CFG-VALSET to the RAM layer.
 pub fn valset_ram(items: &[(u32, u32)]) -> Vec<u8> {
     let mut p = vec![0u8, 0x01, 0, 0];

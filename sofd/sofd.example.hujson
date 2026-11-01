@@ -20,6 +20,11 @@
     // "cpu_governor": "performance",
   },
 
+  // Per USB controller, by sofd's id. counter_lead_ns: README "Frame counter lead"
+  "controllers": {
+    // "0000:01:00.0": { "counter_lead_ns": 125700 },
+  },
+
   "gnss": {
     "attach": "all",                     // or "none", or ["E072A1F9D198"]
     "defaults": {
@@ -28,6 +33,7 @@
       // "chrony": "/run/chrony.sofgnss.sock",       // use {serial} for one socket per board
       // "firmware": "/var/lib/sofd/sofgnss.bin",
       // "leap_seconds": 18,             // GPS minus UTC until the receiver knows it (up to 12.5 min after a cold start)
+      // "constellations": ["gps", "galileo", "beidou"],   // u-blox 9 and later
     },
     "boards": {
       // "E072A1F9D198": { "sof_delay_ns": 0 },
@@ -35,6 +41,7 @@
     // Receivers on a serial port with their PPS on /dev/pps, no board (README)
     "receivers": {
       // "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" },
+      // "pps_gpio": 18 instead of "pps": sofd polls the Raspberry Pi GPIO itself (±0.2 us)
     },
     // MQTT clients allowed to act as GNSS reference (see MQTT-GUIDE.md)
     "external": {

@@ -116,6 +116,7 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
       "configure": true,          // false: use the receiver as it is, at initial_baud
       "strict": false,            // true: never fall back to NMEA ZDA, keep retrying setup
       "leap_seconds": null,       // GPS minus UTC (18 since 2017) until the receiver knows it
+      "constellations": null,     // e.g. ["gps", "galileo", "beidou"], u-blox 9 and later
       "frames": true,             // publish every receiver frame
       "div": null,                // board SOF tag divider (board default)
       "sof_delay_ns": 0,          // bus frame start to the board's capture
@@ -153,10 +154,11 @@ being silently ignored. A file given with `--config` must exist. Without
 | `sampler.cpu` | none | Pin the sampler threads to this CPU. |
 | `sampler.max_cpu_latency_us` | none | While sampling, keep the CPUs out of sleep states that take longer than this to leave. |
 | `sampler.cpu_governor` | none | While sampling, use this cpufreq governor on `cpu` if it is set, or on all CPUs otherwise. The previous governor is restored afterwards. |
+| `controllers.<id>.counter_lead_ns` | known controllers' value, else 0 | How long after the host sees the frame counter step the frame starts on the bus ([below](#frame-counter-lead)). `<id>` is sofd's controller id, e.g. `0000:01:00.0`. Within ±1 ms. |
 | `gnss.attach` | `"all"` | Which sofgnss boards to use. `"all"` means every board with the sofgnss descriptors and `"none"` means none. A list of USB serials picks those boards, whatever their descriptors say. |
 | `gnss.defaults` | | Board options (below) for every board. |
 | `gnss.boards.<serial>` | | Board options for one board, by USB serial. Each option set here replaces the one from `defaults`. Options left out fall back to `defaults`, then to the built-in default. |
-| `gnss.receivers.<name>` | none | A receiver without a sofgnss board ([below](#receivers-without-a-board)). It needs `tty` and `pps` (device paths) and takes the board options except `div`, `sof_delay_ns` and `firmware`. Options left out fall back to `defaults`, and `{serial}` in `chrony` is replaced by the name. |
+| `gnss.receivers.<name>` | none | A receiver without a sofgnss board ([below](#receivers-without-a-board)). It needs `tty` and either `pps` (a /dev/pps device) or `pps_gpio` (a Raspberry Pi GPIO number, polled), and takes the board options except `div`, `sof_delay_ns` and `firmware`. Options left out fall back to `defaults`, and `{serial}` in `chrony` is replaced by the name. |
 | `gnss.external.<client>` | none | An MQTT client that may act as a GNSS reference ([below](#gnss-reference-from-an-mqtt-client)). It takes `chrony` (a socket path) and `sof_delay_ns` (as for boards). The client `*` allows every client not listed by name. |
 
 Board options:
@@ -167,10 +169,11 @@ Board options:
 | `initial_baud` | 9600 | The receiver's rate before configuration, usually its power-on rate (38400 for u-blox M10/F9). sofd tries it right after `baud`, and if neither gives data it also searches the standard rates. It must be one of them too. |
 | `configure` | `true` | With `false` sofd leaves the receiver as it is and uses it at `initial_baud`. Pulses are then labelled from TIM-TP if the receiver sends it, and from NMEA ZDA otherwise. |
 | `leap_seconds` | none | GPS minus UTC in seconds, used for TIM-TP labels until the receiver reports a valid count. After a cold start that takes up to 12.5 min, and pulses are rejected (`no_leap_seconds`) until then. The receiver's count always wins, and a different one is reported in a status message. A wrong value puts every label off by whole seconds for that time, so only set it while the count is certain. |
+| `constellations` | none | The GNSS the receiver tracks: any of `gps`, `galileo`, `beidou`, `glonass`, `qzss` and `sbas`, and all others are turned off. It must include `gps`, because pulses are labelled on the GPS grid. Applied in RAM with CFG-VALSET at every setup, on u-blox 9 and later only. The receiver restarts its GNSS on a signal change, so sofd waits 1 s before the next step. Older receivers keep their own setting, and a `configuring` status message says so: on u-blox 8 turning a system on needs a save to battery-backed RAM and a hardware reset, and some firmware (the LEA-M8T's TIM 1.10) accepts Galileo and BeiDou but never tracks them. A receiver that rejects the combination keeps its own as well, with a status message. Without the option sofd leaves the receiver's choice alone. |
 | `strict` | `false` | With `true` sofd never falls back to NMEA ZDA ([below](#receiver-setup)) and keeps retrying the setup until it works. Needs `configure`. |
 | `frames` | `true` | Publish every receiver frame on `gnss/<serial>/nmea\|ubx\|rtcm3/…`. Set it to `false` to save broker traffic. sofd still uses the frames itself. |
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
-| `sof_delay_ns` | 0 | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. |
+| `sof_delay_ns` | 0, 1300 on STM32 boards | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. The STM32 port captures a little into the SOF packet: 1.12 µs behind a Raspberry Pi 4's hub and 1.44 to 1.52 µs directly on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO. Its default puts either within about 0.2 µs. The value in use is in the board's status. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
 | `firmware` | none | The sofgnss image (`sofgnss/esp32s3/build/sofgnss.bin`) the board should run. Boards running another image are updated. `null` in `boards` turns updates off for one board. |
 
@@ -222,7 +225,7 @@ frames from these topics.
 | Topic | Retained | Payload |
 |---|---|---|
 | `status` | yes | `{"state":"online","version","pid"}`. The will sets `{"state":"offline"}`. |
-| `controllers/<id>/info` | yes | The controller and its devices, `rate_hz` and `model_hz` (null when not sampled), `wanted_by`, and `wants` with each client's `rate_hz`, `model_hz`, `samples` and `expires_ms`. |
+| `controllers/<id>/info` | yes | The controller and its devices, `rate_hz`, `model_hz` and `counter_lead_ns` (null when not sampled), `wanted_by`, and `wants` with each client's `rate_hz`, `model_hz`, `samples` and `expires_ms`. |
 | `controllers/<id>/model` | yes | The latest fits (`epoch`, `unit_ns`, `counter`, `model_*`, `gnss`, `frame_start`). Published at `model_hz` (1 Hz by default), and straight away on a new epoch, when a fit appears or disappears, or when the GNSS reference changes. Emptied when sampling stops, on a controller error until the next sample, and when sofd stops. |
 | `controllers/<id>/sample` | | Every sample, but only while some client's request has `"samples":true`. |
 | `controllers/<id>/event` | | `error`, `recovered` and `realtime_step`, `reference` (the board that is now the GNSS reference, `null` for none), plus `ref_*` and `chrony_busy` for MQTT references. |
@@ -363,8 +366,9 @@ The states on `gnss/<serial>/status` are `opening`, `updating`, `restarting`
 and `update_failed` for firmware, then `probing`, `identifying`,
 `configuring`, `verifying`, `ubx` (running), `nmea_fallback`, `passive`,
 `detached`, `absent` and `error`. The status also carries `locked`,
-`controller`, `tty`, `port`, `baud`, `receiver` (MON-VER), `firmware`
-(`version`, `elf_sha256`, `reset_reason`) and `message`.
+`controller`, `tty`, `port`, `baud`, `sof_delay_ns` (the delay in use),
+`receiver` (MON-VER), `firmware` (`version`, `elf_sha256`, `reset_reason`)
+and `message`.
 
 ### Receiver setup
 
@@ -379,8 +383,9 @@ brings back the receiver's saved settings.
    receiver at one of the configured rates is found within 3 s. One at another
    standard rate takes up to about 14 s.
 2. Identify it with UBX-MON-VER and poll its port with CFG-PRT.
-3. Enable TIM-TP, NAV-TIMEGPS, NAV-STATUS and the diagnostics below, turn NMEA
-   output off and set the baud. Up to u-blox 8 this uses CFG-MSG and CFG-PRT.
+3. With `constellations`, set the GNSS to track (u-blox 9 and later). Enable
+   TIM-TP, NAV-TIMEGPS, NAV-STATUS and the diagnostics below, turn NMEA output
+   off and set the baud. Up to u-blox 8 this uses CFG-MSG and CFG-PRT.
    Generation 9 and 10 (protocol ≥ 27, or MON-VER hardware 00190000/000A0000)
    get CFG-VALSET on the RAM layer. The time pulse stays on the receiver's own
    grid (GPS by default), and NAV-TIMEGPS gives the leap seconds for its
@@ -464,6 +469,24 @@ the file changes or sofd restarts. The board confirms the new image on the
 first command after its restart, so its bootloader rolls back a broken image
 that never reaches the USB handshake.
 
+### Frame counter lead
+
+sofd times the host's frame counter (MFINDEX, HFNUM) and takes each step as
+the start of that microframe on the bus, as the xHCI specification defines
+it. Some controllers step early. The VIA VL805 of the Raspberry Pi 4 steps
+125.7 µs, a microframe and 0.7 µs, before the SOF goes out (sd 0.27 µs over
+6000 frames). It was measured against an Airspy that dates its SOF tags by
+its own GNSS, with the host clock checked by the GPS PPS on a GPIO, timed by
+polling the pin's level register (±0.2 µs). The kernel's PPS timestamp is
+4 to 8.5 µs late on a Pi 4. Uncorrected, chrony keeps the clock that far
+ahead of GNSS.
+
+`counter_lead_ns` moves the host's samples that much later. That changes
+`model_raw`, `model_realtime`, `realtime_minus_gnss` and chrony's samples,
+not `model_gnss`, so SOF tags of other devices are dated as before. sofd
+knows the VL805 (PCI `1106:3483`) and logs the correction it applies. Other
+controllers get 0 until measured. Set it in `controllers` to override.
+
 ### chrony
 
 With `chrony` set, each sample of the board's controller goes to chrony's
@@ -517,8 +540,10 @@ scatter is white, so chrony's filter averages it down.
 ### Receivers without a board
 
 sofd can also run a receiver that is wired to a serial port, with its PPS on
-a Linux PPS device, for example `dtoverlay=pps-gpio` on a Raspberry Pi. That
-replaces gpsd on hosts that only need their clock disciplined. The receiver is
+a Linux PPS device (`dtoverlay=pps-gpio` on a Raspberry Pi) or, on a
+Raspberry Pi 0 to 4, on a GPIO that sofd polls itself. That replaces gpsd on
+hosts that only need their clock disciplined, and dates USB controllers that
+have no board. The receiver is
 set up as above (baud search, UBX configuration, `strict`, `leap_seconds`),
 its pulses are labelled the same way and must be accepted the same way, and
 its status, pulses and frames go to MQTT under `gnss/<name>/`.
@@ -526,13 +551,14 @@ its status, pulses and frames go to MQTT under `gnss/<name>/`.
 ```jsonc
 "gnss": {
   "receivers": {
-    "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" }
+    "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" },
+    // or: "pps_gpio": 18 instead of "pps"
   }
 }
 ```
 
-Each accepted pulse goes to chrony as one sample: the kernel's CLOCK_REALTIME
-timestamp of the edge and its UTC label, with qErr applied. A board sharing the
+Each accepted pulse goes to chrony as one sample: the edge's CLOCK_REALTIME
+and its UTC label, with qErr applied. A board sharing the
 socket takes precedence while its reference is valid, because its SOF timing
 has no interrupt latency ([chrony](#chrony)).
 
@@ -540,16 +566,33 @@ has no interrupt latency ([chrony](#chrony)).
 refclock SOCK /run/chrony.ttyS0.sock refid GPS precision 1e-6
 ```
 
-The kernel takes the timestamp in its interrupt handler, so its interrupt
-latency sets the precision, not sofd. sofd reads the edge with a
+With `pps` the kernel takes the timestamp in its interrupt handler, 4 to
+8.5 µs late on a Raspberry Pi 4 (median 7.5 µs), and sofd reads it with a
 non-blocking `PPS_FETCH` every time it polls the serial port (every 20 ms at
-most), and only the assert edge is used. Without a board nobody measures how
+most). With `pps_gpio` sofd times the rising edge itself, as it times the frame
+counter: a SCHED_FIFO thread off CPU 0 sleeps until 300 µs before the
+expected edge and reads the GPIO level register until it rises, timestamping
+each read with the ARM generic timer, which CLOCK_MONOTONIC_RAW counts. The
+edge lies within the reads around it, ±0.2 µs on a Pi 4, at about 0.05 % of a
+core. After three missed edges it searches the next second at 20 µs steps.
+The pin needs no kernel driver, and `pps-gpio` on the same pin does no harm.
+Only the assert (rising) edge is used. Without a board nobody measures how
 long the serial line was quiet before an edge, so sofd estimates it from when
 it read the bytes. Bytes read within 10 ms after an edge may have arrived
 before it, and that pulse counts as `line_busy`. That is rare: the LEA-5T's
-line was quiet for about 700 ms before each pulse. Receivers have no controller,
-so they are never a controller's GNSS reference. Their samples just steer the
-clock, and `model_realtime` follows it.
+line was quiet for about 700 ms before each pulse.
+
+A USB controller without a board or MQTT reference is dated by a locked
+receiver: its pulses map CLOCK_MONOTONIC_RAW to UTC (interpolated between
+pulses, at most 1.5 s past the last one), and the sampler dates each of its
+samples, the frame counter's step on that clock, by it. So `model_gnss`,
+`frame_start.t_gnss_ns` and the dating of SOF tags work there as with a board,
+with `gnss.board` `receiver:<name>` and `source` `host_pps`, and CLOCK_REALTIME
+and chrony play no part. The controller's `counter_lead_ns` matters here. A
+board or MQTT reference on the controller takes precedence, and these samples
+do not go to chrony (the receiver's own pulses do). On a Raspberry Pi 4 a
+controller dated this way agreed with a board on another controller to
+0.16 µs (sd 0.15 µs), the board's own residual, with the PPS polled.
 
 The serial port must be free: turn off a serial console or getty on it, and
 stop gpsd. sofd opens the port exclusively and retries with a backoff when it

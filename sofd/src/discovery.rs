@@ -322,6 +322,21 @@ pub fn lookup(q: &DeviceQuery, simulate: bool) -> Result<UsbDevice> {
     }
 }
 
+/// How long after the host sees the frame counter step the frame starts on the bus,
+/// for controllers where this was measured, with the controller's name.
+pub fn known_counter_lead(c: &Controller) -> Option<(i64, &'static str)> {
+    if c.bus_type != "pci" {
+        return None;
+    }
+    let id = |f: &str| fs::read_to_string(c.path.join(f)).ok().map(|s| s.trim().to_string());
+    match (id("vendor")?.as_str(), id("device")?.as_str()) {
+        // Raspberry Pi 4: MFINDEX steps a microframe and 0.7 us before the SOF goes out
+        // (the GPS PPS polled on a GPIO against an Airspy dating its SOF tags by GNSS).
+        ("0x1106", "0x3483") => Some((125_700, "VIA VL805")),
+        _ => None,
+    }
+}
+
 /// PCI: BAR0 via sysfs. Platform devices: device tree, then /proc/iomem.
 pub fn mmio_region(c: &Controller, overrides: &[MmioOverride]) -> Result<MmioRegion> {
     let dev_mem = |addr: u64, len: u64| MmioRegion {

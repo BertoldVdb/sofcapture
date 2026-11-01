@@ -81,6 +81,8 @@ pub enum Pvdb<'a> {
     /// `platform`: the ESP-IDF version on ESP32 boards, "stm32g4" on STM32 boards.
     Ver { version: &'a str, platform: &'a str, elf_sha256: &'a str, reset_reason: &'a str },
     Ota(OtaMsg),
+    /// A calibration burst: start tick, mode, PPS-synced, count, chip rate, measured length in ticks.
+    Cal { tick: u64, mode: &'a str, synced: bool, n: u64, chip_rate: u64, length: u64 },
     Err(&'a str),
     Other,
 }
@@ -116,6 +118,12 @@ pub fn pvdb(frame: &[u8]) -> Pvdb<'_> {
             (Some("READY"), _) => Pvdb::Ota(OtaMsg::Ready),
             (Some("ACK"), Some(b)) => Pvdb::Ota(OtaMsg::Ack(b)),
             (Some("OK"), _) => Pvdb::Ota(OtaMsg::Ok),
+            _ => Pvdb::Other,
+        },
+        Some("CAL") => match (n(3), f.get(4), n(5), n(6), n(7), n(8)) {
+            (Some(tick), Some(mode), Some(s), Some(n), Some(chip_rate), Some(length)) => {
+                Pvdb::Cal { tick, mode, synced: s == 1, n, chip_rate, length }
+            }
             _ => Pvdb::Other,
         },
         Some("ERR") => Pvdb::Err(f.get(3).copied().unwrap_or("")),
@@ -161,6 +169,10 @@ mod tests {
         );
         assert_eq!(pvdb(&frame("PVDB,SOFPPS,OTA,ACK,32768")), Pvdb::Ota(OtaMsg::Ack(32768)));
         assert_eq!(pvdb(&frame("PVDB,SOFPPS,OTA,OK")), Pvdb::Ota(OtaMsg::Ok));
+        assert_eq!(
+            pvdb(&frame("PVDB,SOFPPS,CAL,8501545625,NOISE,1,42,72000000,524309")),
+            Pvdb::Cal { tick: 8_501_545_625, mode: "NOISE", synced: true, n: 42, chip_rate: 72_000_000, length: 524_309 }
+        );
         assert_eq!(command("PING"), b"$PVDB,SOFPPS,PING*19\r\n".to_vec());
     }
 }
