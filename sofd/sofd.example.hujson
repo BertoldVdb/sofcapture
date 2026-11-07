@@ -26,7 +26,7 @@
   },
 
   "gnss": {
-    "attach": "all",                     // or "none", or ["E072A1F9D198"]
+    "attach": "all",                     // or "none", or ["003000343645501720393657"]
     "defaults": {
       "baud": 38400,
       "initial_baud": 9600,              // receiver's power-on baud, e.g. 38400 for u-blox M10/F9
@@ -36,7 +36,7 @@
       // "constellations": ["gps", "galileo", "beidou"],   // u-blox 9 and later
     },
     "boards": {
-      // "E072A1F9D198": { "sof_delay_ns": 0 },
+      // "003000343645501720393657": { "sof_delay_ns": 1300 },
     },
     // Receivers on a serial port with their PPS on /dev/pps, no board (README)
     "receivers": {

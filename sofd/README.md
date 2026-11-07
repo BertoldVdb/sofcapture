@@ -119,11 +119,11 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
       "constellations": null,     // e.g. ["gps", "galileo", "beidou"], u-blox 9 and later
       "frames": true,             // publish every receiver frame
       "div": null,                // board SOF tag divider (board default)
-      "sof_delay_ns": 0,          // bus frame start to the board's capture
+      "sof_delay_ns": null,       // bus frame start to the board's capture (0, 1300 on STM32)
       "chrony": "/run/chrony.sofgnss.sock",   // SOCK refclock; "{serial}" is substituted
       "firmware": "/var/lib/sofd/sofgnss.bin",// image the boards should run
     },
-    "boards": { "E072A1F9D198": { "chrony": null } },   // null switches chrony or firmware off
+    "boards": { "003000343645501720393657": { "chrony": null } },   // null switches chrony or firmware off
     "external": { "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 } },
     // a receiver on a serial port with its PPS on /dev/pps, no board (below)
     "receivers": { "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" } },
@@ -175,7 +175,7 @@ Board options:
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
 | `sof_delay_ns` | 0, 1300 on STM32 boards | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. The STM32 port captures a little into the SOF packet: 1.12 µs behind a Raspberry Pi 4's hub and 1.44 to 1.52 µs directly on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO. Its default puts either within about 0.2 µs. The value in use is in the board's status. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
-| `firmware` | none | The sofgnss image the board should run: `sofgnss/esp32s3/build/sofgnss.bin` for ESP32-S3 boards, `sofgnss/stm32g4/build/sofgnss-signed.bin` for STM32 boards. Boards running another image are updated, boards of the other kind are left alone. `null` in `boards` turns updates off for one board. |
+| `firmware` | none | The sofgnss image the board should run: `sofgnss/stm32g4/build/sofgnss-signed.bin` for STM32 boards, `sofgnss/esp32s3/build/sofgnss.bin` for ESP32-S3 boards. Boards running another image are updated, boards of the other kind are left alone. `null` in `boards` turns updates off for one board. |
 
 A controller sampled for a board runs at `sampler.default_rate_hz` (50). That
 is also the rate of the samples sent to chrony, and of MQTT requests that do

@@ -8,13 +8,34 @@ free-running hardware counter. Both timestamps go into the serial stream as
 `$PVDB,SOFPPS,...` sentences, so a host that reads the GPS port sees GPS time,
 PPS and its own USB frame clock side by side.
 
-The firmware runs on the ESP32-S3 (ESP-IDF 5.5, TinyUSB) and on the
-STM32G474 (bare metal, TinyUSB, see [STM32G474 port](#stm32g474-port)).
-Both share the platform-independent core.
+The firmware runs on two boards that share the platform-independent core and
+speak the same protocol:
+
+- the **STM32G474** (bare metal, TinyUSB), the default board:
+  [wiring, building, flashing and details](stm32g4/README.md)
+- the **ESP32-S3** (ESP-IDF 5.5, TinyUSB), alternatively, with software SOF
+  timestamps: [wiring, building, flashing and details](esp32s3/README.md)
 
 On the host, [sofd](../sofd) uses the board as the GNSS reference for its USB
 controller. The [top-level README](../README.md#setting-up-a-system) explains
 how to set up the whole system.
+
+## Choosing a board
+
+| | STM32G474 (default) | ESP32-S3 |
+|---|---|---|
+| Board | WeAct STM32G474 core board (STM32G474CEU6), any G474 works | Seeed Studio XIAO ESP32-S3 |
+| SOF timestamp | Hardware capture of every SOF | Software, a CPU core spins on the frame-number register for each tagged SOF |
+| Counter | 144 MHz (6.9 ns) | 80 MHz (12.5 ns) |
+| SOF stamp noise | 2.0 ticks (14 ns) rms | 3.7 ticks (46 ns) rms, under 1 % of stamps up to 12 ticks (150 ns) late |
+| `sof_delay_ns` in sofd | 1300 ns built in, measured | 0, calibrate it yourself |
+| Update signature | ECDSA P-256, checked by a resident bootloader at every start | RSA-3072, checked by the running app. A serial flash through the ROM bootloader takes any image. |
+| First flash | USB DFU (BOOT0) or ST-LINK | USB ROM bootloader (BOOT button) |
+| Toolchain | arm-none-eabi-gcc, CMake, Python 3 with `cryptography` | ESP-IDF 5.5 |
+| SDR calibration output | 72 Mchip/s, no `SQ40` | 40 Mchip/s, all modes |
+
+sofd treats both boards alike. Use the ESP32-S3 when cost matters more than
+the last few tens of nanoseconds.
 
 ## What it does
 
@@ -43,26 +64,9 @@ how to set up the whole system.
 5. **Sentences.** On PPS the board sends `$PVDB,SOFPPS,PPS,<tick>,<rx_idle_ms>*hh`,
    and on a tagged SOF it sends `$PVDB,SOFPPS,SOF,<tick>,<frame>*hh`.
 
-## Hardware (Seeed Studio XIAO ESP32-S3 defaults)
+## Status LED
 
-| Signal              | XIAO pin | GPIO | Kconfig                    |
-|---------------------|----------|------|----------------------------|
-| GPS TX ← board      | D6 (TX)  | 43   | `SOFGNSS_GPS_TX_GPIO`       |
-| GPS RX → board      | D7 (RX)  | 44   | `SOFGNSS_GPS_RX_GPIO`       |
-| PPS in              | D8       | 7    | `SOFGNSS_PPS_GPIO`          |
-| Status LED          | on-board | 21   | `SOFGNSS_LED_GPIO`          |
-| Debug console TX/RX | D0 / D1  | 1/2  | `ESP_CONSOLE_UART_*_GPIO`  |
-| USB                 | USB-C    | 19/20|                            |
-
-The USB-C connector is the CDC device (native OTG PHY), so the ESP-IDF console
-moves to UART0 on D0/D1 at 115200. The ROM bootloader still prints a few lines
-on GPIO43 at reset, which u-blox receivers ignore.
-
-The timestamp counter is the MCPWM capture timer. It runs at 80 MHz (12.5 ns)
-and is 32 bits wide, and the firmware unwraps it to 64 bits. 80 MHz is the
-fastest clock on the ESP32-S3 that has a hardware capture input.
-
-The yellow status LED shows what the receiver delivers:
+The status LED shows what the receiver delivers:
 
 | LED | Meaning |
 |---|---|
@@ -72,74 +76,9 @@ The yellow status LED shows what the receiver delivers:
 | on, 100 ms gap at each PPS | valid GPS frames and PPS |
 
 "Valid" means a NMEA, UBX or RTCM frame with a correct checksum in the last
-2 s. Garbage from a wrong baud rate does not light it. The red LED is the
-battery-charge indicator and can't be controlled.
+2 s. Garbage from a wrong baud rate does not light it.
 
-## Building and flashing
-
-The ESP-IDF project is in `esp32s3/`:
-
-```sh
-cd esp32s3
-. ~/esp/esp-idf/export.sh
-idf.py set-target esp32s3
-idf.py build                    # esp32s3/build/sofgnss.bin
-../tools/ota.py                 # update a running board, see below
-idf.py monitor -p /dev/ttyUSBx  # console is on D0/D1, not on USB
-idf.py menuconfig               # "sofgnss board" and "sofgnss application" menus
-```
-
-The STM32 build is described under [STM32G474 port](#stm32g474-port).
-
-### Updating a running board
-
-In normal usage, sofd will update the board to the configued firmware. 
-Alternatively, `tools/ota.py` sends the new image over the CDC port
-into the inactive application slot (A/B, see `partitions.csv`). The device
-verifies it and restarts into it. The first host command after the restart
-confirms the image, and the tool sends `VER` for that. Until the image is
-confirmed, a reset boots the previous image again (bootloader rollback).
-
-The tool opens the port exclusively, so stop sofd first. It keeps the port's
-current line coding, so the GPS UART is not retuned. After the restart it
-finds the board again by its `/dev/serial/by-id` link (USB serial number), and
-it fails unless the board comes back confirmed on the new image.
-
-```sh
-idf.py build && ../tools/ota.py         # in esp32s3/, ~10 s including the restart
-```
-
-### First flash or bricked board
-
-This needs the ROM bootloader once. Hold **BOOT** while pressing **RESET**,
-then run `idf.py -p /dev/ttyACM0 flash`. The ROM latches download mode, so
-press **RESET** again after flashing to start the app.
-
-The two application slots are 1 MB each (0x100000, at 0x10000 and 0x110000).
-The image is about 390 KB. Wi-Fi and Bluetooth are not used, so the build
-links no binary blobs (`CONFIG_APP_NO_BLOBS`).
-
-### Signing key
-
-Application images are signed with RSA-3072 using the Secure Boot V2 scheme,
-but without hardware secure boot. A running board only accepts an update that
-is signed with the same key as the image it runs, and answers `ERR,OTAVERIFY`
-otherwise. The build signs `esp32s3/build/sofgnss.bin` with
-`keys/sofgnss_signing_key.pem` (in `sofgnss/`, next to `esp32s3/`), which is
-not in git. Create it once, keep a backup, and use the same key on every
-machine that builds updates:
-
-```sh
-mkdir -p keys && espsecure.py generate_signing_key --version 2 --scheme rsa3072 keys/sofgnss_signing_key.pem
-```
-
-With a new or lost key, each board needs the ROM bootloader flash above once.
-The bootloader itself doesn't check signatures, because the S3 can't do that
-without hardware secure boot. A serial flash can therefore always install any
-image. The signature protects the CDC update path, not against someone with
-physical access.
-
-### Host tests
+## Host tests
 
 These test the portable core (parser, queue, unwrap, sentences, and the SOF
 scheduler against a simulated USB bus):
@@ -161,7 +100,7 @@ Device to host:
 | `$PVDB,SOFPPS,PPS,<tick>,<rx_idle_ms>` | PPS edge captured at `<tick>`. `<rx_idle_ms>` is how long the GPS line had been quiet at the edge, at least. It is 0 if GPS bytes were still on their way (see below). |
 | `$PVDB,SOFPPS,SOF,<tick>,<frame>` | SOF of USB frame `<frame>` (64-bit unwrapped) received at `<tick>` |
 | `$PVDB,SOFPPS,INFO,<tick_hz>,<divider>,<pps>,<sof_tags>,<sof_missed>,<dropped>,<parse_errors>,<tag>,<pps_rejected>` | Sent with an empty `<tag>` when the host connects and every `SOFGNSS_INFO_INTERVAL_S` seconds (default 1). A requested INFO echoes the request's tag. `<pps_rejected>` counts PPS edges dropped as glitches since boot. It comes after `<tag>` so older parsers keep working. |
-| `$PVDB,SOFPPS,VER,<version>,<idf>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, ESP-IDF version (`stm32g4` on the STM32 port, `stm32g4-boot` from its bootloader, see [Bootloader](#bootloader)), running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted (`POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT`, ...). The SHA-256 is the value in the `.bin`'s app descriptor at offset 32, so a host can tell whether an update is needed. Sent when the host connects and on request. |
+| `$PVDB,SOFPPS,VER,<version>,<platform>,<partition>,<pending>,<elf_sha256>,<reset_reason>` | Firmware version, platform (`stm32g4` on the STM32, `stm32g4-boot` from its bootloader, see [Bootloader](stm32g4/README.md#bootloader), the ESP-IDF version on the ESP32-S3), running slot, whether the image still waits for confirmation, the image's ELF SHA-256 and why the device last booted. The STM32 reports `POWERON`, `EXT`, `SW`, `PANIC` (a fault handler) or `WDT`, the ESP32-S3 `POWERON`, `SW`, `PANIC`, `TASK_WDT`, `INT_WDT`, `BROWNOUT` and so on. The SHA-256 is the value in the image's app descriptor, so a host can tell whether an update is needed. Sent when the host connects and on request. |
 | `$PVDB,SOFPPS,USB,<mounted>,<suspended>,<dtr>,<lc_events>,<ls_events>,<baud>` | USB control-path diagnostics, sent with every INFO |
 | `$PVDB,SOFPPS,OTA,READY` / `OTA,ACK,<bytes>` / `OTA,OK` | Firmware update progress |
 | `$PVDB,SOFPPS,ERR,<code>` | Reply to a malformed command or a failed update (`BADDIV`, `BADTAG`, `BADCAL`, `NOCAL` (a mode the board can't send: `SQ40` on the STM32), `UNKNOWN`, `OTAARGS`, `OTABUSY`, `OTABEGIN`, `OTAWRITE`, `OTAVERIFY`, `OTATIMEOUT`, `OTALINK`, and on the STM32 `OTABOOT`, `NOAPP`, `BADAPP`). `OTABUSY` means an `OTA` command came in while an update was running or waiting for its restart, and that update is left alone. `OTALINK` means the update was aborted because the host went away. That happens when USB is unconfigured, reset or suspended, and with `SOFGNSS_REQUIRE_DTR` also when DTR drops. |
@@ -186,7 +125,7 @@ GPS whole. The board waits for UART space rather than cutting one.
 | `$PVDB,SOFPPS,BOOT` | STM32 only: restart into the bootloader. |
 | `$PVDB,SOFPPS,START` | STM32 bootloader only: check the installed app and start it, or answer `ERR,NOAPP` (none installed) or `ERR,BADAPP` (hash or signature wrong). |
 
-Any valid command confirms a newly installed image and so cancels the
+Any valid command confirms a newly installed ESP32-S3 image and so cancels the
 rollback.
 
 Example: `$PVDB,SOFPPS,DIV,100*4F`.
@@ -210,12 +149,14 @@ the edge. It could be on the wire, in the UART FIFO or driver buffer, or in a
 frame that is still being assembled.
 
 `<rx_idle_ms>` tells you which case applies. It is 0 when any GPS byte was
-still in that path when the PPS was handled. A byte that moved between stages
-in the meantime may count twice, but none are missed. Otherwise it is the time
-from the last hand-over of GPS bytes by the UART driver to the edge. That is a
-lower bound on how long the line had been quiet, short by at most about 2
-character times, because the driver hands bytes over after 64 bytes or 2
-characters of silence. With no GPS data since boot it is the uptime.
+still in that path when the PPS was handled. Otherwise it is a lower bound on
+how long the line had been quiet. On the STM32 it is the time since the UART
+last detected an idle line, one character time after the last byte. On the
+ESP32-S3 it is the time from the last hand-over of GPS bytes by the UART
+driver to the edge. That is short by at most about 2 character times, because
+the driver hands bytes over after 64 bytes or 2 characters of silence, and a
+byte that moved between stages in the meantime may count twice, but none are
+missed. With no GPS data since boot it is the uptime.
 
 A host that pairs messages with pulses by order, such as a UBX-TIM-TP with
 the pulse it announces, can use a pulse when `<rx_idle_ms>` is at least about
@@ -250,112 +191,55 @@ from forming a slow sawtooth across samples. With dither off it is `k*N`. The
 sentence always carries the frame number, so hosts don't need to know the
 pattern.
 
-The spin polls the frame-number register about every 38 CPU cycles (13 ticks)
-and checks its deadline on the CPU cycle counter. Every poll interval is
-therefore the same length and the stamp error is uniform within one interval.
-Measured against a local linear fit on an Intel xHCI root port, the error is
-3.7 ticks (46 ns) RMS, with under 1 % of stamps up to 12 ticks late. With
-diagnostics on, those late stamps had normal poll and capture timing, so the
-frame number itself changed late in the host or USB core, and the capture was
-fine. `SOFGNSS_SOF_DEBUG` (off by default) adds a `$PVDB,SOFPPS,SOFDBG`
-sentence after each SOF with the spin's cycle counts, for looking into this.
-
 ## SDR calibration output
 
 This is for measuring an SDR's timing and frequency against the same clock as
-PPS and SOF. `$PVDB,SOFPPS,CAL,<mode>*hh` starts one 6.55 ms burst per PPS on
-**D3 (GPIO4)**. Without PPS it sends one per second on its own clock.
+PPS and SOF. `$PVDB,SOFPPS,CAL,<mode>*hh` starts one burst per PPS on the
+board's burst pin. Without PPS it sends one per second on its own clock.
 
-| Mode | Signal | Use |
-|---|---|---|
-| `NOISE` | Degree-18 maximal-length sequence, 262143 chips at 40 Mchip/s plus one 0 pad bit | Timing. It correlates to a single sharp peak with about 54 dB processing gain. |
-| `SQ2` | 2 MHz square wave (SPI, 10 zero bits and 10 one bits) | Frequency near the 160 MHz null. Odd harmonics sit every 4 MHz, for example at 158 and 162 MHz. The 162 MHz line is about 38 dB below the fundamental, so use about 20 dB less attenuation than for `SQ20`. |
-| `SQ20` | 20 MHz square wave (SPI, `0xAA`) | Frequency, with odd harmonics at 20, 60, 100 … MHz |
-| `SQ40` | 40 MHz square wave (LEDC) | Frequency, with odd harmonics at 40, 120, 200 … MHz |
-| `OFF` | | Default after boot |
+| Mode | Signal | STM32G474 (72 Mchip/s) | ESP32-S3 (40 Mchip/s) |
+|---|---|---|---|
+| `NOISE` | Timing. Degree-18 maximal-length sequence, 262143 chips plus one 0 pad bit. It correlates to a single sharp peak with about 54 dB processing gain. | 3.64 ms, nulls at multiples of 72 MHz (144, 216 MHz) | 6.55 ms, nulls at multiples of 40 MHz (160 MHz) |
+| `SQ2` | Frequency near a null. Square wave of 10 zero and 10 one chips. | 3.6 MHz, odd harmonics every 7.2 MHz (154.8, 162 MHz) | 2 MHz, odd harmonics every 4 MHz (158, 162 MHz) |
+| `SQ20` | Frequency. Square wave, `0xAA`. | 36 MHz, odd harmonics at 36, 108, 180 … MHz | 20 MHz, odd harmonics at 20, 60, 100 … MHz |
+| `SQ40` | Frequency. Square wave from LEDC. | not available, `ERR,NOCAL` | 40 MHz, odd harmonics at 40, 120, 200 … MHz |
+| `OFF` | | Default after boot | Default after boot |
 
-Every frequency comes from the same crystal and PLL as the 80 MHz counter, and
-PPS measures that counter against GPS, so the transmitted frequencies are
-known to ppb level. Every signal changes level only on a 25 ns (SPI) or
-12.5 ns (LEDC) grid. All of them therefore have a spectral null at every
-multiple of 40 MHz, including 160 MHz. `SQ2` is the way to get a line close to
-such a frequency, and `NOISE` still correlates there (V-shaped spectrum). Each
-burst start is captured on the counter and reported:
+Every frequency comes from the same crystal and PLL as the counter, and PPS
+measures that counter against GPS, so the transmitted frequencies are known to
+ppb level. Every signal changes level only on the chip grid, so all of them
+have a spectral null at every multiple of the chip rate. `SQ2` is the way to
+get a line close to such a frequency, and `NOISE` still correlates there
+(V-shaped spectrum). Next to a null the noise spectrum is about 16 dB down
+5 % of the chip rate away and 10 dB down at 10 % (2 and 4 MHz on the
+ESP32-S3, 3.6 and 7.2 MHz on the STM32). Prefer tunings a few MHz away from
+them. A spectrum analyser in max-hold shows the harmonic comb.
+
+Each burst start is captured on the counter and reported once the burst has
+ended:
 
 ```
 $PVDB,SOFPPS,CAL,<tick>,<mode>,<pps_synced>,<n>,<chip_rate>,<length>*hh
 ```
 
-`<chip_rate>` is the SPI rate in chips per second (40000000 here, 72000000 on
-the STM32). `<length>` is the burst's measured length in ticks, or 0 when it
-wasn't measured. Older firmware leaves both out. The sentence is sent when the
-burst has ended.
-
-Here both chip-select edges are captured in hardware: the SPI pulls it low
-before the first bit and releases it right after the last, so the length is
-exact to a tick. A gapless burst is 2 ticks per chip (524288) plus 3 ticks of
-chip-select setup and hold. Measured: every `NOISE` and `SQ20` burst 524291. A
-stall in the stream would make it longer, so tools drop bursts longer than the
-others. `SQ40` reports 0, because software ends it.
-
-The burst starts about 0.1 ms after the PPS edge (measured 40 to 120 µs). The exact difference
-is in the `PPS` and `CAL` ticks rather than assumed. For `NOISE`, `SQ2` and
-`SQ20` the tick is the SPI chip-select edge, exact to one tick. For `SQ40` it
-is a GPIO edge written together with the LEDC start, within about 50 ns.
-**D4 (GPIO5)** carries that start marker and is low during the burst. It needs
-no wiring and is handy as a scope trigger. A spectrum analyser in max-hold
-shows the harmonic comb.
+`<chip_rate>` is the SPI rate in chips per second. `<length>` is the burst's
+measured length in ticks, or 0 when it wasn't measured. Older firmware leaves
+both out. On both boards a gapless burst is 2 ticks per chip (524288) plus a
+few ticks of setup. A stall in the stream would make it longer, so tools drop
+bursts longer than the others.
 
 The sequence, for correlators, is sent MSB first from a right-shift Fibonacci
 LFSR starting at `state = 0x3FFFF`. Per chip it computes `out = state & 1`,
 `fb = (state ^ (state >> 7)) & 1` and `state = (state >> 1) | (fb << 17)`.
 
-The GPIO is far too strong for the SDR's input, so connect it like this:
-GPIO4 → 1 kΩ → 100 nF → 50 Ω to ground → 30–40 dB of attenuators → coax.
-The noise spectrum has nulls at multiples of 40 MHz, about −16 dB at 2 MHz
-away and −10 dB at 4 MHz. Prefer tunings a few MHz away from them.
+The pin is far too strong for the SDR's input, so connect it like this:
+burst pin → 1 kΩ → 100 nF → 50 Ω to ground → 30 to 40 dB of attenuators →
+coax.
 
-### On the STM32G474
-
-The STM32 sends the same patterns over SPI1 at 72 Mchip/s (the 144 MHz bus
-clock divided by 2). 40 Mchip/s isn't reachable while USB shares the PLL. So
-a `NOISE` burst lasts 3.64 ms and its nulls sit at multiples of 72 MHz (144,
-216 MHz), and 160 MHz is clear of them. `SQ20` is a 36 MHz square wave (odd
-harmonics at 36, 108, 180 … MHz) and `SQ2` a 3.6 MHz one (odd harmonics every
-7.2 MHz, for example 154.8 and 162 MHz). `SQ40` answers `ERR,NOCAL`.
-
-| Signal | Pin |
-|---|---|
-| Burst output | PA7 (SPI1_MOSI) |
-| Start marker, low during the burst | PA4 (SPI1_NSS) |
-| Start capture (TIM2_CH3) | PA9 |
-
-Wire PA4 to PA9. The marker falls as the SPI starts with its FIFO already
-filled by DMA, and TIM2 captures that edge, so the `CAL` tick is exact to one
-tick. Without the wire the bursts still go out, but no `CAL` sentences come.
-A burst starts from the PPS interrupt, normally about 7 µs after the edge.
-
-DMA feeds the SPI from a 32 KB buffer in CCM SRAM. USB register and packet
-memory accesses are slow and share the peripheral bus with that DMA. While the
-host streamed every SOF they stalled the stream by up to 30 chips per burst.
-So USB waits out each 3.6 ms burst: its interrupt is masked (the host gets
-NAKs) and the main loop does no USB work, DCD changes included. A PPS that
-arrives while USB work is running starts its burst right after that work
-instead, tens of microseconds later.
-
-Each burst's length is measured and sent in `<length>`: from the captured
-start edge to the moment the SPI reports its last bit gone (FIFO empty, not
-busy), read in the burst-end interrupt. A gapless burst is 2 ticks per chip
-(524288) plus a fixed 15 ticks, good to about a tick. A stall makes it longer,
-so a tool should drop bursts longer than the others. The `CAL` sentence is
-therefore sent when the burst has ended. Measured with every SOF streamed to
-the host: 62 of 63 bursts exactly 524303, one 524305. The firmware also logs
-bursts more than 64 ticks too long on the console. Use the same output network
-as above on PA7.
-
-`tools/sdrcal.py` takes the tick rate from INFO and the chip rate from CAL in
-the log, so it handles both boards. It skips NOISE bursts longer than the
-median length plus one tick.
+The pins and the board-specific timing are on the board pages:
+[STM32G474](stm32g4/README.md#sdr-calibration-output) (PA7, and a wire from
+PA4 to PA9 for the `CAL` ticks) and
+[ESP32-S3](esp32s3/README.md#sdr-calibration-output) (D3).
 
 ### Analysis
 
@@ -368,25 +252,31 @@ sample-rate error (the LO error for an SDR with one crystal), the timing
 residuals and the measured PPS-to-burst offset. `selftest` checks both on
 synthetic recordings with known errors.
 
+It takes the tick rate from INFO and the chip rate from CAL in the log, so it
+handles both boards. It skips NOISE bursts longer than the median length plus
+one tick.
+
 A note for correlators: tuned onto a spectral null, for example exactly
-160 MHz, the correlation has sidelobes about ±1.25 samples from the peak at
-60 % of its height. That is higher than the integer-sample points of a peak
-lying between samples. Find the peak on an upsampled correlation (the tool
-uses 8x) before refining.
+160 MHz on the ESP32-S3, the correlation has sidelobes about ±1.25 samples
+from the peak at 60 % of its height. That is higher than the integer-sample
+points of a peak lying between samples. Find the peak on an upsampled
+correlation (the tool uses 8x) before refining.
 
 ## Watchdogs
 
-- The hardware task watchdog is fed by every firmware task. A task that
-  stalls for 10 s, a panic, or interrupts left disabled will reboot the
-  device.
-- The host-silence watchdog (`SOFGNSS_HOST_WDT`, on by default) restarts the
-  device and makes it re-enumerate if no data arrives from the host for 60 s.
-  Control requests such as a baud change don't count as data, and time with
-  the bus suspended doesn't count as silence. This recovers a wedged USB
-  path. It also means host software must send something at least once a
-  minute, and `$PVDB,SOFPPS,PING*hh` is meant for that. A purely passive
-  reader would see the device disappear every minute, so build with the
-  option off for that use.
+- A hardware watchdog reboots a stalled device. On the STM32 it is the
+  independent watchdog (about 4 s), fed by the main loop. On the ESP32-S3 it
+  is the task watchdog, fed by every firmware task. A task that stalls for
+  10 s, a panic, or interrupts left disabled will reboot the device.
+- The host-silence watchdog restarts the device and makes it re-enumerate if
+  no data arrives from the host for 60 s. Control requests such as a baud
+  change don't count as data. This recovers a wedged USB path. It also means
+  host software must send something at least once a minute, and
+  `$PVDB,SOFPPS,PING*hh` is meant for that. On the STM32 it is always on,
+  also while the bus is suspended. On the ESP32-S3 it is `SOFGNSS_HOST_WDT`
+  (on by default), and time with the bus suspended doesn't count as silence.
+  A purely passive reader would see the device disappear every minute, so
+  build the ESP32-S3 with the option off for that use.
 
 Every boot, and every deliberate restart before it happens, first takes the
 device off the bus for 300 ms by turning off the D+ pull-up. A software reset
@@ -408,7 +298,7 @@ and discards everything up to the `INFO` that echoes the nonce.
 Each PPS edge also raises the CDC carrier-detect line for
 `SOFGNSS_DCD_PULSE_MS` (100 ms), which is the convention gpsd and ntpd use for
 serial receivers. On Linux the change is visible through the usual modem-line
-calls. `TIOCMIWAIT` wakes a waiter about 1-2 ms after the edge, because the
+calls. `TIOCMIWAIT` wakes a waiter about 1 to 2 ms after the edge, because the
 interrupt endpoint is polled every 1 ms, and `TIOCMGET` reads the level.
 gpsd's PPS thread uses exactly this when there is no kernel PPS device.
 
@@ -419,121 +309,6 @@ usb-serial adapters such as FTDI do call it. So this path only gives
 millisecond-class timestamps in userspace. The exact edge time is in the
 `$PVDB,SOFPPS,PPS` sentence on the same port. Without a receiver,
 `$PVDB,SOFPPS,SIMPPS*hh` fires the whole path once.
-
-## How the SOF timestamp is taken
-
-The ESP32-S3 has no hardware path from the USB core to a timer. The SOF
-timestamp is therefore taken in software, with the jitter of a register poll
-rather than of an interrupt:
-
-1. From the last tagged SOF and the measured frame period, predict when the
-   next target frame arrives.
-2. Sleep until `SOFGNSS_SOF_LEAD_US` (default 200 µs) before it, using a
-   one-shot `esp_timer` with ISR dispatch.
-3. On core 1, with interrupts masked, spin reading the DWC2 `DSTS.SOFFN`
-   register. The moment it changes, trigger a software capture of the timer
-   and read it. Detection is as fine as one register read (~100 ns), which is
-   at the noise floor of a full-speed SOF anyway.
-4. Report the stamp only if the caught frame is the target. Otherwise count it
-   as missed and plan again. The spin gives up after 3 ms so a suspended bus
-   can't hang the task.
-
-Everything else (TinyUSB, UART, parser, PPS interrupt) runs on core 0.
-
-## STM32G474 port
-
-`stm32g4/` builds the same firmware for the STM32G474, sized for the smallest
-part (G474xB: 128 KB flash, 96 KB of SRAM used). It is a bare-metal main loop, and
-interrupts only take timestamps and move bytes. It speaks the same protocol
-with the same USB descriptors, so sofd treats both boards alike. The USB
-serial number is the 96-bit chip UID (24 hex digits).
-
-The SOF timestamp is taken in hardware. TIM2 is the 32-bit timestamp counter
-at the 144 MHz core clock (6.9 ns, wraps every 30 s). Channel 1 captures
-internal trigger 11, the USB SOF (only TIM2 has it), and channel 2 captures
-PPS from a pin. The TIM2 interrupt reads `USB_FNR` next to each capture and
-drops the pair if another SOF arrived meanwhile (counted in INFO's
-`<sof_missed>`). Every SOF is captured, and the divider and dither then pick
-the tagged frames as on the ESP32-S3.
-
-The target is the WeAct STM32G474 core board (STM32G474CEU6, 8 MHz crystal,
-USB-C). Its headers are labelled with the pin names. The pins are set in
-`stm32g4/include/port.h`, and the GPS UART is on PB10/PB11, which every G474
-package has:
-
-| Signal              | Pin  | Function    |
-|---------------------|------|-------------|
-| GPS TX ← board      | PB10 | USART3_TX   |
-| GPS RX → board      | PB11 | USART3_RX   |
-| PPS in              | PA1  | TIM2_CH2, rising edge |
-| Status LED          | PC6  | the board's LED |
-| Debug console TX    | PA2  | LPUART1, 115200, to a 3.3 V USB serial adapter |
-| USB D− / D+         | PA11 / PA12 | USB-C |
-
-The core clock comes from HSE through the PLL. At boot the firmware measures
-HSE against HSI16 (HSE/32 into TIM17) and accepts an 8, 12 or 24 MHz external
-clock or crystal. It tries bypass mode first, because a crystal gives no clock
-there while an external clock would also run in crystal mode, only with more
-jitter. A mode that starts but measures wrong is rejected. The console shows
-the measurement and the choice.
-
-USB runs from the same PLL (288 MHz / 6), which is why the core clock is 144
-MHz and not the maximum 170 MHz. With USB on HSI48 the SOF trigger crosses
-clock domains, and TIM2 then saw only 80 to 86 % of the SOFs, plus some
-captures flagged without a new value. On the shared clock it gets all of them.
-Without a usable HSE the core runs from HSI16 (about 1 % off) and USB from
-HSI48 trimmed by the CRS, so SOF captures are unreliable. USB runs from HSI48, trimmed to the host's SOF by the CRS.
-
-```sh
-cmake -S stm32g4 -B stm32g4/build          # fetches TinyUSB, CMSIS and micro-ecc
-cmake --build stm32g4/build                # bootloader, app and the images below
-cmake --build stm32g4/build --target dfu   # everything over USB (dfu-util)
-cmake --build stm32g4/build --target flash # or over ST-LINK (OpenOCD)
-tools/ota.py stm32g4/build/sofgnss-signed.bin   # app update over the CDC port
-```
-
-The build writes `sofgnss-signed.bin`, the app with its signed header, which
-is what OTA sends, and `sofgnss-full.bin`, bootloader, header and app for an
-empty chip. For DFU, hold BOOT0, press and release NRST, then release BOOT0.
-The chip's ROM bootloader then shows up as `0483:df11`. After the download it
-jumps to our bootloader, which resets itself to start clean.
-
-### Bootloader
-
-Flash layout: the bootloader in the first 24 KB, the image header in the next
-4 KB, the app from 0x08007000. The bootloader uses only CCM SRAM, so the app's
-panic flag survives, and it leaves the reset flags for the app to read.
-
-The bootloader never starts the app by itself, because the board is of no use
-without a host. It enumerates with the same USB identity and answers `INFO`,
-`VER`, `PING`, `OTA` and `START`. Its VER reports platform `stm32g4-boot`, the
-installed app's version and ELF SHA-256, and in the partition field the app's
-state: `valid`, `invalid` or `empty`. The host then sends `START`, or `OTA`
-with a new image followed by `START`. A running app is sent `BOOT` first.
-sofd and `tools/ota.py` do all of this.
-
-`START` checks the app's SHA-256 and signature every time (about 1 s), then
-puts USB, clocks and interrupts back to reset state and jumps to the app. An
-update erases the header first, writes the app, checks it and writes the
-header last, so an interrupted or bad update leaves the state `empty`, and the
-bootloader stays reachable for the next try.
-
-The watchdog starts at the bootloader's first instruction, and the bootloader
-also restarts after 60 s without host data, in case USB came up wrong. The
-bootloader itself is only written over DFU or SWD.
-
-Images are signed with ECDSA P-256 (micro-ecc). The key is
-`keys/stm32_signing_key.pem`, not in git. Create it once and keep a backup.
-The bootloader build embeds its public key, so boards only take images signed
-with the key of the bootloader they run:
-
-```sh
-stm32g4/sign.py keygen keys/stm32_signing_key.pem
-```
-
-The calibration output is described under
-[SDR calibration output](#on-the-stm32g474). The independent watchdog (about 4 s) replaces the task watchdog, and VER's reset
-reasons are `POWERON`, `EXT`, `SW`, `PANIC` (a fault handler), `WDT`.
 
 ## Layout
 
@@ -547,17 +322,18 @@ core/                    portable, no platform includes (C++17), shared by both 
   timing_reporter.*      PPS/SOF events → sentences
   cal_signal.*           calibration burst patterns
   sof_spin_source.*      predict / sleep / spin SOF tagging (ports without HW SOF capture)
-esp32s3/                 ESP-IDF project (idf.py)
-  main/app_main.cpp      task wiring (FreeRTOS), Kconfig menus
-  components/port_esp32s3/  HAL: TinyUSB glue, MCPWM capture, UART, OTA, calibration
-stm32g4/                 bare-metal CMake project
+stm32g4/                 STM32G474, bare-metal CMake project
+  README.md              wiring, building, flashing, bootloader
   boot/                  bootloader: USB, OTA into flash, signature check
   sign.py                signing key, signed and full images
   src/main.cpp           main loop
   src/*.cpp              HAL: clocks, TIM2 capture, UART, USB, calibration
   include/               pins and settings (port.h, config.h), TinyUSB config
+esp32s3/                 ESP32-S3, ESP-IDF project (idf.py)
+  README.md              wiring, building, flashing
+  main/app_main.cpp      task wiring (FreeRTOS), Kconfig menus
+  components/port_esp32s3/  HAL: TinyUSB glue, MCPWM capture, UART, OTA, calibration
 test/host/               host build of core with a simulated HAL
-tools/                   ota.py (ESP32 updates), sdrcal.py (calibration analysis)
-keys/                    ESP32 image signing key, not in git
+tools/                   ota.py (updates for both boards), sdrcal.py (calibration analysis)
+keys/                    signing keys for both boards, not in git
 ```
-
