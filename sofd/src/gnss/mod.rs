@@ -4,6 +4,7 @@
 pub mod device;
 pub mod external;
 pub mod firmware;
+pub mod fix;
 pub mod framer;
 pub mod gpio;
 pub mod join;
@@ -77,14 +78,16 @@ pub struct HostClock {
     pulses: Mutex<VecDeque<(Ns, Ns)>>,
     /// The pulses' timing uncertainty.
     pub unc_ns: Ns,
+    /// `HostPps`, or `HostSerial` without real pulses.
+    pub source: timing::Source,
 }
 
 /// Past the last pulse, extrapolate this far at most.
 const HOST_EXTRAPOLATE_NS: Ns = 1_500_000_000;
 
 impl HostClock {
-    pub fn new(unc_ns: Ns) -> Self {
-        Self { pulses: Mutex::new(VecDeque::new()), unc_ns }
+    pub fn new(unc_ns: Ns, source: timing::Source) -> Self {
+        Self { pulses: Mutex::new(VecDeque::new()), unc_ns, source }
     }
 
     pub fn push(&self, raw: Ns, utc: Ns) {
@@ -126,7 +129,7 @@ mod tests {
 
     #[test]
     fn host_clock_interpolates_and_extrapolates() {
-        let c = HostClock::new(300);
+        let c = HostClock::new(300, timing::Source::HostPps);
         assert_eq!(c.utc_of(5), None);
         // Raw clock 10 ppm slow against UTC.
         let s = 1_000_000_000;

@@ -432,7 +432,7 @@ fn run(
             match hc.utc_of(s.t_ns) {
                 Some(u) => {
                     model_gnss.push(counter, u, hc.unc_ns);
-                    (gnss_source, last_tag_rx, last_ok, by_counter) = (Some(Source::HostPps), Some(s.t_ns), true, true);
+                    (gnss_source, last_tag_rx, last_ok, by_counter) = (Some(hc.source), Some(s.t_ns), true, true);
                 }
                 None => last_ok = false,
             }

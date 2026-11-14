@@ -32,6 +32,8 @@
       "initial_baud": 9600,              // receiver's power-on baud, e.g. 38400 for u-blox M10/F9
       // "chrony": "/run/chrony.sofgnss.sock",       // use {serial} for one socket per board
       // "firmware": "/var/lib/sofd/sofgnss.bin",
+      // "fix": false,                   // no gnss/<serial>/fix message per epoch
+      // "serial_delay_ns": 38000000,    // receivers and USB modules without pulses: rough time from their output (README)
       // "leap_seconds": 18,             // GPS minus UTC until the receiver knows it (up to 12.5 min after a cold start)
       // "constellations": ["gps", "galileo", "beidou"],   // u-blox 9 and later
     },
@@ -42,7 +44,11 @@
     "receivers": {
       // "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" },
       // "pps_gpio": 18 instead of "pps": sofd polls the Raspberry Pi GPIO itself (±0.2 us)
+      // Options of a USB module (no tty), here its own serial_delay_ns
+      // "usb-1-1.3": { "serial_delay_ns": 45000000 },
     },
+    // u-blox modules on their own USB port, no pulses: "all", "none" or a list of names (README)
+    // "usb_receivers": "all",
     // MQTT clients allowed to act as GNSS reference (see MQTT-GUIDE.md)
     "external": {
       // "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 },

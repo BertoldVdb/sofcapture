@@ -118,6 +118,7 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
       "leap_seconds": null,       // GPS minus UTC (18 since 2017) until the receiver knows it
       "constellations": null,     // e.g. ["gps", "galileo", "beidou"], u-blox 9 and later
       "frames": true,             // publish every receiver frame
+      "fix": true,                // publish a fix per navigation epoch
       "div": null,                // board SOF tag divider (board default)
       "sof_delay_ns": null,       // bus frame start to the board's capture (0, 1300 on STM32)
       "chrony": "/run/chrony.sofgnss.sock",   // SOCK refclock; "{serial}" is substituted
@@ -127,6 +128,8 @@ chrony. Every section is optional, and `sofd.example.hujson` shows them all.
     "external": { "myapp": { "chrony": "/run/chrony.myapp.sock", "sof_delay_ns": 0 } },
     // a receiver on a serial port with its PPS on /dev/pps, no board (below)
     "receivers": { "ttyS0": { "tty": "/dev/ttyS0", "pps": "/dev/pps0", "chrony": "/run/chrony.ttyS0.sock" } },
+    // u-blox modules on their own USB port: "all", "none" or a list of names (below)
+    "usb_receivers": "none",
   },
 }
 ```
@@ -156,9 +159,10 @@ being silently ignored. A file given with `--config` must exist. Without
 | `sampler.cpu_governor` | none | While sampling, use this cpufreq governor on `cpu` if it is set, or on all CPUs otherwise. The previous governor is restored afterwards. |
 | `controllers.<id>.counter_lead_ns` | known controllers' value, else 0 | How long after the host sees the frame counter step the frame starts on the bus ([below](#frame-counter-lead)). `<id>` is sofd's controller id, e.g. `0000:01:00.0`. Within ±1 ms. |
 | `gnss.attach` | `"all"` | Which sofgnss boards to use. `"all"` means every board with the sofgnss descriptors and `"none"` means none. A list of USB serials picks those boards, whatever their descriptors say. |
-| `gnss.defaults` | | Board options (below) for every board. |
+| `gnss.defaults` | | Board options (below) for every board, receiver and USB module. |
 | `gnss.boards.<serial>` | | Board options for one board, by USB serial. Each option set here replaces the one from `defaults`. Options left out fall back to `defaults`, then to the built-in default. |
-| `gnss.receivers.<name>` | none | A receiver without a sofgnss board ([below](#receivers-without-a-board)). It needs `tty` and either `pps` (a /dev/pps device) or `pps_gpio` (a Raspberry Pi GPIO number, polled), and takes the board options except `div`, `sof_delay_ns` and `firmware`. Options left out fall back to `defaults`, and `{serial}` in `chrony` is replaced by the name. |
+| `gnss.receivers.<name>` | none | A receiver without a sofgnss board ([below](#receivers-without-a-board)). It needs `tty`, and takes `pps` (a /dev/pps device) or `pps_gpio` (a Raspberry Pi GPIO number, polled). Without either it has no pulses and only passes data, unless `serial_delay_ns` is set ([serial timing](#serial-timing)). It takes the board options except `div`, `sof_delay_ns` and `firmware`, plus `serial_delay_ns`. Options left out fall back to `defaults`, and `{serial}` in `chrony` is replaced by the name. An entry without `tty` holds the options of the USB module of that name. |
+| `gnss.usb_receivers` | `"none"` | Which u-blox modules on their own USB port to use ([below](#usb-modules)): `"all"`, `"none"` or a list of names. A module's name is its USB serial, or `usb-<port>` (for example `usb-1-1.3`) when it has none. |
 | `gnss.external.<client>` | none | An MQTT client that may act as a GNSS reference ([below](#gnss-reference-from-an-mqtt-client)). It takes `chrony` (a socket path) and `sof_delay_ns` (as for boards). The client `*` allows every client not listed by name. |
 
 Board options:
@@ -172,8 +176,10 @@ Board options:
 | `constellations` | none | The GNSS the receiver tracks: any of `gps`, `galileo`, `beidou`, `glonass`, `qzss` and `sbas`, and all others are turned off. It must include `gps`, because pulses are labelled on the GPS grid. Applied in RAM with CFG-VALSET at every setup, on u-blox 9 and later only. The receiver restarts its GNSS on a signal change, so sofd waits 1 s before the next step. Older receivers keep their own setting, and a `configuring` status message says so: on u-blox 8 turning a system on needs a save to battery-backed RAM and a hardware reset, and some firmware (the LEA-M8T's TIM 1.10) accepts Galileo and BeiDou but never tracks them. A receiver that rejects the combination keeps its own as well, with a status message. Without the option sofd leaves the receiver's choice alone. |
 | `strict` | `false` | With `true` sofd never falls back to NMEA ZDA ([below](#receiver-setup)) and keeps retrying the setup until it works. Needs `configure`. |
 | `frames` | `true` | Publish every receiver frame on `gnss/<serial>/nmea\|ubx\|rtcm3/…`. Set it to `false` to save broker traffic. sofd still uses the frames itself. |
+| `fix` | `true` | Publish the receiver's fix once per navigation epoch on `gnss/<serial>/fix` ([below](#fix)). |
 | `div` | board's own (100) | The board timestamps one SOF in every `div` frames (1 to 1000000). The default gives 10 tags per second at 1 ms frames. More tags add points to `model_gnss` but use more USB bandwidth. |
 | `sof_delay_ns` | 0, 1300 on STM32 boards | The board's fixed delay from the start of the bus frame to its capture (within ±1 s). It is subtracted from every tag's GNSS time, so a positive value moves `model_gnss` and chrony earlier. The STM32 port captures a little into the SOF packet: 1.12 µs behind a Raspberry Pi 4's hub and 1.44 to 1.52 µs directly on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO. Its default puts either within about 0.2 µs. The value in use is in the board's status. |
+| `serial_delay_ns` | none | Not for boards. Gives receivers and USB modules without pulses a rough time from when their output arrives ([below](#serial-timing)): the delay from a navigation epoch to its output, 0 to 1 s. In `defaults` it is for all of them, and `null` in `receivers` turns it off for one. Receivers with pulses ignore the default. |
 | `chrony` | none | Path of a chrony SOCK refclock socket. `{serial}` is replaced by the board's serial. `null` in `boards` turns it off for one board. |
 | `firmware` | none | The sofgnss image the board should run: `sofgnss/stm32g4/build/sofgnss-signed.bin` for STM32 boards, `sofgnss/esp32s3/build/sofgnss.bin` for ESP32-S3 boards. Boards running another image are updated, boards of the other kind are left alone. `null` in `boards` turns updates off for one board. |
 
@@ -233,12 +239,13 @@ frames from these topics.
 | `controllers/<id>/ref/<client>` | by clients | SOF tags of an MQTT GNSS reference (below). |
 | `gnss/<serial>/status` | yes | Board state (below). |
 | `gnss/<serial>/pps` | | Each pulse and whether it was used. |
+| `gnss/<serial>/fix` | | The receiver's fix, once per navigation epoch ([below](#fix)). |
 | `gnss/<serial>/event` | | `detached`, `firmware_updated`, `firmware_failed`, `chrony_busy`. |
 | `gnss/<serial>/nmea/<address>` | | Raw sentence, e.g. `.../nmea/GPZDA`. |
 | `gnss/<serial>/ubx/<class>/<id>` | | Raw UBX frame (binary, hex ids), e.g. `.../ubx/0d/01`. |
 | `gnss/<serial>/rtcm3/<type>` | | Raw RTCM3 frame, e.g. `.../rtcm3/1005`. |
 | `gnss/<serial>/tx` | by clients | Bytes for the receiver, written as they are. |
-| `gnss/<name>/…` | | The same topics for a [receiver without a board](#receivers-without-a-board), by its name. Its `pps` events also carry `t_realtime_ns`, the kernel's timestamp of the edge, and its events carry `receiver` instead of `board`. |
+| `gnss/<name>/…` | | The same topics for a [receiver without a board](#receivers-without-a-board), by its name. Its `pps` events also carry `t_realtime_ns`, the kernel's timestamp of the edge, and its events carry `receiver` instead of `board`. With [serial timing](#serial-timing) the `pps` events have `source` `serial` and stand for epochs, not pulses. |
 | `cmd/list`, `cmd/lookup` | | Request and response. sofd replies to the MQTT 5 response topic, or to `reply_to` in the body for MQTT 3.1.1. `correlation` is echoed back. Replies are not retained. |
 
 sofd ignores retained messages on `ref`, `tx` and `cmd`, so one retained by
@@ -291,7 +298,7 @@ Here is a sample, as published on request and as `probe` prints it:
                   "est_error_ns":0, "max_error_ns":4508000},      // kernel_synced with `rtcsync`
  "frame_start":{"bus_frame":1234, "counter":1234560,   // 1 ms frame containing this sample
                 "t_raw_ns":…, "t_realtime_ns":…, "t_gnss_ns":…},   // from the fits; each null while its fit is
- "gnss":{"board":"E072A1F9D198", "source":"tim_tp",   // or "zda"; null without a board
+ "gnss":{"board":"E072A1F9D198", "source":"tim_tp",   // or "zda", "external", "host_pps", "host_serial" (null without a board)
          "frame_offset":-14336,                       // host frame = board frame + offset
          "realtime_minus_gnss_ns":-919790}}           // CLOCK_REALTIME - GNSS UTC at frame_start
 {"event":"realtime_step","controller":"…","step_ns":…}   // CLOCK_REALTIME moved more than the kernel's slew allows
@@ -397,13 +404,13 @@ brings back the receiver's saved settings.
 
 sofd also turns on some diagnostics for monitoring peers. They are published
 like every other receiver frame on `gnss/<serial>/ubx/<class>/<id>`, and sofd
-itself does not use them. The large ones only come every 5th navigation epoch
+itself only uses the solution messages, for the [fix](#fix). The large ones only come every 5th navigation epoch
 so they do not keep the line busy at the pulse. At 38400 baud the 5th epoch
 carries about 1 KB, which takes 0.25 s, so keep `baud` at 38400 or more.
 
 | | u-blox 9/10 | u-blox 8 | u-blox 7 | u-blox 5/6 |
 |---|---|---|---|---|
-| solution, with UTC (every epoch) | NAV-PVT `01/07` | NAV-PVT | NAV-PVT | NAV-SOL `01/06` + NAV-TIMEUTC `01/21` |
+| solution, with UTC (every epoch) | NAV-PVT `01/07` | NAV-PVT | NAV-PVT | NAV-SOL `01/06` + NAV-TIMEUTC `01/21` + NAV-POSLLH `01/02` + NAV-VELNED `01/12` |
 | satellites: C/N0, elevation, azimuth, use (every 5th) | NAV-SAT `01/35` | NAV-SAT | NAV-SVINFO `01/30` | NAV-SVINFO |
 | RF (every 5th) | MON-SPAN `0a/31` (spectrum) | MON-HW `0a/09` (noise, AGC, jamming) | MON-HW | MON-HW |
 
@@ -419,6 +426,53 @@ TIM-TP is set up again from step 3, without a baud search. A receiver that does 
 three times in a row, is used as it is, and its pulses are labelled from NMEA
 ZDA instead. With `strict` sofd keeps retrying the setup instead. With `configure:false` the tty runs at `initial_baud`, and pulses
 are labelled from TIM-TP when it arrives and from ZDA otherwise.
+
+### Fix
+
+Every board, receiver and USB module gets its fix published on
+`gnss/<serial>/fix`, one JSON message per navigation epoch, not retained. The
+topic names the receiver, so the message does not. Turn it off with
+`"fix": false`.
+
+```jsonc
+{"utc_ns":1794664032999866635,   // the epoch, null until the receiver knows date and time
+ "time_valid":true,              // date and time valid and fully resolved
+ "t_acc_ns":14,                  // the receiver's time accuracy estimate
+ "leap_seconds":18,              // GPS minus UTC from the receiver, null until it knows
+ "fix":"3d",                     // none, 2d, 3d, dead_reckoning, gnss_dr, time_only
+ "fix_ok":true,                  // the receiver's own "fix within limits" flag
+ "differential":false,           // SBAS or RTCM corrections applied
+ "carrier":"none",               // none, float, fixed (RTK)
+ "lat_deg":48.1234567, "lon_deg":11.1234567,
+ "height_m":512.34,              // above the ellipsoid
+ "msl_m":465.12,                 // above mean sea level
+ "h_acc_m":5.7, "v_acc_m":7.1,   // accuracy estimates
+ "speed_mps":0.047,              // ground speed
+ "course_deg":3.15,              // course over ground
+ "vel_ned_mps":[-0.045,-0.012,0.046],
+ "speed_acc_mps":0.65,
+ "sats_used":13, "pdop":1.22, "hdop":null,
+ "source":"nav_pvt"}             // nav_pvt, nav_sol or nmea
+```
+
+What the receiver does not tell is `null`. With `fix` `none` the position,
+velocity and their accuracies are `null` too, because the receiver then
+repeats an old or empty position. `utc_ns` is the time of the navigation
+epoch as the receiver reports it, which is not exactly on the second: it
+follows the receiver's own clock. `course_deg` is the direction of motion and
+means little at standstill.
+
+Where it comes from, by `source`:
+
+| `source` | Receiver | From |
+|---|---|---|
+| `nav_pvt` | u-blox 7 and later | NAV-PVT, which has all of it except `hdop` |
+| `nav_sol` | u-blox 5 and 6 | NAV-SOL, NAV-TIMEUTC, NAV-POSLLH and NAV-VELNED of one epoch. `carrier` is always `none`, `hdop` `null`. |
+| `nmea` | NMEA only | GGA, RMC and GSA of one epoch. No accuracy estimates, `vel_ned_mps`, `t_acc_ns` or `leap_seconds`. `utc_ns` needs RMC for the date. |
+
+A receiver that sends several of these gets one fix per epoch, from the
+first source in the table. Where an epoch takes several messages, the fix
+goes out when all have come, or 0.3 s after the last one.
 
 ### Labelling pulses
 
@@ -511,7 +565,9 @@ One board feeds one socket. With a default path and several boards, the first
 valid board owns the socket until it is gone or has been silent for 10 s, and
 the others get `chrony_busy`. A [receiver without a board](#receivers-without-a-board)
 on the same socket gives way at once to a board or MQTT reference with a valid
-reference, and gets the socket back once that has been gone or silent for 10 s. Put `{serial}` in the path to get one source per
+reference, and gets the socket back once that has been gone or silent for 10 s.
+A receiver with [serial timing](#serial-timing) gives way to all of these in
+the same way. Put `{serial}` in the path to get one source per
 board. The leap flag is always 0, so give chrony `leapsectz right/UTC`.
 
 ```
@@ -606,6 +662,89 @@ controller dated this way agreed with a board on another controller to
 The serial port must be free: turn off a serial console or getty on it, and
 stop gpsd. sofd opens the port exclusively and retries with a backoff when it
 cannot.
+
+#### Without pulses
+
+`pps` and `pps_gpio` can both be left out. The receiver is then set up the
+same way and its status and frames go to MQTT, and `tx` reaches it, but it
+gives no time: it never becomes `locked`, sends nothing to chrony and dates no
+controller. This is for using sofd's u-blox setup and MQTT frames with a
+receiver whose time pulse is not wired.
+
+#### USB modules
+
+A u-blox module plugged in by its own USB port is such a receiver. With
+`usb_receivers` set, sofd finds them like boards, by USB VID:PID 1546:01a5 to
+1546:01a9 (u-blox 5 to 9), and opens and closes them as they come and go.
+u-blox cellular modems share the vendor id and are left alone.
+
+```jsonc
+"gnss": {
+  "usb_receivers": "all",                      // or ["usb-1-1.3"]
+  "receivers": {
+    "usb-1-1.3": { "frames": true },           // options for one module, no tty
+  }
+}
+```
+
+A module is named by its USB serial. Many report none, and are then named by
+their port, `usb-<port>`, which changes when the module moves to another port.
+The name is in the log and in `gnss/<name>/status`, which also carries `port`.
+Options come from `gnss.defaults` and from the `gnss.receivers` entry of that
+name, which then has no `tty`.
+
+sofd configures the port the module is reached through. On u-blox 9 that
+means the USB keys (`CFG-USBOUTPROT`, `CFG-MSGOUT-*_USB`), and the UART's baud
+is left as it is. The baud options do nothing on USB. Like every receiver,
+the module must not be open elsewhere: gpsd grabs USB receivers by itself
+when it runs with `USBAUTO`.
+
+#### Serial timing
+
+A receiver without pulses can still give a rough time, from when its output
+arrives. Set `serial_delay_ns` to turn that on:
+
+```jsonc
+"receivers": { "usb-1-1.3": { "serial_delay_ns": 38000000, "chrony": "/run/chrony.gps.sock" } }
+```
+
+In `defaults` it applies to every receiver and USB module without pulses,
+which suits a USB module whose port, and so its name, is not known beforehand:
+
+```jsonc
+"usb_receivers": "all",
+"defaults": { "serial_delay_ns": 38000000, "chrony": "/run/chrony.sofd.sock" }
+```
+
+An entry in `receivers` can give its own value, or `null` to stay data only.
+
+A receiver sends the messages of one navigation epoch in a row and is then
+quiet until the next. sofd takes the first read after at least 100 ms of
+silence as the start of an epoch's output and dates it `serial_delay_ns` after
+the epoch, whose time is in that output (UBX-NAV-TIMEGPS, or NMEA ZDA). So
+`serial_delay_ns` is the receiver's delay from the epoch to its first byte
+reaching sofd. It depends on the receiver, its messages and the port, and
+sofd does not measure it: with a better reference at hand, that one is used
+instead. A u-blox 8 on USB measured 38 ms (sd 1.5 ms over 67 epochs) against
+an NTP clock, which itself is only good to some ms.
+
+Each epoch is published as a `pps` event with `source` `serial`, where `tick`
+(CLOCK_MONOTONIC_RAW) and `t_realtime_ns` are the arrival minus the delay and
+`utc_ns` is the epoch. An epoch is `accepted` when the receiver has a fix,
+its time is valid, and the arrival moved by the same time as the epochs since
+the previous one, within 20 ms. The reasons otherwise are `first_epoch`,
+`no_fix`, `no_time`, `no_leap_seconds`, `interval`, `label_jump` and
+`line_busy` (no silence before the output). It needs a navigation rate of
+1 Hz.
+
+Accepted epochs are used as a receiver's pulses are, at the lowest rank:
+
+- They go to chrony when `chrony` is set. On a shared socket every other
+  source takes precedence. Give chrony a `precision` to match, such as
+  `refclock SOCK /run/chrony.gps.sock refid GPS precision 1e-3`.
+- A controller without a board, MQTT reference or receiver with pulses is
+  dated by it, with `gnss.source` `host_serial`. Expect ms, and a `ppm` that
+  is of no use: on the u-blox 8 above `model_gnss` had 1.7 ms rms residual.
 
 ### GNSS reference from an MQTT client
 

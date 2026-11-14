@@ -235,7 +235,8 @@ impl PulseSource {
     }
 }
 
-/// A receiver on a serial port, with its pulses on a /dev/pps device or a polled GPIO.
+/// A receiver on a serial port or its own USB port. Its pulses, if any, come from a
+/// /dev/pps device or a polled GPIO.
 pub struct Receiver {
     pub id: u64,
     worker: Worker,
@@ -292,16 +293,22 @@ pub fn spawn(info: BoardInfo, cfg: Config, hub: &Hub, out: &Sender<Msg>) -> Resu
     Ok(Board { info, id, feed, worker })
 }
 
-pub fn spawn_receiver(name: &str, tty: &str, pps: &PpsSpec, cfg: Config, out: &Sender<Msg>) -> Result<Receiver> {
+pub fn spawn_receiver(name: &str, tty: &str, pps: Option<&PpsSpec>, cfg: Config, out: &Sender<Msg>) -> Result<Receiver> {
     let t = Tty::open(tty, cfg.initial_baud).with_context(|| format!("opening {tty}"))?;
     let p = match pps {
-        PpsSpec::Device(path) => PulseSource::Device(Pps::open(path).with_context(|| format!("opening {path}"))?),
-        PpsSpec::Gpio(n) => PulseSource::Gpio(Poller::start(*n).with_context(|| format!("polling GPIO {n}"))?),
+        Some(PpsSpec::Device(path)) => Some(PulseSource::Device(Pps::open(path).with_context(|| format!("opening {path}"))?)),
+        Some(PpsSpec::Gpio(n)) => Some(PulseSource::Gpio(Poller::start(*n).with_context(|| format!("polling GPIO {n}"))?)),
+        None => None,
     };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let io = Io { name: name.into(), id, tty: t, pps: Some(p), feed: None };
-    let worker = start(io, Config { plain: true, ..cfg }, out, || {})?;
-    info!("{name}: receiver on {tty}, pulses from {pps}");
+    let io = Io { name: name.into(), id, tty: t, pps: p, feed: None };
+    let timing = match (pps, cfg.serial_delay_ns) {
+        (Some(p), _) => format!("pulses from {p}"),
+        (None, Some(d)) => format!("no pulses, epochs dated by their output ({} ms delay)", d / 1_000_000),
+        (None, None) => "no pulses, data only".into(),
+    };
+    let worker = start(io, Config { plain: true, pps: pps.is_some(), ..cfg }, out, || {})?;
+    info!("{name}: receiver on {tty}, {timing}");
     Ok(Receiver { id, worker })
 }
 
@@ -388,9 +395,15 @@ fn run(mut io: Io, cfg: Config, tx: &mpsc::Receiver<Vec<u8>>, out: &Sender<Msg>,
                 BoardOut::Status(ev)
             } else if ev["event"] == "gnss_cal" {
                 BoardOut::Cal(ev)
+            } else if ev["event"] == "gnss_fix" {
+                BoardOut::Fix(ev)
             } else {
                 if io.pps.is_some() {
                     let t = ev["tick"].as_u64().and_then(|t| pulses.realtime_of(t));
+                    ev["t_realtime_ns"] = json!(t);
+                } else if ev["source"] == "serial" {
+                    // The session dated it on the raw clock.
+                    let t = ev["tick"].as_i64().map(|t| t + clock::offset_from_raw(clock::realtime));
                     ev["t_realtime_ns"] = json!(t);
                 }
                 BoardOut::Pps(ev)

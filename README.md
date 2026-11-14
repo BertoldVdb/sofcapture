@@ -41,7 +41,11 @@ chrony steers the clock, and on a laptop that gets to about 50 to 100 ns rms.
 
 Without a board, sofd still gives SOF timing against the host clocks. A
 program that already knows the GNSS time of some SOFs can be the GNSS
-reference over MQTT instead of a board.
+reference over MQTT instead of a board. sofd can also run a receiver that is
+not on a board, wired to a serial port with its PPS on the host, or a u-blox
+module on its own USB port, which gives its data and at best a time good to
+milliseconds (see
+[Receivers without a board](sofd/README.md#receivers-without-a-board)).
 
 ## Parts
 

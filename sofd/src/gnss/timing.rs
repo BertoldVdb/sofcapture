@@ -30,6 +30,8 @@ pub enum Source {
     External,
     /// The host clock, dated by a receiver's pulses.
     HostPps,
+    /// The host clock, dated by when a receiver's output arrived.
+    HostSerial,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +142,11 @@ impl Labeler {
         self.tick_hz = hz as f64;
     }
 
+    /// The last fix report said ok.
+    pub fn has_fix(&self) -> bool {
+        matches!(self.fix, Some((true, _)))
+    }
+
     pub fn on_fix(&mut self, ok: bool) {
         self.fix = Some((ok, self.idx));
     }
@@ -174,9 +181,9 @@ impl Labeler {
         let label: Label = match (between.len(), self.source) {
             (1, _) => between[0],
             (0, Source::TimTp) => Err("no_tim_tp"),
-            (0, Source::Zda | Source::External | Source::HostPps) => Err("no_zda"),
+            (0, Source::Zda | Source::External | Source::HostPps | Source::HostSerial) => Err("no_zda"),
             (_, Source::TimTp) => Err("multiple_tim_tp"),
-            (_, Source::Zda | Source::External | Source::HostPps) => Err("multiple_zda"),
+            (_, Source::Zda | Source::External | Source::HostPps | Source::HostSerial) => Err("multiple_zda"),
         };
         let fix_ok = matches!(self.fix, Some((true, i)) if self.idx - i <= FIX_MAX_AGE);
         let interval_ok =
@@ -210,7 +217,7 @@ impl Labeler {
                 self.decided(d, decisions, tags);
             }
             // External and host clock tags never reach a labeler.
-            Source::Zda | Source::External | Source::HostPps => {
+            Source::Zda | Source::External | Source::HostPps | Source::HostSerial => {
                 // ZDA describes the previous pulse.
                 if let Some(p) = self.prev.take() {
                     let cand = label.ok().map(|l| l.0);

@@ -162,6 +162,7 @@ converting frames as in step 4.
 | `controllers/<id>/sample` | Every sample with all its fields, not retained. It is only published while some client asks with `"samples":true`. Useful for logging or your own fitting. |
 | `controllers/<id>/event` | `realtime_step` (CLOCK_REALTIME was stepped), `error` and `recovered`. |
 | `gnss/<serial>/status` | The board's state, or a receiver's by its name. `ubx` means it is running normally. |
+| `gnss/<serial>/fix` | The receiver's fix once per navigation epoch, not retained: time, fix type, position, velocity, accuracy estimates and satellites used. The fields are in [sofd's README](README.md#fix). |
 
 A `model` message looks like this:
 
@@ -275,7 +276,9 @@ limit. Keep checking the low 11 bits on every frame, and match again when the
   received within the last 5 s. They go null within 5 s of the reference
   stopping, so a non-null `model_gnss` is current. `gnss.source` is `tim_tp`,
   which is accurate, or `zda`, which is labelled from NMEA and also fine once
-  running. `gnss/<serial>/status` should be `ubx`.
+  running. `gnss/<serial>/status` should be `ubx`. A source of `host_serial`
+  is only good to milliseconds: it comes from a receiver without pulses, dated
+  by when its output arrived.
 - The retained `model` is emptied when sampling stops, on a controller error
   and when sofd stops. `status` is `online` while sofd runs.
 - `bus_frame` is null on a controller whose count doesn't give the frame

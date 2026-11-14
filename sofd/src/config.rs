@@ -80,27 +80,46 @@ impl Default for Sampler {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Gnss {
     pub attach: Attach,
+    /// u-blox modules on their own USB port, by name (USB serial, else `usb-<port>`).
+    pub usb_receivers: Attach,
     pub defaults: BoardOptions,
     /// Per-serial overrides of `defaults`.
     pub boards: BTreeMap<String, BoardOptions>,
     /// MQTT clients allowed to act as GNSS reference, by client name. `*` allows any other.
     pub external: BTreeMap<String, External>,
-    /// Receivers on a serial port with their pulses on /dev/pps, by name.
+    /// Receivers without a board, by name: on a serial port, or options for a USB module.
     pub receivers: BTreeMap<String, Receiver>,
 }
 
+impl Default for Gnss {
+    fn default() -> Self {
+        Self {
+            attach: Attach::All,
+            usb_receivers: Attach::None,
+            defaults: BoardOptions::default(),
+            boards: BTreeMap::new(),
+            external: BTreeMap::new(),
+            receivers: BTreeMap::new(),
+        }
+    }
+}
+
 /// A receiver without a sofgnss board. Unset options fall back to `gnss.defaults`.
+/// Without `tty` these are the options of the USB module of that name.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Receiver {
     pub tty: String,
     /// A /dev/pps device, or `pps_gpio`: a Raspberry Pi GPIO polled around each pulse.
+    /// Neither: no pulses.
     pub pps: Option<String>,
     pub pps_gpio: Option<u8>,
+    #[serde(deserialize_with = "nullable")]
+    pub serial_delay_ns: Option<Option<i64>>,
     pub baud: Option<u32>,
     pub initial_baud: Option<u32>,
     pub configure: Option<bool>,
@@ -108,17 +127,14 @@ pub struct Receiver {
     pub leap_seconds: Option<i8>,
     pub constellations: Option<Vec<Constellation>>,
     pub frames: Option<bool>,
+    pub fix: Option<bool>,
     #[serde(deserialize_with = "nullable")]
     pub chrony: Option<Option<String>>,
 }
 
 impl Receiver {
-    pub fn pps_name(&self) -> String {
-        match (&self.pps, self.pps_gpio) {
-            (Some(p), _) => p.clone(),
-            (None, Some(n)) => format!("gpio{n}"),
-            (None, None) => String::new(),
-        }
+    fn has_pulses(&self) -> bool {
+        self.pps.is_some() || self.pps_gpio.is_some()
     }
 
     fn options(&self) -> BoardOptions {
@@ -130,7 +146,9 @@ impl Receiver {
             leap_seconds: self.leap_seconds,
             constellations: self.constellations.clone(),
             frames: self.frames,
+            fix: self.fix,
             chrony: self.chrony.clone(),
+            serial_delay_ns: self.serial_delay_ns,
             ..BoardOptions::default()
         }
     }
@@ -182,7 +200,8 @@ impl Attach {
     }
 }
 
-/// Unset fields fall back to `defaults`, then built-ins; `null` clears `chrony`/`firmware`.
+/// Unset fields fall back to `defaults`, then built-ins; `null` clears `chrony`, `firmware`
+/// and `serial_delay_ns`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BoardOptions {
@@ -193,12 +212,17 @@ pub struct BoardOptions {
     pub leap_seconds: Option<i8>,
     pub constellations: Option<Vec<Constellation>>,
     pub frames: Option<bool>,
+    pub fix: Option<bool>,
     pub div: Option<u32>,
     pub sof_delay_ns: Option<i64>,
     #[serde(deserialize_with = "nullable")]
     pub chrony: Option<Option<String>>,
     #[serde(deserialize_with = "nullable")]
     pub firmware: Option<Option<PathBuf>>,
+    /// Receivers without pulses: date each epoch by the arrival of the receiver's output,
+    /// this much after the epoch.
+    #[serde(deserialize_with = "nullable")]
+    pub serial_delay_ns: Option<Option<i64>>,
 }
 
 fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
@@ -219,22 +243,28 @@ pub struct Board {
     pub leap_seconds: Option<i8>,
     pub constellations: Option<Vec<Constellation>>,
     pub frames: bool,
+    /// Publish a fix per navigation epoch.
+    pub fix: bool,
     pub div: Option<u32>,
     pub sof_delay_ns: Option<i64>,
     /// chrony SOCK refclock path, `{serial}` substituted.
     pub chrony: Option<PathBuf>,
     pub firmware: Option<PathBuf>,
+    /// Receivers only: serial timing.
+    pub serial_delay_ns: Option<i64>,
 }
 
 impl Gnss {
     pub fn board(&self, serial: &str) -> Board {
-        self.merge(serial, self.boards.get(serial).cloned().unwrap_or_default())
+        Board { serial_delay_ns: None, ..self.merge(serial, self.boards.get(serial).cloned().unwrap_or_default()) }
     }
 
     /// Board-only options (`div`, `sof_delay_ns`, `firmware`) don't apply.
     pub fn receiver(&self, name: &str) -> Board {
-        let b = self.merge(name, self.receivers.get(name).map(Receiver::options).unwrap_or_default());
-        Board { div: None, sof_delay_ns: None, firmware: None, ..b }
+        let r = self.receivers.get(name);
+        let b = self.merge(name, r.map(Receiver::options).unwrap_or_default());
+        let pulses = r.is_some_and(Receiver::has_pulses);
+        Board { div: None, sof_delay_ns: None, firmware: None, serial_delay_ns: b.serial_delay_ns.filter(|_| !pulses), ..b }
     }
 
     fn merge(&self, serial: &str, b: BoardOptions) -> Board {
@@ -247,10 +277,12 @@ impl Gnss {
             leap_seconds: b.leap_seconds.or(d.leap_seconds),
             constellations: b.constellations.or(d.constellations.clone()),
             frames: b.frames.or(d.frames).unwrap_or(true),
+            fix: b.fix.or(d.fix).unwrap_or(true),
             div: b.div.or(d.div),
             sof_delay_ns: b.sof_delay_ns.or(d.sof_delay_ns),
             chrony: b.chrony.or(d.chrony.clone()).flatten().map(|p| PathBuf::from(p.replace("{serial}", serial))),
             firmware: b.firmware.or(d.firmware.clone()).flatten(),
+            serial_delay_ns: b.serial_delay_ns.or(d.serial_delay_ns).flatten(),
         }
     }
 
@@ -303,6 +335,9 @@ impl Config {
                 anyhow::bail!("controllers.{id}.counter_lead_ns must be within ±1 ms");
             }
         }
+        if let Some(serial) = self.gnss.boards.iter().find_map(|(k, b)| b.serial_delay_ns.map(|_| k)) {
+            anyhow::bail!("gnss.boards.{serial}.serial_delay_ns: boards have pulses, this is for receivers without");
+        }
         for (name, r) in &self.gnss.receivers {
             if name.is_empty() || name.contains(['/', '+', '#']) {
                 anyhow::bail!("gnss.receivers: name {name:?} must be non-empty, without '/' or wildcards");
@@ -310,8 +345,15 @@ impl Config {
             if self.gnss.boards.contains_key(name) {
                 anyhow::bail!("gnss.receivers.{name}: also a board in gnss.boards");
             }
-            if r.tty.is_empty() || r.pps.is_some() == r.pps_gpio.is_some() || r.pps.as_ref().is_some_and(|p| p.is_empty()) {
-                anyhow::bail!("gnss.receivers.{name}: needs tty and one of pps or pps_gpio");
+            let pulses = r.has_pulses();
+            if r.tty.is_empty() && pulses {
+                anyhow::bail!("gnss.receivers.{name}: pps and pps_gpio need a tty (without one these are a USB module's options)");
+            }
+            if (r.pps.is_some() && r.pps_gpio.is_some()) || r.pps.as_ref().is_some_and(|p| p.is_empty()) {
+                anyhow::bail!("gnss.receivers.{name}: give at most one of pps or pps_gpio");
+            }
+            if r.serial_delay_ns.flatten().is_some() && pulses {
+                anyhow::bail!("gnss.receivers.{name}.serial_delay_ns is for receivers without pulses");
             }
             if r.pps_gpio.is_some_and(|n| n > 53) {
                 anyhow::bail!("gnss.receivers.{name}.pps_gpio must be a GPIO number (0-53)");
@@ -322,6 +364,9 @@ impl Config {
             .chain([("gnss.defaults".to_string(), self.gnss.defaults.clone(), self.gnss.board(""))])
             .chain(receivers);
         for (what, b, merged) in boards {
+            if b.serial_delay_ns.flatten().is_some_and(|d| !(0..=1_000_000_000).contains(&d)) {
+                anyhow::bail!("{what}.serial_delay_ns must be within 0..=1000000000");
+            }
             if merged.strict && !merged.configure {
                 anyhow::bail!("{what}: strict needs configure");
             }
@@ -455,9 +500,29 @@ mod tests {
         .unwrap();
         let r = c.gnss.receiver("ttyS0");
         assert_eq!((r.baud, r.initial_baud, r.div, r.chrony.as_deref()), (115_200, 38_400, None, Some(Path::new("/run/c.ttyS0.sock"))));
-        assert_eq!(c.gnss.receivers["ttyS0"].pps_name(), "/dev/pps0");
+        assert_eq!(c.gnss.receivers["ttyS0"].pps.as_deref(), Some("/dev/pps0"));
         let c = Config::parse(r#"{"gnss":{"receivers":{"g":{"tty":"/dev/ttyAMA3","pps_gpio":20}}}}"#).unwrap();
-        assert_eq!(c.gnss.receivers["g"].pps_name(), "gpio20");
+        assert_eq!(c.gnss.receivers["g"].pps_gpio, Some(20));
+        // Without pulses, and the options of a USB module.
+        let c = Config::parse(
+            r#"{"gnss":{"usb_receivers":"all","defaults":{"chrony":"/run/c.sock"},
+                "receivers":{"u":{"tty":"/dev/ttyS1"},"usb-1-1.3":{"serial_delay_ns":45000000,"baud":115200}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.gnss.usb_receivers, Attach::All);
+        assert_eq!((c.gnss.receivers["u"].pps.is_none(), c.gnss.receivers["u"].pps_gpio), (true, None));
+        let u = c.gnss.receiver("usb-1-1.3");
+        assert_eq!((u.serial_delay_ns, u.baud, u.chrony.as_deref()), (Some(45_000_000), 115_200, Some(Path::new("/run/c.sock"))));
+        assert_eq!(c.gnss.receiver("other").serial_delay_ns, None);
+        // A default delay is for every receiver without pulses.
+        let c = Config::parse(
+            r#"{"gnss":{"defaults":{"serial_delay_ns":38000000},"receivers":{"p":{"tty":"/dev/ttyS0","pps":"/dev/pps0"},
+                "t":{"tty":"/dev/ttyS1"},"a":{"serial_delay_ns":5},"off":{"serial_delay_ns":null}}}}"#,
+        )
+        .unwrap();
+        let delay = |n| c.gnss.receiver(n).serial_delay_ns;
+        assert_eq!((delay("usb-1-4"), delay("t"), delay("a"), delay("off"), delay("p")), (Some(38_000_000), Some(38_000_000), Some(5), None, None));
+        assert_eq!(c.gnss.board("A").serial_delay_ns, None);
         let c = Config::parse(r#"{"controllers":{"0000:01:00.0":{"counter_lead_ns":128000}}}"#).unwrap();
         assert_eq!(c.controllers["0000:01:00.0"].counter_lead_ns, Some(128_000));
         let c = Config::parse(r#"{"gnss":{"defaults":{"constellations":["gps","galileo","beidou"]},"boards":{"A":{"constellations":["gps"]}}}}"#).unwrap();
@@ -466,6 +531,8 @@ mod tests {
         let c = Config::parse(r#"{"gnss":{"external":{"*":{"sof_delay_ns":5},"app":{}}}}"#).unwrap();
         assert_eq!((c.gnss.external("sdrrx").unwrap().sof_delay_ns, c.gnss.external("app").unwrap().sof_delay_ns), (5, 0));
         assert_eq!(Config::parse("{}").unwrap().gnss.attach, Attach::All);
+        assert_eq!(Config::parse("{}").unwrap().gnss.usb_receivers, Attach::None);
+        assert_eq!(Config::default().gnss.usb_receivers, Attach::None);
         assert!(Config::parse(r#"{"gnss":{"attach":"some"}}"#).is_err());
         assert!(Config::parse(r#"{"mqtt":{"prefix":"a/#"}}"#).is_err());
         for bad in [
@@ -481,7 +548,13 @@ mod tests {
             r#"{"gnss":{"defaults":{"constellations":["gps","gps"]}}}"#,
             r#"{"gnss":{"defaults":{"constellations":["gps","navic"]}}}"#,
             r#"{"gnss":{"defaults":{"constellations":[]}}}"#,
-            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0"}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"pps":"/dev/pps0"}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":""}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","serial_delay_ns":0}}}}"#,
+            r#"{"gnss":{"receivers":{"a":{"serial_delay_ns":-1}}}}"#,
+            r#"{"gnss":{"defaults":{"serial_delay_ns":2000000000}}}"#,
+            r#"{"gnss":{"boards":{"A":{"serial_delay_ns":0}}}}"#,
+            r#"{"gnss":{"usb_receivers":"some"}}"#,
             r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps":"/dev/pps0","pps_gpio":20}}}}"#,
             r#"{"gnss":{"receivers":{"a":{"tty":"/dev/ttyS0","pps_gpio":60}}}}"#,
             r#"{"gnss":{"receivers":{"a/b":{"tty":"/dev/ttyS0","pps":"/dev/pps0"}}}}"#,

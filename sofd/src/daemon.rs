@@ -35,6 +35,21 @@ pub fn is_board(d: &UsbDevice) -> bool {
         && d.manufacturer.as_deref() == Some(BOARD_MANUFACTURER)
         && d.product.as_deref() == Some(BOARD_PRODUCT)
 }
+
+/// u-blox 5 to 9 GNSS receivers on their own USB port. The vendor id alone
+/// would also match u-blox cellular modems.
+pub const UBLOX_VID: &str = "1546";
+pub const UBLOX_GNSS_PIDS: [&str; 5] = ["01a5", "01a6", "01a7", "01a8", "01a9"];
+
+pub fn is_usb_receiver(d: &UsbDevice) -> bool {
+    d.vid == UBLOX_VID && UBLOX_GNSS_PIDS.contains(&d.pid.as_str())
+}
+
+/// A USB receiver's name: its USB serial, else its port.
+pub fn usb_receiver_name(d: &UsbDevice) -> String {
+    let name = d.serial.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("usb-{}", d.port));
+    name.replace(['/', '+', '#'], "_")
+}
 const SCAN_EVERY: Duration = Duration::from_secs(1);
 /// Rescan even without uevents, in case one was missed.
 const FULL_RESCAN: Duration = Duration::from_secs(60);
@@ -76,6 +91,8 @@ pub enum BoardOut {
     Pps(Value),
     /// A calibration burst.
     Cal(Value),
+    /// A navigation epoch's fix.
+    Fix(Value),
     Frame(Kind, Vec<u8>),
     Ended(String),
 }
@@ -170,8 +187,16 @@ struct Slot {
     ended: bool,
 }
 
-/// A receiver on a serial port with its pulses on /dev/pps or a polled GPIO.
+/// A receiver on a serial port or its own USB port, with its pulses, if any, on
+/// /dev/pps or a polled GPIO.
 struct RecvSlot {
+    tty: String,
+    pps: Option<device::PpsSpec>,
+    /// For the status: the pulse source, empty without one.
+    pps_name: String,
+    /// A USB module: its port. It is opened while `present`.
+    usb: Option<String>,
+    present: bool,
     rx: Option<device::Receiver>,
     retry_at: Instant,
     backoff: Duration,
@@ -185,12 +210,62 @@ struct RecvSlot {
 /// How exactly a receiver's pulses are timed.
 const POLLED_PPS_UNC_NS: Ns = 300;
 const KERNEL_PPS_UNC_NS: Ns = 3_000;
+/// Without pulses: when its output arrived.
+const SERIAL_UNC_NS: Ns = 10_000_000;
 
-fn pps_spec(r: &config::Receiver) -> device::PpsSpec {
+fn pps_spec(r: &config::Receiver) -> Option<device::PpsSpec> {
     match (&r.pps, r.pps_gpio) {
-        (Some(p), _) => device::PpsSpec::Device(p.clone()),
-        (None, n) => device::PpsSpec::Gpio(n.unwrap_or(0)),
+        (Some(p), _) => Some(device::PpsSpec::Device(p.clone())),
+        (None, Some(n)) => Some(device::PpsSpec::Gpio(n)),
+        (None, None) => None,
     }
+}
+
+impl RecvSlot {
+    fn new(name: &str, tty: String, pps: Option<device::PpsSpec>, usb: Option<String>, now: Instant) -> Self {
+        let (unc, source) = match &pps {
+            Some(device::PpsSpec::Gpio(_)) => (POLLED_PPS_UNC_NS, Source::HostPps),
+            Some(device::PpsSpec::Device(_)) => (KERNEL_PPS_UNC_NS, Source::HostPps),
+            None => (SERIAL_UNC_NS, Source::HostSerial),
+        };
+        let clock = Arc::new(HostClock::new(unc, source));
+        let pps_name = match &pps {
+            Some(device::PpsSpec::Device(p)) => p.clone(),
+            Some(device::PpsSpec::Gpio(n)) => format!("gpio{n}"),
+            None => String::new(),
+        };
+        Self {
+            tty,
+            pps,
+            pps_name,
+            usb,
+            present: true,
+            rx: None,
+            retry_at: now,
+            backoff: Duration::ZERO,
+            status: Value::Null,
+            chrony_busy: false,
+            feed: Arc::new(Feed::host(name, clock.clone())),
+            clock,
+        }
+    }
+
+    /// Where it is, for its status.
+    fn place(&self) -> Value {
+        let mut v = json!({"tty": self.tty, "pps": self.pps_name});
+        if let Some(port) = &self.usb {
+            v["port"] = json!(port);
+        }
+        v
+    }
+}
+
+/// `status` with the receiver's place added.
+fn placed(mut status: Value, place: Value) -> Value {
+    for (k, v) in place.as_object().into_iter().flatten() {
+        status[k] = v.clone();
+    }
+    status
 }
 
 /// An MQTT client acting as a controller's GNSS reference.
@@ -280,15 +355,12 @@ impl Daemon {
     pub fn new(opts: Options, gnss: config::Gnss, tx: Sender<Msg>, mqtt: Option<Mqtt>, stdout: bool) -> Self {
         let usb_watch = uevent::watch().map_err(|e| warn!("{e:#}; scanning USB every second")).ok();
         let now = Instant::now();
+        // Entries without a tty are the options of USB modules, found later.
         let receivers = gnss
             .receivers
             .iter()
-            .map(|(n, r)| {
-                let clock = Arc::new(HostClock::new(if r.pps_gpio.is_some() { POLLED_PPS_UNC_NS } else { KERNEL_PPS_UNC_NS }));
-                let feed = Arc::new(Feed::host(n, clock.clone()));
-                let slot = RecvSlot { rx: None, retry_at: now, backoff: Duration::ZERO, status: Value::Null, chrony_busy: false, clock, feed };
-                (n.clone(), slot)
-            })
+            .filter(|(_, r)| !r.tty.is_empty())
+            .map(|(n, r)| (n.clone(), RecvSlot::new(n, r.tty.clone(), pps_spec(r), None, now)))
             .collect();
         Self {
             opts,
@@ -597,6 +669,7 @@ impl Daemon {
                 }
                 self.print(&ev);
             }
+            BoardOut::Fix(ev) => self.on_fix("board", serial, ev),
             BoardOut::Frame(kind, f) => {
                 if let Some(m) = &self.mqtt {
                     m.publish(&format!("gnss/{serial}/{}", mqtt::frame_topic(kind, &f)), f.clone(), false);
@@ -686,10 +759,12 @@ impl Daemon {
     /// A sampled controller without a board or MQTT reference is dated by a locked
     /// receiver's host clock, through its own samples.
     fn assign_host_feeds(&mut self) {
+        // The most exact one: real pulses before serial timing.
         let locked = self
             .receivers
             .values()
-            .find(|r| RUNNING_STATES.contains(&r.status["state"].as_str().unwrap_or("")) && r.status["locked"] == true)
+            .filter(|r| RUNNING_STATES.contains(&r.status["state"].as_str().unwrap_or("")) && r.status["locked"] == true)
+            .min_by_key(|r| r.clock.unc_ns)
             .map(|r| r.feed.clone());
         let mut hub = self.hub.lock().unwrap();
         let mut changes = vec![];
@@ -969,6 +1044,7 @@ impl Daemon {
         }
         let devices = self.discovered.as_ref().map(|d| d.devices.clone()).unwrap_or_default();
         self.check_images();
+        self.scan_usb_receivers(&devices);
         self.scan_boards(&devices);
         self.check_refs();
         self.expire_wants();
@@ -1080,26 +1156,75 @@ impl Daemon {
 
     fn open_receivers(&mut self) {
         let now = Instant::now();
-        let due: Vec<String> = self.receivers.iter().filter(|(_, r)| r.rx.is_none() && now >= r.retry_at).map(|(n, _)| n.clone()).collect();
+        let due = self.receivers.iter().filter(|(_, r)| r.present && r.rx.is_none() && now >= r.retry_at);
+        let due: Vec<String> = due.map(|(n, _)| n.clone()).collect();
         for name in due {
-            let rc = &self.gnss.receivers[&name];
-            let (tty, pps) = (rc.tty.clone(), rc.pps_name());
-            let result = device::spawn_receiver(&name, &tty, &pps_spec(rc), session_config(&self.gnss.receiver(&name)), &self.tx);
+            let b = self.gnss.receiver(&name);
+            let r = &self.receivers[&name];
+            let cfg = session::Config { usb: r.usb.is_some(), serial_delay_ns: b.serial_delay_ns.map(|d| d as Ns), ..session_config(&b) };
+            let result = device::spawn_receiver(&name, &r.tty, r.pps.as_ref(), cfg, &self.tx);
             let r = self.receivers.get_mut(&name).unwrap();
+            let place = r.place();
             match result {
                 Ok(rx) => {
                     r.rx = Some(rx);
-                    self.set_receiver_status(&name, json!({"state": "opening", "tty": tty, "pps": pps}));
+                    self.set_receiver_status(&name, placed(json!({"state": "opening"}), place));
                 }
                 Err(e) => {
                     r.backoff = backoff(r.backoff);
                     r.retry_at = now + r.backoff;
                     let msg = format!("{e:#}");
                     warn!("{name}: {msg}; retrying in {} s", r.backoff.as_secs());
-                    self.set_receiver_status(&name, json!({"state": "error", "message": msg, "tty": tty, "pps": pps}));
+                    self.set_receiver_status(&name, placed(json!({"state": "error", "message": msg}), place));
                 }
             }
         }
+    }
+
+    /// u-blox modules on their own USB port come and go like boards.
+    fn scan_usb_receivers(&mut self, devices: &[UsbDevice]) {
+        let found: BTreeMap<String, (String, String)> = devices
+            .iter()
+            .filter(|d| is_usb_receiver(d))
+            .filter_map(|d| Some((usb_receiver_name(d), (d.tty.clone()?, d.port.clone()))))
+            // A configured receiver of that name has its own tty.
+            .filter(|(n, _)| self.gnss.usb_receivers.includes(n) && self.receivers.get(n).is_none_or(|r| r.usb.is_some()))
+            .collect();
+        let now = Instant::now();
+        let gone = self.receivers.iter().filter(|(n, r)| r.usb.is_some() && r.present && !found.contains_key(*n));
+        let gone: Vec<String> = gone.map(|(n, _)| n.clone()).collect();
+        for name in gone {
+            let r = self.receivers.get_mut(&name).unwrap();
+            (r.present, r.rx, r.backoff, r.retry_at) = (false, None, Duration::ZERO, now);
+            r.clock.clear();
+            self.chrony.release(&name);
+            info!("{name}: unplugged");
+            self.set_receiver_status(&name, json!({"state": "absent"}));
+        }
+        for (name, (tty, port)) in found {
+            let r = self.receivers.entry(name.clone()).or_insert_with(|| {
+                info!("{name}: u-blox receiver on USB port {port}");
+                RecvSlot::new(&name, tty.clone(), None, Some(port.clone()), now)
+            });
+            r.present = true;
+            // Re-enumerated before the old session noticed.
+            if r.tty != tty || r.usb.as_ref() != Some(&port) {
+                (r.tty, r.usb, r.rx) = (tty, Some(port), None);
+                r.clock.clear();
+            }
+        }
+        self.open_receivers();
+        self.assign_host_feeds();
+    }
+
+    /// The topic names the board or receiver, so the message does not.
+    fn on_fix(&mut self, what: &str, name: &str, mut ev: Value) {
+        let event = ev.as_object_mut().and_then(|o| o.remove("event"));
+        if let Some(m) = &self.mqtt {
+            m.publish_json(&format!("gnss/{name}/fix"), &ev, false);
+        }
+        (ev["event"], ev[what]) = (json!(event), json!(name));
+        self.print(&ev);
     }
 
     fn set_receiver_status(&mut self, name: &str, status: Value) {
@@ -1115,8 +1240,7 @@ impl Daemon {
         match out {
             BoardOut::Status(mut ev) => {
                 ev.as_object_mut().map(|o| o.remove("event"));
-                let rc = &self.gnss.receivers[name];
-                (ev["tty"], ev["pps"]) = (json!(rc.tty), json!(rc.pps_name()));
+                let ev = placed(ev, self.receivers[name].place());
                 if RUNNING_STATES.contains(&ev["state"].as_str().unwrap_or("")) {
                     self.receivers.get_mut(name).unwrap().backoff = Duration::ZERO;
                 }
@@ -1142,6 +1266,7 @@ impl Daemon {
             }
             // Receivers have no calibration output.
             BoardOut::Cal(_) => {}
+            BoardOut::Fix(ev) => self.on_fix("receiver", name, ev),
             BoardOut::Frame(kind, f) => {
                 if let Some(m) = &self.mqtt {
                     m.publish(&format!("gnss/{name}/{}", mqtt::frame_topic(kind, &f)), f.clone(), false);
@@ -1159,9 +1284,8 @@ impl Daemon {
                 r.retry_at = Instant::now() + r.backoff;
                 self.chrony.release(name);
                 self.receiver_event(name, json!({"event": "detached", "reason": reason}));
-                let rc = &self.gnss.receivers[name];
-                let st = json!({"state": "error", "message": reason, "tty": rc.tty, "pps": rc.pps_name()});
-                self.set_receiver_status(name, st);
+                let place = self.receivers[name].place();
+                self.set_receiver_status(name, placed(json!({"state": "error", "message": reason}), place));
                 self.assign_feeds();
             }
         }
@@ -1169,7 +1293,8 @@ impl Daemon {
 
     fn receiver_to_chrony(&mut self, name: &str, p: chrony::Point) {
         let Some(path) = self.gnss.receiver(name).chrony else { return };
-        let busy = match self.chrony.send(&path, name, Priority::Pps, p, clock::raw()) {
+        let prio = if self.receivers[name].pps.is_some() { Priority::Pps } else { Priority::Serial };
+        let busy = match self.chrony.send(&path, name, prio, p, clock::raw()) {
             Sent::Ok => None,
             Sent::Busy(owner) => Some(owner),
         };
@@ -1436,8 +1561,12 @@ fn session_config(b: &config::Board) -> session::Config {
         strict: b.strict,
         leap_seconds: b.leap_seconds,
         plain: false,
+        pps: true,
+        usb: false,
+        serial_delay_ns: None,
         constellations: b.constellations.clone(),
         frames: b.frames,
+        fix: b.fix,
         div: b.div,
         sof_delay_ns: b.sof_delay_ns.map(|d| d as Ns),
         firmware: None,

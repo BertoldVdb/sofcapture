@@ -4,9 +4,11 @@ use super::framer::ubx_checksum;
 use crate::clock::Ns;
 
 pub type Id = (u8, u8);
+pub const NAV_POSLLH: Id = (0x01, 0x02);
 pub const NAV_STATUS: Id = (0x01, 0x03);
 pub const NAV_SOL: Id = (0x01, 0x06);
 pub const NAV_PVT: Id = (0x01, 0x07);
+pub const NAV_VELNED: Id = (0x01, 0x12);
 pub const NAV_TIMEGPS: Id = (0x01, 0x20);
 pub const NAV_TIMEUTC: Id = (0x01, 0x21);
 pub const NAV_SVINFO: Id = (0x01, 0x30);
@@ -27,12 +29,13 @@ pub const ENABLED: [Id; 3] = [TIM_TP, NAV_TIMEGPS, NAV_STATUS];
 pub const SLOW_EVERY: u8 = 5;
 
 /// Diagnostics forwarded to monitoring peers, with rates, for a receiver generation.
+/// The solution messages also make the fix message.
 pub fn diagnostics(generation: u8) -> Vec<(Id, u8)> {
     let mut d = vec![];
     if generation >= 7 {
         d.push((NAV_PVT, 1));
     } else {
-        d.extend([(NAV_SOL, 1), (NAV_TIMEUTC, 1)]);
+        d.extend([(NAV_SOL, 1), (NAV_TIMEUTC, 1), (NAV_POSLLH, 1), (NAV_VELNED, 1)]);
     }
     d.push((if generation >= 8 { NAV_SAT } else { NAV_SVINFO }, SLOW_EVERY));
     d.push((if generation >= 9 { MON_SPAN } else { MON_HW }, SLOW_EVERY));
@@ -113,6 +116,23 @@ impl TimTp {
 /// UBX-NAV-TIMEGPS: leap seconds (GPS - UTC), if the receiver knows them.
 pub fn leap_seconds(p: &[u8]) -> Option<Option<i8>> {
     (p.len() >= 12).then(|| (p[11] & 0x04 != 0).then_some(p[10] as i8))
+}
+
+/// UBX-NAV-TIMEGPS: UTC of the navigation epoch. The receiver's leap seconds win
+/// over `leap_s`.
+pub fn timegps_utc(p: &[u8], leap_s: Option<i8>) -> Result<Ns, &'static str> {
+    if p.len() < 12 {
+        return Err("short_timegps");
+    }
+    // towValid, weekValid
+    if p[11] & 0x03 != 0x03 {
+        return Err("no_time");
+    }
+    let itow = u32::from_le_bytes(p[0..4].try_into().unwrap()) as Ns;
+    let ftow = i32::from_le_bytes(p[4..8].try_into().unwrap()) as Ns;
+    let week = i16::from_le_bytes(p[8..10].try_into().unwrap()) as i64;
+    let leap = if p[11] & 0x04 != 0 { Some(p[10] as i8) } else { leap_s }.ok_or("no_leap_seconds")?;
+    Ok((GPS_EPOCH_UNIX_S + week * WEEK_S - leap as i64) * 1_000_000_000 + itow * 1_000_000 + ftow)
 }
 
 /// UBX-NAV-STATUS: gpsFixOk.
@@ -197,18 +217,29 @@ pub fn cfg_prt(polled: Option<&[u8]>, baud: u32) -> Vec<u8> {
     frame(CFG_PRT, &p)
 }
 
+/// UBX port ids, as in CFG-PRT.
+pub const PORT_UART1: u8 = 1;
+pub const PORT_UART2: u8 = 2;
+pub const PORT_USB: u8 = 3;
+
 /// Configuration keys (u-blox generation 9/10 interface description).
 pub mod key {
+    use super::{PORT_UART2, PORT_USB};
+
     pub fn uart_baud(port: u8) -> u32 {
-        if port == 2 { 0x4053_0001 } else { 0x4052_0001 }
+        if port == PORT_UART2 { 0x4053_0001 } else { 0x4052_0001 }
     }
-    pub fn uart_out_ubx(port: u8) -> u32 {
-        if port == 2 { 0x1076_0001 } else { 0x1074_0001 }
+    pub fn out_ubx(port: u8) -> u32 {
+        match port {
+            PORT_UART2 => 0x1076_0001,
+            PORT_USB => 0x1078_0001,
+            _ => 0x1074_0001,
+        }
     }
-    pub fn uart_out_nmea(port: u8) -> u32 {
-        if port == 2 { 0x1076_0002 } else { 0x1074_0002 }
+    pub fn out_nmea(port: u8) -> u32 {
+        out_ubx(port) + 1
     }
-    /// CFG-MSGOUT-UBX_* for UART1; UART2 is the next key.
+    /// CFG-MSGOUT-UBX_*: I2C, UART1, UART2, USB, SPI in a row.
     pub fn msgout(id: super::Id, port: u8) -> u32 {
         let uart1 = match id {
             super::TIM_TP => 0x2091_017E,
@@ -219,7 +250,11 @@ pub mod key {
             super::MON_SPAN => 0x2091_038C,
             _ => unreachable!("no CFG-MSGOUT key for {id:?}"),
         };
-        if port == 2 { uart1 + 1 } else { uart1 }
+        match port {
+            PORT_UART2 => uart1 + 1,
+            PORT_USB => uart1 + 2,
+            _ => uart1,
+        }
     }
 }
 
@@ -314,21 +349,46 @@ mod tests {
         assert_eq!(v.protocol(), None);
         assert!(!v.uses_valset());
         assert_eq!(v.generation(), 5);
-        assert_eq!(diagnostics(5), [(NAV_SOL, 1), (NAV_TIMEUTC, 1), (NAV_SVINFO, SLOW_EVERY), (MON_HW, SLOW_EVERY)]);
+        // Position and velocity come separately where NAV-PVT is missing.
+        let legacy = [(NAV_SOL, 1), (NAV_TIMEUTC, 1), (NAV_POSLLH, 1), (NAV_VELNED, 1), (NAV_SVINFO, SLOW_EVERY), (MON_HW, SLOW_EVERY)];
+        assert_eq!(diagnostics(5), legacy);
         assert_eq!(diagnostics(8), [(NAV_PVT, 1), (NAV_SAT, SLOW_EVERY), (MON_HW, SLOW_EVERY)]);
         assert_eq!(diagnostics(10), [(NAV_PVT, 1), (NAV_SAT, SLOW_EVERY), (MON_SPAN, SLOW_EVERY)]);
         // Keys as in the u-blox M9/M10 interface description.
         assert_eq!(key::msgout(NAV_PVT, 1), 0x2091_0007);
         assert_eq!(key::msgout(NAV_SAT, 1), 0x2091_0016);
         assert_eq!(key::msgout(MON_SPAN, 1), 0x2091_038C);
+        assert_eq!(key::msgout(NAV_PVT, PORT_USB), 0x2091_0009);
+        assert_eq!(key::msgout(TIM_TP, PORT_USB), 0x2091_0180);
+        assert_eq!((key::out_ubx(PORT_USB), key::out_nmea(PORT_USB)), (0x1078_0001, 0x1078_0002));
+        assert_eq!((key::out_ubx(1), key::out_nmea(2)), (0x1074_0001, 0x1076_0002));
         let mut m8 = vec![0u8; 40];
         m8[30..38].copy_from_slice(b"00080000");
         assert_eq!(Version::parse(&m8).unwrap().generation(), 8);
     }
 
     #[test]
+    fn timegps_epoch() {
+        // GPS week 2385, TOW 100.002 s, fTOW -500.2 us.
+        let mut p = vec![0u8; 16];
+        p[0..4].copy_from_slice(&100_002u32.to_le_bytes());
+        p[4..8].copy_from_slice(&(-500_200i32).to_le_bytes());
+        p[8..10].copy_from_slice(&2385i16.to_le_bytes());
+        (p[10], p[11]) = (18, 0x07);
+        let gps_s = 315_964_800 + 2385 * 604_800 + 100;
+        let want = (gps_s - 18) * 1_000_000_000 + 1_499_800;
+        assert_eq!(timegps_utc(&p, None), Ok(want));
+        // Leap seconds not known yet: the configured ones.
+        (p[10], p[11]) = (15, 0x03);
+        assert_eq!(timegps_utc(&p, Some(18)), Ok(want));
+        assert_eq!(timegps_utc(&p, None), Err("no_leap_seconds"));
+        p[11] = 0x01;
+        assert_eq!(timegps_utc(&p, Some(18)), Err("no_time"));
+    }
+
+    #[test]
     fn valset_encoding() {
-        let f = valset_ram(&[(key::uart_baud(1), 38400), (key::uart_out_nmea(1), 0), (key::msgout(TIM_TP, 1), 1)]);
+        let f = valset_ram(&[(key::uart_baud(1), 38400), (key::out_nmea(1), 0), (key::msgout(TIM_TP, 1), 1)]);
         let (id, p) = split(&f);
         assert_eq!(id, CFG_VALSET);
         assert_eq!(&p[..4], &[0, 1, 0, 0]);

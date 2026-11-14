@@ -48,6 +48,8 @@ fn encode(p: Point) -> Vec<u8> {
 /// A source takes a socket from a lower one at once, from an equal one only after OWNER_TIMEOUT_NS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
+    /// A receiver without pulses, dated by when its output arrived.
+    Serial,
     /// A receiver's kernel PPS timestamps.
     Pps,
     /// A controller's GNSS reference (board or MQTT client): SOF timing, no interrupt latency.
@@ -177,5 +179,10 @@ mod tests {
         assert!(matches!(c.send(path, "board", r, p, OWNER_TIMEOUT_NS + 3), Sent::Ok));
         c.release("board");
         assert!(matches!(c.send(path, "rx", pps, p, OWNER_TIMEOUT_NS + 4), Sent::Ok));
+        // Serial timing only feeds a socket nothing better feeds.
+        let t = 2 * OWNER_TIMEOUT_NS;
+        assert!(matches!(c.send(path, "usb", Priority::Serial, p, t), Sent::Busy(o) if o == "rx"));
+        assert!(matches!(c.send(path, "usb", Priority::Serial, p, t + OWNER_TIMEOUT_NS + 5), Sent::Ok));
+        assert!(matches!(c.send(path, "rx", pps, p, t + OWNER_TIMEOUT_NS + 6), Sent::Ok));
     }
 }

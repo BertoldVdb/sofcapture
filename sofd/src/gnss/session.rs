@@ -2,6 +2,7 @@
 //! then labelling pulses from TIM-TP, or from NMEA ZDA if the receiver doesn't answer UBX.
 
 use super::firmware::Image;
+use super::fix;
 use super::framer::{Framer, Kind};
 use super::nmea::{self, OtaMsg, Pvdb};
 use super::timing::{Labeler, PpsDecision, Source, Tag};
@@ -37,6 +38,13 @@ const MAX_FAILURES: u32 = 3;
 const PASSIVE_TP_WINDOW: Ns = 3_000 * MS;
 /// The receiver counts as working while a pulse was accepted this recently.
 const LOCK_TIMEOUT: Ns = 5_000 * MS;
+/// Serial timing: a read after this much silence starts the output of a new epoch.
+const BURST_GAP: Ns = 100 * MS;
+/// An epoch's time this long after its output began: the line never went quiet.
+const BURST_MAX: Ns = 900 * MS;
+/// Allowed change of the receiver's output delay from one epoch to the next.
+const EPOCH_TOL: Ns = 20 * MS;
+const SECOND: Ns = 1_000 * MS;
 /// From the bus frame start to the board's SOF capture, unless configured. The STM32
 /// captures after the SOF packet's start: 1.12 us behind a Pi 4's hub, 1.44 to 1.52 us
 /// on a root port (DWC2, BCM2711 xHCI), measured against the GPS PPS polled on a GPIO.
@@ -73,10 +81,19 @@ pub struct Config {
     pub leap_seconds: Option<i8>,
     /// No sofgnss board: the port is the receiver's own, pulses come in through `on_pulse`.
     pub plain: bool,
+    /// Plain mode: pulses come in at all.
+    pub pps: bool,
+    /// Plain mode: the port is the receiver's own USB port.
+    pub usb: bool,
+    /// Plain mode without pulses: date each epoch by the start of its output, this much
+    /// after the epoch.
+    pub serial_delay_ns: Option<Ns>,
     /// The GNSS to track, all others off. u-blox 9 and later only.
     pub constellations: Option<Vec<ubx::Constellation>>,
     /// Emit every GPS frame.
     pub frames: bool,
+    /// Emit a fix per navigation epoch.
+    pub fix: bool,
     pub div: Option<u32>,
     /// From bus frame start to the device's SOF capture.
     /// None: the board platform's default (`default_sof_delay`).
@@ -87,7 +104,23 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { baud: 38_400, initial_baud: 9600, configure: true, strict: false, leap_seconds: None, plain: false, constellations: None, frames: true, div: None, sof_delay_ns: None, firmware: None }
+        Self {
+            baud: 38_400,
+            initial_baud: 9600,
+            configure: true,
+            strict: false,
+            leap_seconds: None,
+            plain: false,
+            pps: true,
+            usb: false,
+            serial_delay_ns: None,
+            constellations: None,
+            frames: true,
+            fix: true,
+            div: None,
+            sof_delay_ns: None,
+            firmware: None,
+        }
     }
 }
 
@@ -141,6 +174,8 @@ fn ubx_name(id: ubx::Id) -> String {
     match id {
         ubx::NAV_PVT => "NAV-PVT".into(),
         ubx::NAV_SOL => "NAV-SOL".into(),
+        ubx::NAV_POSLLH => "NAV-POSLLH".into(),
+        ubx::NAV_VELNED => "NAV-VELNED".into(),
         ubx::NAV_TIMEUTC => "NAV-TIMEUTC".into(),
         ubx::NAV_SAT => "NAV-SAT".into(),
         ubx::NAV_SVINFO => "NAV-SVINFO".into(),
@@ -200,6 +235,14 @@ pub struct Session {
     last_accepted: Option<Ns>,
     /// A pulse was accepted within LOCK_TIMEOUT. Only then can the board be a reference.
     locked: bool,
+    /// Serial timing: the read that began the current output, and the silence before it (ms).
+    burst: Option<(Ns, u32)>,
+    last_read: Option<Ns>,
+    /// The current output's epoch is handled.
+    epoch_seen: bool,
+    /// Output start and UTC of the last epoch.
+    prev_epoch: Option<(Ns, Ns)>,
+    fixes: fix::Assembler,
 }
 
 impl Session {
@@ -230,6 +273,11 @@ impl Session {
             leap_warned: false,
             last_accepted: None,
             locked: false,
+            burst: None,
+            last_read: None,
+            epoch_seen: false,
+            prev_epoch: None,
+            fixes: fix::Assembler::default(),
         }
     }
 
@@ -250,6 +298,9 @@ impl Session {
         let mut ev = json!({"event": "gnss_status", "state": state, "baud": self.baud, "locked": self.locked});
         if !self.cfg.plain {
             ev["sof_delay_ns"] = json!(self.sof_delay());
+        }
+        if let Some(d) = self.cfg.serial_delay_ns {
+            ev["serial_delay_ns"] = json!(d);
         }
         if let Some(r) = &self.receiver {
             ev["receiver"] = json!(r);
@@ -277,6 +328,16 @@ impl Session {
             l.reset();
         }
         (self.last_accepted, self.locked, self.fix_since) = (None, false, None);
+        (self.burst, self.prev_epoch) = (None, None);
+        self.fixes.reset();
+    }
+
+    fn on_fix(&mut self, f: Option<fix::Fix>, out: &mut Output) {
+        if let Some(f) = f.filter(|_| self.cfg.fix) {
+            let mut ev = serde_json::to_value(&f).expect("fix serializes");
+            ev["event"] = json!("gnss_fix");
+            out.events.push(ev);
+        }
     }
 
     fn update_lock(&mut self, now: Ns, out: &mut Output) {
@@ -289,6 +350,14 @@ impl Session {
     }
 
     pub fn on_bytes(&mut self, data: &[u8], now: Ns, port: &mut dyn Port, out: &mut Output) {
+        if self.cfg.serial_delay_ns.is_some() && !data.is_empty() {
+            let quiet = self.last_read.map_or(Ns::MAX, |t| now - t);
+            if quiet >= BURST_GAP {
+                self.burst = Some((now, (quiet / MS).min(u32::MAX as Ns) as u32));
+                self.epoch_seen = false;
+            }
+            self.last_read = Some(now);
+        }
         let mut frames = vec![];
         self.framer.feed(data, |k, f| frames.push((k, f.to_vec())));
         for (kind, f) in frames {
@@ -311,6 +380,8 @@ impl Session {
     }
 
     pub fn on_tick(&mut self, now: Ns, port: &mut dyn Port, out: &mut Output) {
+        let f = self.fixes.on_tick(now);
+        self.on_fix(f, out);
         if self.cfg.plain {
             if let Rx::Idle = self.rx {
                 self.after_version(now, port, out);
@@ -423,15 +494,27 @@ impl Session {
         if self.cfg.frames {
             out.frames.push((kind, f.to_vec()));
         }
+        let fixed = match (kind, msg) {
+            (Kind::Ubx, Some((id, p))) => self.fixes.on_ubx(id, p, now),
+            (Kind::Nmea, _) => self.fixes.on_nmea(&nmea::fields(f), now),
+            _ => None,
+        };
+        self.on_fix(fixed, out);
         let mut tim_tp = false;
         let mut zda = false;
         let mut leap_differs = None;
+        // Serial timing: the UTC of the epoch this output belongs to.
+        let mut epoch = None;
+        // Without pulses, labels would pile up waiting for one.
+        let pulses = self.cfg.pps;
         if let Some(l) = &mut self.labeler {
             match (kind, msg) {
                 (Kind::Ubx, Some((ubx::TIM_TP, p))) => {
                     if let Some(tp) = ubx::TimTp::parse(p) {
                         tim_tp = true;
-                        l.on_tim_tp(&tp);
+                        if pulses {
+                            l.on_tim_tp(&tp);
+                        }
                     }
                 }
                 (Kind::Ubx, Some((ubx::NAV_TIMEGPS, p))) => {
@@ -440,6 +523,7 @@ impl Session {
                         leap_differs = Some(leap.zip(cfg).filter(|(r, c)| r != c));
                         l.on_leap(leap.or(cfg));
                     }
+                    epoch = Some(ubx::timegps_utc(p, self.cfg.leap_seconds));
                 }
                 (Kind::Ubx, Some((ubx::NAV_STATUS, p))) => {
                     if let Some(ok) = ubx::fix_ok(p) {
@@ -451,7 +535,10 @@ impl Session {
                 (Kind::Nmea, _) => match nmea::parse(f) {
                     nmea::Info::Zda(label) => {
                         zda = true;
-                        l.on_zda(label);
+                        epoch = Some(label);
+                        if pulses {
+                            l.on_zda(label);
+                        }
                     }
                     // NAV-STATUS wins while it arrives; otherwise use the NMEA fix.
                     nmea::Info::Fix(ok)
@@ -474,6 +561,47 @@ impl Session {
             _ => {}
         }
         self.rx_frame(kind, msg, tim_tp, zda, now, port, out);
+        if let Some(e) = epoch {
+            self.on_epoch(e, now, out);
+        }
+    }
+
+    /// Serial timing: the epoch at `utc` began the output that started at the last burst.
+    fn on_epoch(&mut self, utc: Result<Ns, &'static str>, now: Ns, out: &mut Output) {
+        let (Some(delay), Some((start, quiet_ms))) = (self.cfg.serial_delay_ns, self.burst) else { return };
+        if !matches!(self.rx, Rx::Running { .. } | Rx::Fallback { .. } | Rx::Passive { .. }) {
+            return;
+        }
+        // One epoch per output: NAV-TIMEGPS and ZDA tell the same.
+        if std::mem::replace(&mut self.epoch_seen, true) {
+            return;
+        }
+        let fix = self.labeler.as_ref().is_some_and(Labeler::has_fix);
+        let prev = self.prev_epoch.take();
+        let reason = match utc {
+            _ if now - start > BURST_MAX => Some("line_busy"),
+            Err(e) => Some(e),
+            Ok(_) if !fix => Some("no_fix"),
+            Ok(u) => match prev {
+                None => Some("first_epoch"),
+                Some((_, pu)) if u <= pu || u - pu > 2 * SECOND => Some("label_jump"),
+                Some((ps, pu)) if ((start - ps) - (u - pu)).abs() > EPOCH_TOL => Some("interval"),
+                Some(_) => None,
+            },
+        };
+        if reason != Some("line_busy") {
+            self.prev_epoch = utc.ok().map(|u| (start, u));
+        }
+        if reason.is_none() {
+            self.last_accepted = Some(now);
+        }
+        let mut ev = json!({"event": "gnss_pps", "source": "serial", "tick": start - delay, "rx_idle_ms": quiet_ms,
+            "utc_ns": utc.ok(), "accepted": reason.is_none()});
+        if let Some(r) = reason {
+            ev["reason"] = json!(r);
+        }
+        out.events.push(ev);
+        self.update_lock(now, out);
     }
 
     /// Called on VER, or after giving up on it.
@@ -633,11 +761,15 @@ impl Session {
         let target = self.cfg.baud;
         let diag = ubx::diagnostics(ver.generation());
         let steps = if ver.uses_valset() {
-            let p = self.polled_port.as_ref().map_or(1, |p| p[0]);
-            let p = if p == 2 { 2 } else { 1 };
+            let p = self.polled_port.as_ref().map_or(ubx::PORT_UART1, |p| p[0]);
+            let p = match p {
+                _ if self.cfg.usb => ubx::PORT_USB,
+                ubx::PORT_UART2 | ubx::PORT_USB => p,
+                _ => ubx::PORT_UART1,
+            };
             let mut items: Vec<(u32, u32)> = ubx::ENABLED.iter().map(|&id| (ubx::key::msgout(id, p), 1)).collect();
-            items.push((ubx::key::uart_out_ubx(p), 1));
-            items.push((ubx::key::uart_out_nmea(p), 0));
+            items.push((ubx::key::out_ubx(p), 1));
+            items.push((ubx::key::out_nmea(p), 0));
             let diag_items: Vec<(u32, u32)> = diag.iter().map(|&(id, r)| (ubx::key::msgout(id, p), u32::from(r))).collect();
             let names: Vec<String> = diag.iter().map(|&(id, _)| ubx_name(id)).collect();
             // First: a signal change restarts the receiver's GNSS.
@@ -645,12 +777,15 @@ impl Session {
                 let items: Vec<(u32, u32)> = ubx::Constellation::ALL.iter().map(|g| (g.signal_key(), c.contains(g) as u32)).collect();
                 Step { pause: true, ..Step::optional(ubx::valset_ram(&items), ubx::CFG_VALSET, "constellations".into()) }
             });
-            gnss.into_iter().chain([
-                Step::required(ubx::valset_ram(&items), Some(ubx::CFG_VALSET)),
-                Step::optional(ubx::valset_ram(&diag_items), ubx::CFG_VALSET, names.join(", ")),
-                Step::required(ubx::valset_ram(&[(ubx::key::uart_baud(p), target)]), None),
-            ])
-            .collect()
+            // USB has no baud, and the UART's is not ours to change.
+            let baud = (p != ubx::PORT_USB).then(|| Step::required(ubx::valset_ram(&[(ubx::key::uart_baud(p), target)]), None));
+            gnss.into_iter()
+                .chain([
+                    Step::required(ubx::valset_ram(&items), Some(ubx::CFG_VALSET)),
+                    Step::optional(ubx::valset_ram(&diag_items), ubx::CFG_VALSET, names.join(", ")),
+                ])
+                .chain(baud)
+                .collect()
         } else {
             let mut s: Vec<Step> = ubx::ENABLED.iter().map(|&id| Step::required(ubx::cfg_msg(id, 1), Some(ubx::CFG_MSG))).collect();
             s.extend(diag.iter().map(|&(id, r)| Step::optional(ubx::cfg_msg(id, r), ubx::CFG_MSG, ubx_name(id))));
@@ -674,6 +809,11 @@ impl Session {
     fn next_step(&mut self, now: Ns, port: &mut dyn Port) {
         let Rx::Configure { steps, since, tries, sends } = &mut self.rx else { return };
         let pause = steps.remove(0).pause;
+        if steps.is_empty() {
+            // No baud change at the end (USB).
+            self.rx = Rx::Switch { since: now };
+            return;
+        }
         let wait = *sends > 1 || pause;
         (*since, *tries, *sends) = (now, 0, 0);
         if !wait {
@@ -940,6 +1080,14 @@ mod tests {
         nak_signals: bool,
         /// When each CFG-VALSET came (ms).
         valsets: Vec<i64>,
+        /// On its own USB port: no baud, and USB configuration keys.
+        usb: bool,
+        /// A VALSET changed the UART1 baud.
+        uart_baud_set: bool,
+        /// Plain: false sends no pulses.
+        pps: bool,
+        /// The UBX output of this second comes this many ms late.
+        late: Option<(i64, i64)>,
     }
 
     impl Fake {
@@ -979,11 +1127,19 @@ mod tests {
                 signals: Default::default(),
                 nak_signals: false,
                 valsets: vec![],
+                usb: false,
+                uart_baud_set: false,
+                pps: true,
+                late: None,
             }
         }
 
+        fn same_baud(&self) -> bool {
+            self.usb || self.host_baud == self.rx_baud
+        }
+
         fn gps(&mut self, bytes: &[u8]) {
-            if self.host_baud == self.rx_baud {
+            if self.same_baud() {
                 self.to_host.extend(bytes);
             }
         }
@@ -1013,7 +1169,7 @@ mod tests {
                 ubx::CFG_PRT if self.gen9 => self.ack(id, false),
                 ubx::CFG_PRT if p.is_empty() => {
                     let mut c = vec![0u8; 20];
-                    c[0] = 1;
+                    c[0] = if self.usb { ubx::PORT_USB } else { ubx::PORT_UART1 };
                     c[8..12].copy_from_slice(&self.rx_baud.to_le_bytes());
                     c[12] = 7;
                     c[14] = self.ubx_out as u8 | (self.nmea_out as u8) << 1;
@@ -1022,7 +1178,10 @@ mod tests {
                 }
                 ubx::CFG_PRT => {
                     self.ack(id, true);
-                    self.rx_baud = u32::from_le_bytes(p[8..12].try_into().unwrap());
+                    // The USB port ignores the baud.
+                    if !self.usb {
+                        self.rx_baud = u32::from_le_bytes(p[8..12].try_into().unwrap());
+                    }
                     self.ubx_out = p[14] & 1 != 0;
                     self.nmea_out = p[14] & 2 != 0;
                 }
@@ -1063,17 +1222,20 @@ mod tests {
                         return self.ack(id, false);
                     }
                     self.ack(id, true);
+                    // Only the keys of the port it is on change its output.
+                    let port = if self.usb { ubx::PORT_USB } else { ubx::PORT_UART1 };
                     for (k, v) in items {
                         if signal(k) {
                             self.signals.insert(k, v);
                         }
                         match k {
+                            0x4052_0001 if self.usb => self.uart_baud_set = true,
                             0x4052_0001 => self.rx_baud = v,
-                            0x1074_0001 => self.ubx_out = v != 0,
-                            0x1074_0002 => self.nmea_out = v != 0,
+                            k if k == ubx::key::out_ubx(port) => self.ubx_out = v != 0,
+                            k if k == ubx::key::out_nmea(port) => self.nmea_out = v != 0,
                             _ => {
                                 for id in ubx::ENABLED {
-                                    if ubx::key::msgout(id, 1) == k && v > 0 {
+                                    if ubx::key::msgout(id, port) == k && v > 0 {
                                         self.enabled.insert(id);
                                     }
                                 }
@@ -1102,9 +1264,12 @@ mod tests {
                 self.to_host.extend(nmea::command("ERR,OTATIMEOUT"));
             }
             let (s, r) = (ms.div_euclid(1000), ms.rem_euclid(1000));
-            if r == 700 && self.ublox && self.ubx_out {
+            let ubx_at = 700 + self.late.filter(|l| l.0 == s).map_or(0, |l| l.1);
+            if r == ubx_at && self.ublox && self.ubx_out {
                 let gps = UTC0_S + s + 1 - 315_964_800 + LEAP;
                 let (week, tow) = (gps / 604_800, gps % 604_800);
+                // The epoch this output follows.
+                let (epoch_week, epoch_tow) = ((gps - 1) / 604_800, (gps - 1) % 604_800);
                 // Like the LEA-5T: no TIM-TP without a fix.
                 let fix = self.fix;
                 for id in self.enabled.clone().into_iter().filter(|&id| fix || id != ubx::TIM_TP) {
@@ -1115,6 +1280,8 @@ mod tests {
                             p[12..14].copy_from_slice(&(week as u16).to_le_bytes());
                         }
                         ubx::NAV_TIMEGPS => {
+                            p[..4].copy_from_slice(&((epoch_tow * 1000) as u32).to_le_bytes());
+                            p[8..10].copy_from_slice(&(epoch_week as u16).to_le_bytes());
                             // An unknown count is the firmware default.
                             (p[10], p[11]) = if self.leap_valid { (LEAP as u8, 0x07) } else { (15, 0x03) };
                         }
@@ -1128,7 +1295,9 @@ mod tests {
                 }
             }
             if r == 0 && self.plain {
-                self.pulses.push(ms);
+                if self.pps {
+                    self.pulses.push(ms);
+                }
             } else if r == 0 {
                 self.to_host.extend(nmea::command(&format!("PPS,{},300", ms * 80_000 + 1000)));
             }
@@ -1185,7 +1354,7 @@ mod tests {
                     } else if fl[2] == "DIV" {
                         self.to_host.extend(nmea::command("ERR,BADDIV"));
                     }
-                } else if k == Kind::Ubx && self.ublox && self.answers && self.host_baud == self.rx_baud {
+                } else if k == Kind::Ubx && self.ublox && self.answers && self.same_baud() {
                     let (id, p) = ubx::split(&f);
                     self.on_ubx(id, p);
                 }
@@ -1257,7 +1426,7 @@ mod tests {
         assert_eq!((r.fake.rx_baud, r.fake.nmea_out, r.fake.ubx_out), (38_400, false, true));
         // u-blox 5: base set plus legacy diagnostics.
         let want: BTreeSet<ubx::Id> =
-            ubx::ENABLED.into_iter().chain([ubx::NAV_SOL, ubx::NAV_TIMEUTC, ubx::NAV_SVINFO, ubx::MON_HW]).collect();
+            ubx::ENABLED.into_iter().chain([ubx::NAV_SOL, ubx::NAV_TIMEUTC, ubx::NAV_POSLLH, ubx::NAV_VELNED, ubx::NAV_SVINFO, ubx::MON_HW]).collect();
         assert_eq!(r.fake.enabled, want);
         r.check_tags(Source::TimTp);
         assert!(r.out.frames.iter().any(|(k, _)| *k == Kind::Nmea));
@@ -1321,8 +1490,8 @@ mod tests {
         let mut r = Run::new(f);
         r.for_secs(20);
         assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
-        // 7 steps, and one resend of the lost one.
-        assert_eq!(r.fake.cfg_msgs, 8);
+        // 9 steps, and one resend of the lost one.
+        assert_eq!(r.fake.cfg_msgs, 10);
     }
 
     #[test]
@@ -1464,6 +1633,123 @@ mod tests {
             assert_eq!(e["utc_ns"].as_i64().unwrap(), UTC0_S * 1_000_000_000 + tick - 1000, "{e}");
         }
         assert!(r.out.tags.is_empty());
+    }
+
+    #[test]
+    fn publishes_a_fix_per_epoch() {
+        let mut pvt = vec![0u8; 92];
+        pvt[4..6].copy_from_slice(&2026u16.to_le_bytes());
+        (pvt[6], pvt[7], pvt[11], pvt[20], pvt[21], pvt[23]) = (9, 21, 0x07, 3, 0x01, 11);
+        pvt[28..32].copy_from_slice(&481_234_567i32.to_le_bytes());
+        let frame = ubx::frame(ubx::NAV_PVT, &pvt);
+        let fixes = |r: &Run| r.out.events.iter().filter(|e| e["event"] == "gnss_fix").cloned().collect::<Vec<Value>>();
+
+        let mut r = Run::new(Fake::new(9600, false, true));
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        // Before the setup the receiver sent NMEA: a fix from its GGA.
+        let nmea: Vec<Value> = fixes(&r);
+        assert!(!nmea.is_empty() && nmea.iter().all(|f| f["source"] == "nmea" && f["fix"] == "3d"), "{nmea:?}");
+        // The fake's GGA: 1 minute north, 8 satellites.
+        assert!(nmea[0]["lat_deg"] == 0.0166667 && nmea[0]["sats_used"] == 8, "{}", nmea[0]);
+        let now = r.ms * MS;
+        r.session.on_bytes(&frame, now, &mut r.fake, &mut r.out);
+        let f = fixes(&r).pop().unwrap();
+        assert_eq!((f["source"].as_str(), f["fix"].as_str(), f["lat_deg"].as_f64(), f["sats_used"].as_u64()), (Some("nav_pvt"), Some("3d"), Some(48.1234567), Some(11)));
+        assert_eq!((f["leap_seconds"].as_i64(), f["utc_ns"].as_i64()), (Some(LEAP), Some(20_717 * 86_400 * 1_000_000_000)));
+
+        // Turned off.
+        let mut r = Run::with(Config { fix: false, ..Config::default() }, Fake::new(9600, false, true));
+        r.for_secs(20);
+        let now = r.ms * MS;
+        r.session.on_bytes(&frame, now, &mut r.fake, &mut r.out);
+        assert!(fixes(&r).is_empty());
+    }
+
+    /// A receiver without pulses, on its USB port if `usb`.
+    fn no_pps(gen9: bool, ublox: bool, usb: bool, serial_delay_ms: Option<i64>) -> Run {
+        let mut f = Fake::new(9600, gen9, ublox);
+        (f.plain, f.pps, f.usb) = (true, false, usb);
+        let cfg = Config { plain: true, pps: false, usb, serial_delay_ns: serial_delay_ms.map(|d| d * MS), ..Config::default() };
+        Run::with(cfg, f)
+    }
+
+    fn serial_events(r: &Run) -> Vec<&Value> {
+        r.out.events.iter().filter(|e| e["event"] == "gnss_pps").inspect(|e| assert_eq!(e["source"], "serial", "{e}")).collect()
+    }
+
+    #[test]
+    fn usb_receiver_without_pulses_only_passes_data() {
+        let mut r = no_pps(false, true, true, None);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert_eq!((r.fake.nmea_out, r.fake.ubx_out, r.fake.enabled.len() >= 3), (false, true, true));
+        assert!(!r.session.locked);
+        assert!(!r.out.events.iter().any(|e| e["event"] == "gnss_pps"));
+        assert!(r.out.frames.iter().any(|(k, f)| *k == Kind::Ubx && ubx::split(f).0 == ubx::TIM_TP));
+    }
+
+    #[test]
+    fn generation_9_on_usb_gets_usb_keys_and_no_baud() {
+        let mut r = no_pps(true, true, true, None);
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        // Only the USB keys turn its NMEA off and the messages on.
+        assert_eq!((r.fake.nmea_out, r.fake.enabled.len(), r.fake.uart_baud_set), (false, 3, false));
+    }
+
+    #[test]
+    fn serial_timing_dates_epochs_by_their_output() {
+        // The output of each epoch starts 700 ms after it and is read 10 ms later.
+        let mut r = no_pps(false, true, false, Some(710));
+        r.for_secs(20);
+        assert_eq!(r.session.state(), "ubx", "{:?}", r.states());
+        assert!(r.session.locked);
+        let ev = serial_events(&r);
+        assert_eq!(ev[0]["reason"], "first_epoch");
+        let accepted: Vec<&&Value> = ev.iter().filter(|e| e["accepted"] == true).collect();
+        assert!(accepted.len() > 8, "{ev:?}");
+        for e in accepted {
+            let tick = e["tick"].as_i64().unwrap();
+            assert_eq!(tick % 1_000_000_000, 0, "{e}");
+            assert_eq!(e["utc_ns"].as_i64().unwrap(), UTC0_S * 1_000_000_000 + tick, "{e}");
+            assert!(e["rx_idle_ms"].as_u64().unwrap() > 500, "{e}");
+        }
+        assert!(r.out.events.iter().any(|e| e["event"] == "gnss_status" && e["serial_delay_ns"] == 710 * MS));
+    }
+
+    #[test]
+    fn serial_timing_uses_zda_of_an_nmea_receiver() {
+        // NMEA comes 100 ms after the epoch.
+        let mut r = no_pps(false, false, false, Some(110));
+        r.for_secs(30);
+        assert_eq!(r.session.state(), "nmea_fallback", "{:?}", r.states());
+        assert!(r.session.locked);
+        let ev = serial_events(&r);
+        let accepted: Vec<&&Value> = ev.iter().filter(|e| e["accepted"] == true).collect();
+        assert!(accepted.len() > 5, "{ev:?}");
+        for e in accepted {
+            assert_eq!(e["utc_ns"].as_i64().unwrap(), UTC0_S * 1_000_000_000 + e["tick"].as_i64().unwrap(), "{e}");
+        }
+    }
+
+    #[test]
+    fn serial_timing_rejects_late_output_and_no_fix() {
+        let mut r = no_pps(false, true, false, Some(710));
+        r.fake.late = Some((25, 50));
+        r.for_secs(30);
+        let at = |r: &Run, s: i64| {
+            let utc = (UTC0_S + s) * 1_000_000_000;
+            serial_events(r).into_iter().find(|e| e["utc_ns"] == utc).unwrap_or_else(|| panic!("no epoch {s}")).clone()
+        };
+        assert_eq!(at(&r, 24)["accepted"], true);
+        // 50 ms late, then back: both intervals are off.
+        assert_eq!((at(&r, 25)["reason"].clone(), at(&r, 26)["reason"].clone()), (json!("interval"), json!("interval")));
+        assert_eq!(at(&r, 27)["accepted"], true);
+        r.fake.fix = false;
+        r.for_secs(10);
+        assert_eq!(at(&r, 35)["reason"], "no_fix");
+        assert!(!r.session.locked);
     }
 
     #[test]
